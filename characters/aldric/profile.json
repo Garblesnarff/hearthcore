@@ -1,0 +1,34 @@
+{
+  "slug": "aldric",
+  "name": "Aldric",
+  "game_guid": null,
+  "status": "active_companion",
+  "race": "draenei",
+  "gender": null,
+  "class": "paladin",
+  "primary_spec": "Retribution",
+  "primary_role": "damage",
+  "preferences": {
+    "quest": 1,
+    "dungeon": 1.1,
+    "gear": 1,
+    "profession": 1.2,
+    "gather": 1,
+    "craft": 1,
+    "train": 1,
+    "bank": 1,
+    "repair": 1,
+    "travel": 1,
+    "fish": 1,
+    "explore": 1,
+    "rest": 1,
+    "guild_order": 1.3
+  },
+  "motivations": [
+    "guild_order",
+    "profession",
+    "dungeon"
+  ],
+  "session_minutes": 90,
+  "notes": "Initial preferences are proposals; verify in-game character details."
+}
