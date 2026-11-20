@@ -1,0 +1,34 @@
+{
+  "slug": "wren",
+  "name": "Wren",
+  "game_guid": null,
+  "status": "active_companion",
+  "race": null,
+  "gender": "female",
+  "class": "rogue",
+  "primary_spec": "Combat",
+  "primary_role": "damage",
+  "preferences": {
+    "quest": 1,
+    "dungeon": 1,
+    "gear": 1.3,
+    "profession": 1,
+    "gather": 1,
+    "craft": 1.1,
+    "train": 1,
+    "bank": 1,
+    "repair": 1,
+    "travel": 1,
+    "fish": 1,
+    "explore": 1.2,
+    "rest": 1,
+    "guild_order": 1
+  },
+  "motivations": [
+    "gear",
+    "explore",
+    "craft"
+  ],
+  "session_minutes": 90,
+  "notes": "Initial preferences are proposals; verify in-game character details."
+}

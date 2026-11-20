@@ -1,0 +1,30 @@
+{
+  "character_id": "brannoc",
+  "observed_at": "2026-11-20T12:00:00Z",
+  "candidates": [
+    {
+      "id": "repair:gear",
+      "type": "repair",
+      "score": 65,
+      "description": "Repair at a reachable vendor using earned gold"
+    },
+    {
+      "id": "quest:hub",
+      "type": "quest",
+      "score": 74,
+      "description": "Complete currently eligible quests"
+    },
+    {
+      "id": "dungeon:stockades",
+      "type": "dungeon",
+      "score": 70,
+      "description": "Join a suitable Dungeon Finder group"
+    },
+    {
+      "id": "profession:smith",
+      "type": "profession",
+      "score": 60,
+      "description": "Advance Blacksmithing with available supplies"
+    }
+  ]
+}
