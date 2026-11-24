@@ -71,3 +71,25 @@ class CoreTests(unittest.TestCase):
 
     def test_strip_json_fences(self):
         self.assertEqual(_strip_json_fences('```json\n{"a":1}\n```'), '{"a":1}')
+
+    def test_supply_report_and_quartermaster_fallback(self):
+        from hearthcore.guides import compute_supply_report
+        from hearthcore.quartermaster import _fallback_quartermaster, build_eligible_menus
+
+        chars = [
+            {"guid": 1, "name": "Wonky", "level": 30, "online": True, "skills": {333: (100, 150), 185: (138, 150)}},
+            {"guid": 2, "name": "Logan", "level": 10, "online": False, "skills": {164: (5, 75), 186: (10, 75)}},
+        ]
+        sup = compute_supply_report(chars, {2840: 20})
+        self.assertEqual(sup["characters_analyzed"], 2)
+        copper = next(m for m in sup["materials"] if m["item_entry"] == 2840)
+        self.assertEqual(copper["vault_have"], 20)
+        self.assertGreater(copper["active_deficit"], 0)
+
+        st = {"characters": chars, "vault_counts": {2840: 20}, "open_orders": [], "supply": sup}
+        om, bm = build_eligible_menus(st)
+        self.assertTrue(any(o["item_entry"] == 21072 for o in om))  # Smoked Sagefish
+        self.assertTrue(any(o["item_entry"] == 20744 for o in om))  # Minor Wizard Oil
+        fb = _fallback_quartermaster(om, bm, 6)
+        self.assertEqual(len(fb["work_orders"]), 6)
+        self.assertGreater(len(fb["bank_requests"]), 0)

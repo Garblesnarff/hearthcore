@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from .core import Invalid, ROOT, fallback, profile, profiles, snapshot, validate
+from .guides import LEVELING_ORDER_CATALOG, SKILL_NAMES
 from .provider import anthropic_with_meta, load_env
 
 DB_CONTAINER = "ac-database"
@@ -28,36 +29,14 @@ LIVE_POS_FILE = Path("/home/wonky/AzerothCore/azerothcore-wotlk/env/dist/logs/li
 RUNTIME_DIR = ROOT / "runtime"
 BRAIN_DB_PATH = RUNTIME_DIR / "brain.db"
 ACTIVE_PLANS_PATH = RUNTIME_DIR / "active_plans.json"
+QUARTERMASTER_PATH = RUNTIME_DIR / "quartermaster.json"
 
-SKILL_NAMES = {
-    164: "Blacksmithing",
-    165: "Leatherworking",
-    171: "Alchemy",
-    182: "Herbalism",
-    186: "Mining",
-    197: "Tailoring",
-    202: "Engineering",
-    333: "Enchanting",
-    393: "Skinning",
-    755: "Jewelcrafting",
-    773: "Inscription",
-    129: "First Aid",
-    185: "Cooking",
-    356: "Fishing",
-}
 CRAFT_SKILLS = {164, 165, 171, 197, 202, 333, 755, 773}
 GATHER_SKILLS = {182, 186, 393}
 
-# Curated craftable work-order item -> profession skill (matches Guild Life v2 catalog)
-WORK_ORDER_SKILL = {
-    118: 171, 2455: 171, 2454: 171, 858: 171, 3385: 171, 929: 171,
-    1251: 129, 2581: 129, 3530: 129, 6450: 129,
-    2840: 186, 3576: 186, 2841: 186,
-    2862: 164, 2863: 164, 3470: 164, 3486: 164,
-    4238: 197, 4240: 197,
-    2304: 165, 2313: 165,
-    2681: 185, 6888: 185, 6890: 185, 4592: 185,
-}
+# All guild work-order items (Guild Life v2 + Claude Quartermaster Priority 1 & Priority 2 catalog)
+WORK_ORDER_SKILL = {t.item_entry: t.skill_id for t in LEVELING_ORDER_CATALOG}
+WORK_ORDER_SKILL.update({3470: 164, 3486: 164, 3576: 186})
 
 ZONE_NAMES = {
     1: "Dun Morogh", 10: "Duskwood", 11: "Wetlands", 12: "Elwynn Forest",
@@ -194,12 +173,28 @@ def fetch_world_context() -> dict[str, Any]:
         for r in human_rows if len(r) >= 3
     ]
 
+    # Optional Quartermaster guild-wide directives (so individual companions align with guild deficits!)
+    qm_focus: set[str] = set()
+    qm_mats_by_skill: dict[str, list[str]] = {}
+    try:
+        if QUARTERMASTER_PATH.is_file():
+            qm = json.loads(QUARTERMASTER_PATH.read_text(encoding="utf-8"))
+            qm_focus = {str(s).lower() for s in (qm.get("focus_skills") or [])}
+            for br in qm.get("bank_requests") or []:
+                gsk = str(br.get("gather_skill") or "").lower()
+                if gsk:
+                    qm_mats_by_skill.setdefault(gsk, []).append(str(br.get("name") or ""))
+    except Exception:
+        pass
+
     return {
         "observed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "weekly_event": live["weekly_event"],
         "companions": companions,
         "work_orders": work_orders,
         "humans": humans,
+        "qm_focus": qm_focus,
+        "qm_mats_by_skill": qm_mats_by_skill,
     }
 
 
@@ -242,39 +237,49 @@ def build_snapshot(comp: dict[str, Any], world_ctx: dict[str, Any]) -> dict[str,
             })
             added_wo += 1
 
-    # 3. Primary crafting professions
+    # 3. Primary crafting & gathering professions (aligned with Claude Quartermaster guild deficits!)
+    qm_focus = world_ctx.get("qm_focus") or set()
+    qm_mats = world_ctx.get("qm_mats_by_skill") or {}
     for sk_id, (val, mx) in sorted(skills.items()):
         if sk_id in CRAFT_SKILLS:
             sk_name = SKILL_NAMES[sk_id]
             gap = max(0, min(lvl * 5, mx) - val)
-            score = min(88, 52 + gap // 2 + (14 if is_craft_night else 0))
+            qm_boost = 10 if sk_name.lower() in qm_focus else 0
+            score = min(92, 52 + gap // 2 + (14 if is_craft_night else 0) + qm_boost)
             candidates.append({
                 "id": f"craft:{_slug_token(sk_name)}",
                 "type": "craft",
                 "score": max(45, score),
-                "description": f"Advance {sk_name} ({val}/{mx}) and supply Hearthguard",
+                "description": f"Advance {sk_name} ({val}/{mx}) and supply Hearthguard"
+                               + (" [Guild Priority]" if qm_boost else ""),
             })
         elif sk_id in GATHER_SKILLS:
             sk_name = SKILL_NAMES[sk_id]
             gap = max(0, min(lvl * 5, mx) - val)
-            score = min(84, 54 + gap // 2 + (8 if is_craft_night else 0))
+            needed_names = qm_mats.get(sk_name.lower(), [])[:3]
+            qm_boost = 12 if (sk_name.lower() in qm_focus or needed_names) else 0
+            score = min(92, 54 + gap // 2 + (8 if is_craft_night else 0) + qm_boost)
+            need_txt = f" — guild needs {', '.join(needed_names)}" if needed_names else ""
             candidates.append({
                 "id": f"gather:{_slug_token(sk_name)}",
                 "type": "gather",
                 "score": max(45, score),
-                "description": f"Gather {sk_name} nodes ({val}/{mx}) for crafting and guild vault",
+                "description": f"Gather {sk_name} ({val}/{mx}) for 40-char guild vault{need_txt}"[:240],
             })
 
     # 4. Secondary Cooking / First Aid / Fishing
     if 356 in skills:
         f_val, f_mx = skills[356]
-        f_score = 84 if is_fish_night else (58 if f_val < lvl * 4 else 46)
+        fish_need = qm_mats.get("fishing", [])[:2]
+        f_boost = 12 if ("fishing" in qm_focus or fish_need) else 0
+        f_score = 88 if is_fish_night else min(86, (58 if f_val < lvl * 4 else 48) + f_boost)
+        fish_txt = f" ({', '.join(fish_need)} for Mp5 buffs)" if fish_need else ""
         candidates.append({
             "id": "fish:hearthguard",
             "type": "fish",
             "score": f_score,
-            "description": f"Fish for guild cooking supplies (Fishing {f_val}/{f_mx})"
-                           + (" [Fishing Night!]" if is_fish_night else ""),
+            "description": (f"Fish for guild cooking supplies (Fishing {f_val}/{f_mx}){fish_txt}"
+                            + (" [Fishing Night!]" if is_fish_night else ""))[:240],
         })
 
     if 185 in skills or 129 in skills:

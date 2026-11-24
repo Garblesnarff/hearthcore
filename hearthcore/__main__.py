@@ -29,6 +29,13 @@ def main():
 
     commands.add_parser("brain-status", help="Show active AI Brain session plans and today's API stats")
 
+    commands.add_parser("supply-report", help="Compute 40-char Classic (1-300) profession material deficits vs Guild Bank")
+
+    qm = commands.add_parser("quartermaster-tick", help="Run Claude Guild Quartermaster to plan 12+ orders & bank requests")
+    qm.add_argument("--provider", choices=("anthropic", "fallback"), default="anthropic")
+    qm.add_argument("--shadow", action="store_true", help="Compute & log without writing DB")
+    qm.add_argument("--model", help="Override strategist model (default: claude-sonnet-5-5)")
+
     args = cli.parse_args()
     try:
         if args.command in ("roster", "validate-roster"):
@@ -81,6 +88,41 @@ def main():
                     f"  {v['character_id']:<12} [{v['source']:<9}] {v['primary_goal_id']:<28} "
                     f"({v['reason_code']}, {rem}m left) - {v['primary_desc']}"
                 )
+            return 0
+
+        if args.command == "supply-report":
+            from .quartermaster import fetch_40char_supply_state
+            st = fetch_40char_supply_state()
+            sup = st["supply"]
+            print(f"Hearthguard 40-Char Classic (1-300) Supply Report ({sup['characters_analyzed']} characters)")
+            print("\nTop 20 Material Deficits (Active Bracket vs Guild Bank | Full 1-300 Total):")
+            for m in sup["materials"][:20]:
+                print(
+                    f"  {m['name']:<22} have={m['vault_have']:<4} now={m['active_need']:<5} "
+                    f"def_now={m['active_deficit']:<5} full300={m['full_300_need']:<5} ({m['driven_by_active'] or m['driven_by_all']})"
+                )
+            return 0
+
+        if args.command == "quartermaster-tick":
+            from .quartermaster import run_quartermaster
+            res = run_quartermaster(
+                provider=args.provider,
+                apply=not args.shadow,
+                model=args.model,
+            )
+            p = res["plan"]
+            m = res["meta"]
+            print(f"[{res['source']}] model={m.get('model', res['source'])} ({m.get('latency_ms', 0)}ms, tok={m.get('input_tokens', 0)}/{m.get('output_tokens', 0)})")
+            print("Strategy:", p["strategy_summary"])
+            print(f"Focus skills: {', '.join(p['focus_skills'])}")
+            print(f"Work orders added ({res['orders_added']}):")
+            for wo in p["work_orders"]:
+                print(f"  [P{wo['priority']}] {wo['name']} x{wo['quantity']} - {wo['reason']}")
+            print(f"Bank gathering directives set ({res['banks_set']}):")
+            for br in p["bank_requests"][:10]:
+                print(f"  {br['name']:<22} min={br['min_count']:<3} ({br['note']})")
+            if res["error_note"]:
+                print("Error note:", res["error_note"])
             return 0
 
         character = profile(args.character)
