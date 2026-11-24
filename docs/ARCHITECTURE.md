@@ -13,3 +13,7 @@ Start with shadow-mode comparison of proposed vs actual outcomes. Replan only at
 The optional API planner sends only the character profile and candidate snapshot. API tokens must remain in environment secrets. No generated text is exposed as bot chat: child-visible messages require independently approved templates grounded in actual events.
 
 Planned extensions: trusted game-state bridge, persistent event memory and relationships in DB, per-character schedule, guild opportunity pool, cost quotas, token accounting, and rate-limited scheduling. None are claimed implemented.
+
+## Persistent memory proposal
+
+See [Persistent memory and experience (v2)](PERSISTENT_MEMORY.md) and the [implementation checklist](MEMORY_IMPLEMENTATION.md). These documents describe a future event-driven memory subsystem; they do not change the standalone CLI or claim live integration.
