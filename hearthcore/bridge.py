@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from .core import Invalid, ROOT, fallback, profile, profiles, snapshot, validate
-from .guides import LEVELING_ORDER_CATALOG, SKILL_NAMES
+from .guides import LEVELING_ORDER_CATALOG, ORDER_BY_ENTRY, SKILL_NAMES, best_farm_hint
 from .provider import anthropic_with_meta, load_env
 
 DB_CONTAINER = "ac-database"
@@ -94,7 +94,7 @@ def fetch_world_context() -> dict[str, Any]:
 
     comp_rows = run_sql("""
         SELECT c.guid, c.name, c.level, c.zone, c.map, c.money, c.online,
-               COALESCE(cs.shift_group, '')
+               COALESCE(cs.shift_group, ''), c.xp
         FROM companion_schedule cs
         JOIN characters c ON c.name = cs.name
         ORDER BY c.online DESC, c.name;
@@ -102,7 +102,7 @@ def fetch_world_context() -> dict[str, Any]:
     companions: dict[str, dict[str, Any]] = {}
     guid_to_slug: dict[int, str] = {}
     for r in comp_rows:
-        if len(r) < 8:
+        if len(r) < 9:
             continue
         guid = int(r[0])
         name = r[1]
@@ -115,6 +115,7 @@ def fetch_world_context() -> dict[str, Any]:
             "name": name,
             "slug": slug,
             "level": int(r[2]),
+            "xp": int(r[8]),
             "zone_id": zid,
             "zone": ZONE_NAMES.get(zid, f"Zone {zid}"),
             "map_id": mid,
@@ -122,22 +123,33 @@ def fetch_world_context() -> dict[str, Any]:
             "online": (int(r[6]) == 1) or (guid in live["live_by_guid"]),
             "shift_group": r[7],
             "skills": {},
+            "orders_delivered": 0,
             "recent_events": [],
         }
         guid_to_slug[guid] = slug
 
-    # Skills for online companions
-    online_guids = [str(c["guid"]) for c in companions.values() if c["online"]]
-    if online_guids:
-        glist = ",".join(online_guids)
+    # Skills for all companions (needed for both planning & outcome delta tracking)
+    all_guids = [str(c["guid"]) for c in companions.values()]
+    if all_guids:
+        glist = ",".join(all_guids)
         for r in run_sql(f"SELECT guid, skill, value, max FROM character_skills WHERE guid IN ({glist}) AND skill IN (164,165,171,182,186,197,202,333,393,755,773,129,185,356);"):
             if len(r) >= 4:
                 sl = guid_to_slug.get(int(r[0]))
                 if sl:
                     companions[sl]["skills"][int(r[1])] = (int(r[2]), int(r[3]))
 
+        # Delivered work orders count per crafter
+        for r in run_sql("SELECT crafter_guid, COUNT(*) FROM companion_work_orders WHERE status = 'delivered' AND crafter_guid > 0 GROUP BY crafter_guid;"):
+            if len(r) >= 2:
+                sl = guid_to_slug.get(int(r[0]))
+                if sl:
+                    companions[sl]["orders_delivered"] = int(r[1])
+
+    online_guids = [str(c["guid"]) for c in companions.values() if c["online"]]
+    if online_guids:
+        oglist = ",".join(online_guids)
         # Recent 4 events per online companion
-        for r in run_sql(f"SELECT guid, event_type, summary FROM companion_events WHERE guid IN ({glist}) ORDER BY id DESC LIMIT 120;"):
+        for r in run_sql(f"SELECT guid, event_type, summary FROM companion_events WHERE guid IN ({oglist}) ORDER BY id DESC LIMIT 120;"):
             if len(r) >= 3:
                 sl = guid_to_slug.get(int(r[0]))
                 if sl and len(companions[sl]["recent_events"]) < 4:
@@ -221,21 +233,28 @@ def build_snapshot(comp: dict[str, Any], world_ctx: dict[str, Any]) -> dict[str,
         "description": f"Complete quests and turn-ins around {zone} (Lv {lvl})",
     })
 
-    # 2. Eligible open guild work orders matching a skill this companion actually holds
+    # 2. Eligible open guild work orders matching a skill this companion holds AT/NEAR the required skill level
     added_wo = 0
     for wo in world_ctx.get("work_orders", []):
         if wo["requester_guid"] == comp["guid"]:
             continue
         sk = wo["skill"]
-        if sk and sk in skills and added_wo < 2:
-            score = 88 if is_craft_night else 80
-            candidates.append({
-                "id": f"guild_order:{wo['id']}:{_slug_token(wo['item_name'])}",
-                "type": "guild_order",
-                "score": score,
-                "description": f"Craft {wo['quantity']}x {wo['item_name']} for {wo['requester_name']} ({SKILL_NAMES.get(sk, 'craft')})",
-            })
-            added_wo += 1
+        if not sk or sk not in skills or added_wo >= 3:
+            continue
+        comp_sk_val = skills[sk][0]
+        tpl = ORDER_BY_ENTRY.get(wo["item_entry"])
+        if tpl and comp_sk_val + 15 < tpl.min_skill:
+            continue
+        score = 88 if is_craft_night else 82
+        if tpl and tpl.priority == 2:
+            score = min(90, score + 2)
+        candidates.append({
+            "id": f"guild_order:{wo['id']}:{_slug_token(wo['item_name'])}",
+            "type": "guild_order",
+            "score": score,
+            "description": f"Craft {wo['quantity']}x {wo['item_name']} for {wo['requester_name']} ({SKILL_NAMES.get(sk, 'craft')} {comp_sk_val})"[:240],
+        })
+        added_wo += 1
 
     # 3. Primary crafting & gathering professions (aligned with Claude Quartermaster guild deficits!)
     qm_focus = world_ctx.get("qm_focus") or set()
@@ -259,12 +278,14 @@ def build_snapshot(comp: dict[str, Any], world_ctx: dict[str, Any]) -> dict[str,
             needed_names = qm_mats.get(sk_name.lower(), [])[:3]
             qm_boost = 12 if (sk_name.lower() in qm_focus or needed_names) else 0
             score = min(92, 54 + gap // 2 + (8 if is_craft_night else 0) + qm_boost)
-            need_txt = f" — guild needs {', '.join(needed_names)}" if needed_names else ""
+            need_txt = f" — needs {', '.join(needed_names)}" if needed_names else ""
+            spot_hint = best_farm_hint(sk_id, lvl)
+            hint_txt = f" | {spot_hint}" if spot_hint else ""
             candidates.append({
                 "id": f"gather:{_slug_token(sk_name)}",
                 "type": "gather",
                 "score": max(45, score),
-                "description": f"Gather {sk_name} ({val}/{mx}) for 40-char guild vault{need_txt}"[:240],
+                "description": f"Gather {sk_name} ({val}/{mx}) for guild vault{need_txt}{hint_txt}"[:240],
             })
 
     # 4. Secondary Cooking / First Aid / Fishing
@@ -273,12 +294,14 @@ def build_snapshot(comp: dict[str, Any], world_ctx: dict[str, Any]) -> dict[str,
         fish_need = qm_mats.get("fishing", [])[:2]
         f_boost = 12 if ("fishing" in qm_focus or fish_need) else 0
         f_score = 88 if is_fish_night else min(86, (58 if f_val < lvl * 4 else 48) + f_boost)
-        fish_txt = f" ({', '.join(fish_need)} for Mp5 buffs)" if fish_need else ""
+        fish_txt = f" ({', '.join(fish_need)} Mp5)" if fish_need else ""
+        spot_hint = best_farm_hint(356, lvl)
+        hint_txt = f" | {spot_hint}" if spot_hint else ""
         candidates.append({
             "id": "fish:hearthguard",
             "type": "fish",
             "score": f_score,
-            "description": (f"Fish for guild cooking supplies (Fishing {f_val}/{f_mx}){fish_txt}"
+            "description": (f"Fish for guild cooking (Fishing {f_val}/{f_mx}){fish_txt}{hint_txt}"
                             + (" [Fishing Night!]" if is_fish_night else ""))[:240],
         })
 
@@ -449,9 +472,59 @@ class BrainStore:
             """)
             db.execute("CREATE INDEX IF NOT EXISTS idx_plans_char_exp ON plans(character_id, expires_at DESC)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_plans_day ON plans(day_key, source)")
+            # Safe additive outcome-tracking columns for existing brain.db files
+            existing_cols = {r[1] for r in db.execute("PRAGMA table_info(plans)").fetchall()}
+            for col, typ in [
+                ("start_level", "INTEGER NOT NULL DEFAULT 0"),
+                ("start_xp", "INTEGER NOT NULL DEFAULT 0"),
+                ("start_skill_sum", "INTEGER NOT NULL DEFAULT 0"),
+                ("start_orders_done", "INTEGER NOT NULL DEFAULT 0"),
+                ("outcome_levels", "INTEGER NOT NULL DEFAULT 0"),
+                ("outcome_xp", "INTEGER NOT NULL DEFAULT 0"),
+                ("outcome_skillups", "INTEGER NOT NULL DEFAULT 0"),
+                ("outcome_orders", "INTEGER NOT NULL DEFAULT 0"),
+                ("outcome_checked_at", "INTEGER NOT NULL DEFAULT 0"),
+            ]:
+                if col not in existing_cols:
+                    db.execute(f"ALTER TABLE plans ADD COLUMN {col} {typ}")
 
     def _conn(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path)
+
+    def refresh_outcomes(self, companions: dict[str, dict[str, Any]], now_ts: int) -> None:
+        """Update real in-game outcome deltas (levels, XP, skill-ups, work orders) for recent plans."""
+        cutoff = now_ts - 86400
+        with self._conn() as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute(
+                """
+                SELECT id, character_id, start_level, start_xp, start_skill_sum, start_orders_done
+                FROM plans
+                WHERE planned_at >= ? AND start_level > 0
+                  AND (expires_at > ? OR outcome_checked_at < expires_at)
+                ORDER BY id DESC LIMIT 120
+                """,
+                (cutoff, now_ts - 1800),
+            ).fetchall()
+            updates = []
+            for r in rows:
+                comp = companions.get(r["character_id"])
+                if not comp:
+                    continue
+                cur_lvl = int(comp["level"])
+                cur_xp = int(comp.get("xp", 0))
+                cur_sk = sum(v for v, _ in comp["skills"].values())
+                cur_ord = int(comp.get("orders_delivered", 0))
+                d_lvl = max(0, cur_lvl - int(r["start_level"]))
+                d_xp = max(0, cur_xp - int(r["start_xp"])) if d_lvl == 0 else cur_xp
+                d_sk = max(0, cur_sk - int(r["start_skill_sum"]))
+                d_ord = max(0, cur_ord - int(r["start_orders_done"]))
+                updates.append((d_lvl, d_xp, d_sk, d_ord, now_ts, int(r["id"])))
+            if updates:
+                db.executemany(
+                    "UPDATE plans SET outcome_levels=?, outcome_xp=?, outcome_skillups=?, outcome_orders=?, outcome_checked_at=? WHERE id=?",
+                    updates,
+                )
 
     def active_plan(self, slug: str, now_ts: int) -> dict[str, Any] | None:
         with self._conn() as db:
@@ -486,6 +559,10 @@ class BrainStore:
         applied: bool,
         error_note: str,
         observed_at: str,
+        start_level: int = 0,
+        start_xp: int = 0,
+        start_skill_sum: int = 0,
+        start_orders_done: int = 0,
     ) -> None:
         dt = datetime.fromtimestamp(now_ts, tz=timezone.utc)
         day_key = datetime.now().strftime("%Y-%m-%d")
@@ -498,8 +575,9 @@ class BrainStore:
                     source, model, effort, primary_goal_id, primary_desc, secondary_goal_ids,
                     reason_code, session_minutes, weight_modifiers, cpp_weights,
                     input_tokens, output_tokens, thinking_tokens, latency_ms,
-                    applied, error_note, observed_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    applied, error_note, observed_at,
+                    start_level, start_xp, start_skill_sum, start_orders_done
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     now_ts,
@@ -525,6 +603,10 @@ class BrainStore:
                     1 if applied else 0,
                     error_note[:200],
                     observed_at,
+                    int(start_level),
+                    int(start_xp),
+                    int(start_skill_sum),
+                    int(start_orders_done),
                 ),
             )
 
@@ -548,7 +630,10 @@ class BrainStore:
                     SUM(CASE WHEN source='fallback' THEN 1 ELSE 0 END) AS fb_only,
                     COALESCE(SUM(input_tokens), 0) AS in_tok,
                     COALESCE(SUM(output_tokens), 0) AS out_tok,
-                    COALESCE(AVG(CASE WHEN source='anthropic' THEN latency_ms END), 0) AS avg_ms
+                    COALESCE(AVG(CASE WHEN source='anthropic' THEN latency_ms END), 0) AS avg_ms,
+                    COALESCE(SUM(outcome_levels), 0) AS out_lvls,
+                    COALESCE(SUM(outcome_skillups), 0) AS out_sks,
+                    COALESCE(SUM(outcome_orders), 0) AS out_ords
                 FROM plans WHERE day_key = ?
             """, (day_key,)).fetchone()
 
@@ -587,6 +672,9 @@ class BrainStore:
                 "input_tokens": int(day_row["in_tok"] or 0),
                 "output_tokens": int(day_row["out_tok"] or 0),
                 "avg_latency_ms": int(day_row["avg_ms"] or 0),
+                "outcome_levels": int(day_row["out_lvls"] or 0),
+                "outcome_skillups": int(day_row["out_sks"] or 0),
+                "outcome_orders": int(day_row["out_ords"] or 0),
             },
             "plans": active,
         }
@@ -619,6 +707,7 @@ def run_cycle(
 
     store = BrainStore()
     world_ctx = fetch_world_context()
+    store.refresh_outcomes(world_ctx["companions"], now_ts)
     known_slugs = set(profiles())
 
     targets = []
@@ -685,6 +774,10 @@ def run_cycle(
             applied=apply,
             error_note=err_note,
             observed_at=snap["observed_at"],
+            start_level=int(comp["level"]),
+            start_xp=int(comp.get("xp", 0)),
+            start_skill_sum=sum(v for v, _ in comp["skills"].values()),
+            start_orders_done=int(comp.get("orders_delivered", 0)),
         )
         planned.append({
             "name": comp["name"],

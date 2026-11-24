@@ -275,6 +275,50 @@ LEVELING_ORDER_CATALOG: list[OrderTemplate] = [
 
 ORDER_BY_ENTRY: dict[int, OrderTemplate] = {t.item_entry: t for t in LEVELING_ORDER_CATALOG}
 
+# Verified top Alliance farming zones from live acore_world node/school/beast counts:
+# gather_skill -> list of (min_lvl, max_lvl, zone_name, mats_summary)
+BEST_FARM_ZONES: dict[int, list[tuple[int, int, str, str]]] = {
+    186: [  # Mining
+        (1, 14, "Dun Morogh / Elwynn / Azuremyst", "Copper Vein & Rough Stone (159/127/91 nodes)"),
+        (10, 22, "Westfall / Loch Modan / Darkshore / Bloodmyst", "Copper & Tin Veins (99-103 Copper, 33-46 Tin)"),
+        (18, 32, "Redridge / Duskwood / Wetlands / Ashenvale", "Tin & Silver Veins (44-63 Tin nodes)"),
+        (28, 42, "Stranglethorn Vale / Arathi / Badlands", "Iron & Mithril Deposits (82-98 Iron nodes)"),
+        (40, 52, "The Hinterlands / Tanaris / Searing Gorge", "Mithril Deposits (52-79 nodes)"),
+        (50, 60, "Un'Goro Crater / Eastern Plaguelands / Burning Steppes", "Thorium Veins (211 in Un'Goro!)"),
+    ],
+    182: [  # Herbalism
+        (1, 14, "Teldrassil / Dun Morogh / Elwynn / Azuremyst", "Peacebloom, Silverleaf, Earthroot (182-240 herbs)"),
+        (10, 24, "Westfall / Loch Modan / Darkshore / Bloodmyst", "Briarthorn, Mageroyal, Bruiseweed, Stranglekelp"),
+        (20, 34, "Wetlands / Duskwood / Redridge / Ashenvale", "Briarthorn, Kingsblood, Liferoot, Stranglekelp"),
+        (30, 44, "Stranglethorn Vale / Arathi / Dustwallow Marsh", "Goldthorn, Kingsblood, Liferoot, Wild Steelbloom"),
+        (42, 54, "Feralas / The Hinterlands / Azshara", "Sungrass & Golden Sansam"),
+        (50, 60, "Un'Goro Crater / Eastern Plaguelands / Winterspring", "Mountain Silversage, Golden Sansam, Dreamfoil"),
+    ],
+    393: [  # Skinning
+        (1, 14, "Elwynn / Dun Morogh / Teldrassil / Azuremyst", "Ruined Leather Scraps & Light Leather"),
+        (12, 24, "Westfall / Loch Modan / Darkshore / Wetlands", "Light & Medium Leather"),
+        (24, 38, "Duskwood / Ashenvale / Stranglethorn Vale", "Medium & Heavy Leather"),
+        (38, 50, "Feralas / Tanaris / The Hinterlands", "Heavy & Thick Leather"),
+        (50, 60, "Un'Goro Crater / Winterspring / Burning Steppes", "Thick & Rugged Leather"),
+    ],
+    356: [  # Fishing (Sagefish priority!)
+        (10, 25, "Darkshore / Loch Modan (Lesser Sagefish Schools)", "Raw Sagefish (25 schools in Darkshore!)"),
+        (22, 36, "Hillsbrad Foothills / Ashenvale (Sagefish Schools)", "Raw Sagefish (16 schools in Hillsbrad!)"),
+        (32, 48, "Stranglethorn Vale / Hinterlands (Greater Sagefish Schools)", "Raw Greater Sagefish"),
+    ],
+}
+
+
+def best_farm_hint(skill_id: int, level: int) -> str:
+    zones = BEST_FARM_ZONES.get(skill_id)
+    if not zones:
+        return ""
+    for lo, hi, zname, detail in zones:
+        if lo <= level <= hi:
+            return f"Best spots: {zname} ({detail})"
+    lo, hi, zname, detail = zones[-1]
+    return f"Best spots: {zname} ({detail})"
+
 
 def compute_supply_report(
     char_skills: list[dict[str, Any]],
