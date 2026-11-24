@@ -1,0 +1,41 @@
+{
+  "slug": "solara",
+  "name": "Solara",
+  "game_guid": null,
+  "status": "active_companion",
+  "race": "human",
+  "gender": "female",
+  "class": "paladin",
+  "primary_spec": "Protection",
+  "primary_role": "tank",
+  "shift_group": "afternoon-crew",
+  "archetype": "Sentinel",
+  "culture": "progression",
+  "professions": [
+    "Mining",
+    "Jewelcrafting"
+  ],
+  "preferences": {
+    "quest": 1.15,
+    "dungeon": 1.25,
+    "gear": 1.15,
+    "profession": 1.0,
+    "gather": 1.1,
+    "craft": 1.1,
+    "train": 1.0,
+    "bank": 1.0,
+    "repair": 1.2,
+    "travel": 1.0,
+    "fish": 1.0,
+    "explore": 1.0,
+    "rest": 1.0,
+    "guild_order": 1.0
+  },
+  "motivations": [
+    "dungeon",
+    "repair",
+    "quest"
+  ],
+  "session_minutes": 120,
+  "notes": "Bright human paladin proud to defend the Alliance."
+}

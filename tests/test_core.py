@@ -4,10 +4,13 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from hearthcore.bridge import weights_for_cpp
 from hearthcore.core import Invalid, fallback, profile, profiles, snapshot, validate
+from hearthcore.provider import _strip_json_fences
 from hearthcore.store import record
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "brannoc.json"
+
 
 class CoreTests(unittest.TestCase):
     def setUp(self):
@@ -15,8 +18,9 @@ class CoreTests(unittest.TestCase):
         self.s = snapshot(json.loads(EXAMPLE.read_text()), "brannoc")
 
     def test_profiles(self):
-        self.assertEqual(len(profiles()), 11)
-        for slug in profiles():
+        all_slugs = profiles()
+        self.assertEqual(len(all_slugs), 38)
+        for slug in all_slugs:
             profile(slug)
 
     def test_fallback(self):
@@ -56,3 +60,14 @@ class CoreTests(unittest.TestCase):
             record(path, fallback(self.p, self.s), "fallback", self.s["observed_at"])
             with sqlite3.connect(path) as db:
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM proposals").fetchone()[0], 1)
+
+    def test_cpp_weights_bounds(self):
+        plan = fallback(self.p, self.s)
+        w = weights_for_cpp(plan, self.s)
+        self.assertIn("quest_work", w)
+        self.assertIn("craft", w)
+        for k, v in w.items():
+            self.assertTrue(0.5 <= v <= 1.5, f"{k}={v}")
+
+    def test_strip_json_fences(self):
+        self.assertEqual(_strip_json_fences('```json\n{"a":1}\n```'), '{"a":1}')

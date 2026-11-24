@@ -1,0 +1,41 @@
+{
+  "slug": "tidecaller",
+  "name": "Tidecaller",
+  "game_guid": null,
+  "status": "active_companion",
+  "race": "draenei",
+  "gender": "female",
+  "class": "shaman",
+  "primary_spec": "Restoration",
+  "primary_role": "healer",
+  "shift_group": "core-logan",
+  "archetype": "Ritualist",
+  "culture": "social",
+  "professions": [
+    "Alchemy",
+    "Herbalism"
+  ],
+  "preferences": {
+    "quest": 1.15,
+    "dungeon": 1.15,
+    "gear": 1.0,
+    "profession": 1.2,
+    "gather": 1.1,
+    "craft": 1.1,
+    "train": 1.0,
+    "bank": 1.0,
+    "repair": 1.15,
+    "travel": 1.0,
+    "fish": 1.2,
+    "explore": 1.0,
+    "rest": 1.0,
+    "guild_order": 1.0
+  },
+  "motivations": [
+    "profession",
+    "fish",
+    "dungeon"
+  ],
+  "session_minutes": 150,
+  "notes": "Kind draenei healer who keeps Logan's squad topped off."
+}

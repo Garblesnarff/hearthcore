@@ -2,8 +2,8 @@
   "slug": "pooferz",
   "name": "Pooferz",
   "game_guid": null,
-  "status": "planned",
-  "race": null,
+  "status": "active_companion",
+  "race": "night elf",
   "gender": "female",
   "class": "druid",
   "primary_spec": "Restoration",
@@ -30,5 +30,12 @@
     "explore"
   ],
   "session_minutes": 90,
-  "notes": "Initial preferences are proposals; verify in-game character details."
+  "notes": "Playful druid who fills the guild bank with useful herbs.",
+  "shift_group": "prime-time",
+  "archetype": "Packrat",
+  "culture": "social",
+  "professions": [
+    "Herbalism",
+    "Enchanting"
+  ]
 }

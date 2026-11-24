@@ -1,0 +1,41 @@
+{
+  "slug": "ironbulwark",
+  "name": "Ironbulwark",
+  "game_guid": null,
+  "status": "active_companion",
+  "race": "dwarf",
+  "gender": "male",
+  "class": "paladin",
+  "primary_spec": "Protection",
+  "primary_role": "tank",
+  "shift_group": "early-birds",
+  "archetype": "Sentinel",
+  "culture": "progression",
+  "professions": [
+    "Blacksmithing",
+    "Mining"
+  ],
+  "preferences": {
+    "quest": 1.15,
+    "dungeon": 1.25,
+    "gear": 1.15,
+    "profession": 1.0,
+    "gather": 1.1,
+    "craft": 1.1,
+    "train": 1.0,
+    "bank": 1.0,
+    "repair": 1.2,
+    "travel": 1.0,
+    "fish": 1.0,
+    "explore": 1.0,
+    "rest": 1.0,
+    "guild_order": 1.0
+  },
+  "motivations": [
+    "dungeon",
+    "repair",
+    "quest"
+  ],
+  "session_minutes": 120,
+  "notes": "Stalwart dwarf tank who never lets a friend fall."
+}

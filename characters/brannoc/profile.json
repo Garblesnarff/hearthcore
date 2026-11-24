@@ -3,7 +3,7 @@
   "name": "Brannoc",
   "game_guid": null,
   "status": "active_companion",
-  "race": null,
+  "race": "night elf",
   "gender": "female",
   "class": "warrior",
   "primary_spec": "Protection",
@@ -30,5 +30,12 @@
     "profession"
   ],
   "session_minutes": 150,
-  "notes": "Initial preferences are proposals; verify in-game character details."
+  "notes": "Steadfast shield-bearer who watches over Wonky's party.",
+  "shift_group": "core-wonky",
+  "archetype": "Sentinel",
+  "culture": "progression",
+  "professions": [
+    "Blacksmithing",
+    "Mining"
+  ]
 }
