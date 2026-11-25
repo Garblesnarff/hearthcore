@@ -231,3 +231,46 @@ class CoreTests(unittest.TestCase):
             self.assertIn("Claimed by Forgedeep", c50["description"])
             self.assertGreater(c51["score"], c50["score"])
             self.assertIn("Stalled: 0 progress", by_id["craft:blacksmithing"]["description"])
+
+    def test_xp_capped_profession_catchup_priority(self):
+        from hearthcore.bridge import build_snapshot, weights_for_cpp
+
+        comp = {
+            "guid": 105,
+            "name": "Aldric",
+            "slug": "aldric",
+            "level": 33,
+            "zone_id": 33,
+            "zone": "Stranglethorn Vale",
+            "shift_group": "core-wonky",
+            "skills": {171: (47, 75), 182: (34, 75)},
+            "recent_events": [],
+            "social_bonds": [],
+        }
+        world_ctx = {
+            "observed_at": "2026-11-25T13:00:00Z",
+            "weekly_event": "",
+            "work_orders": [],
+            "humans": [],
+            "owner_levels": {"wonky": 30, "logan": 10},
+            "qm_focus": set(),
+            "qm_mats_by_skill": {},
+        }
+        snap = build_snapshot(comp, world_ctx)
+        by_id = {c["id"]: c for c in snap["candidates"]}
+        self.assertLess(by_id["quest:zone_33"]["score"], 40)
+        self.assertGreater(by_id["craft:alchemy"]["score"], 75)
+        self.assertGreater(by_id["gather:herbalism"]["score"], 75)
+        plan = {
+            "character_id": "aldric",
+            "primary_goal_id": "gather:herbalism",
+            "secondary_goal_ids": ["craft:alchemy"],
+            "weight_modifiers": {"gather": 1.3, "craft": 1.2, "quest": 0.9},
+            "session_minutes": 120,
+            "reason_code": "catchup_herbalism",
+        }
+        w = weights_for_cpp(plan, snap, xp_capped_catchup=True)
+        self.assertLessEqual(w["quest_work"], 0.55)
+        self.assertGreaterEqual(w["craft"], 1.45)
+        self.assertGreaterEqual(w["gather"], 1.45)
+        self.assertLessEqual(w["travel"], 0.65)

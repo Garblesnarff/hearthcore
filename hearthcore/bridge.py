@@ -342,6 +342,12 @@ def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = No
         for r in human_rows if len(r) >= 3
     ]
 
+    # Authoritative owner levels (Wonky / Logan) for CompanionLevelLead XP-cap awareness
+    owner_levels: dict[str, int] = {}
+    for r in run_sql("SELECT name, level FROM characters WHERE name IN ('Wonky', 'Logan');"):
+        if len(r) >= 2:
+            owner_levels[r[0].lower()] = int(r[1])
+
     # Live Quartermaster directives (strictly reads live quartermaster.json, never shadow)
     qm_focus: set[str] = set()
     qm_mats_by_skill: dict[str, list[str]] = {}
@@ -363,10 +369,33 @@ def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = No
         "companions": companions,
         "work_orders": work_orders,
         "humans": humans,
+        "owner_levels": owner_levels,
         "qm_focus": qm_focus,
         "qm_mats_by_skill": qm_mats_by_skill,
         "proposals_by_plan_id": proposals_by_plan_id,
     }
+
+
+def _is_xp_capped_prof_catchup(comp: dict[str, Any], world_ctx: dict[str, Any]) -> tuple[bool, int]:
+    """Return (True, cap_level) when companion is near/at CompanionLevelLead XP cap AND has lagging primary skills."""
+    lvl = int(comp.get("level") or 0)
+    owner_levels = world_ctx.get("owner_levels") or {}
+    sg = str(comp.get("shift_group") or "")
+    owner_lvl = owner_levels.get("logan", 0) if sg == "core-logan" else owner_levels.get("wonky", 0)
+    if owner_lvl <= 0:
+        return False, 0
+    cap_lvl = owner_lvl + 3  # AiPlayerbot.CompanionLevelLead = 3
+    # Trigger catch-up at cap or 1 level below cap when primary professions lag badly behind character level
+    if lvl < cap_lvl - 1:
+        return False, cap_lvl
+    skills = comp.get("skills") or {}
+    target_skill = min(225, max(75, lvl * 4))
+    lagging = any(
+        val < target_skill
+        for sid, (val, _mx) in skills.items()
+        if sid in CRAFT_SKILLS or sid in GATHER_SKILLS
+    )
+    return lagging, cap_lvl
 
 
 def build_snapshot(
@@ -386,17 +415,24 @@ def build_snapshot(
     is_fish_night = "Fishing" in weekly
     is_sunday = "Sunday" in weekly
     res_map = order_reservations or {}
+    xp_capped_catchup, cap_lvl = _is_xp_capped_prof_catchup(comp, world_ctx)
 
     candidates: list[dict[str, Any]] = []
 
-    q_score = 78 if lvl < 20 else 72
-    if comp["shift_group"] in ("core-wonky", "core-logan"):
-        q_score = min(92, q_score + 8)
+    if xp_capped_catchup:
+        # Companion is at/near owner XP cap (0 XP from quests/mobs!) and primary professions lag behind level.
+        q_score = 32
+        q_desc = f"Quest around {zone} (Lv {lvl} XP-capped at {cap_lvl}: 0 XP — prefer catching up lagging professions!)"
+    else:
+        q_score = 78 if lvl < 20 else 72
+        if comp["shift_group"] in ("core-wonky", "core-logan"):
+            q_score = min(92, q_score + 8)
+        q_desc = f"Complete quests and turn-ins around {zone} (Lv {lvl})"
     candidates.append({
         "id": f"quest:zone_{comp['zone_id']}",
         "type": "quest",
         "score": q_score,
-        "description": f"Complete quests and turn-ins around {zone} (Lv {lvl})",
+        "description": q_desc[:240],
     })
 
     eligible_wos = []
@@ -437,20 +473,25 @@ def build_snapshot(
             sk_name = SKILL_NAMES[sk_id]
             gap = max(0, min(lvl * 5, mx) - val)
             qm_boost = 10 if sk_name.lower() in qm_focus else 0
-            score = min(92, 52 + gap // 2 + (14 if is_craft_night else 0) + qm_boost)
+            catchup_boost = 18 if (xp_capped_catchup and val < min(225, lvl * 4)) else 0
+            score = min(96, 52 + gap // 2 + (14 if is_craft_night else 0) + qm_boost + catchup_boost)
             candidates.append({
                 "id": f"craft:{_slug_token(sk_name)}",
                 "type": "craft",
                 "score": max(45, score),
-                "description": f"Advance {sk_name} ({val}/{mx}) and supply Hearthguard"
-                               + (" [Guild Priority]" if qm_boost else ""),
+                "description": (
+                    f"Advance {sk_name} ({val}/{mx}) and supply Hearthguard"
+                    + (" [XP-Cap Profession Catch-Up!]" if catchup_boost else "")
+                    + (" [Guild Priority]" if qm_boost else "")
+                )[:240],
             })
         elif sk_id in GATHER_SKILLS:
             sk_name = SKILL_NAMES[sk_id]
             gap = max(0, min(lvl * 5, mx) - val)
             needed_names = qm_mats.get(sk_name.lower(), [])[:3]
             qm_boost = 12 if (sk_name.lower() in qm_focus or needed_names) else 0
-            score = min(92, 54 + gap // 2 + (8 if is_craft_night else 0) + qm_boost)
+            catchup_boost = 18 if (xp_capped_catchup and val < min(225, lvl * 4)) else 0
+            score = min(96, 54 + gap // 2 + (8 if is_craft_night else 0) + qm_boost + catchup_boost)
             need_txt = f" — needs {', '.join(needed_names)}" if needed_names else ""
             spot_hint = best_farm_hint(sk_id, lvl)
             hint_txt = f" | {spot_hint}" if spot_hint else ""
@@ -458,7 +499,10 @@ def build_snapshot(
                 "id": f"gather:{_slug_token(sk_name)}",
                 "type": "gather",
                 "score": max(45, score),
-                "description": f"Gather {sk_name} ({val}/{mx}) for guild vault{need_txt}{hint_txt}"[:240],
+                "description": (
+                    f"Gather {sk_name} ({val}/{mx}) for guild vault{need_txt}{hint_txt}"
+                    + (" [XP-Cap Catch-Up!]" if catchup_boost else "")
+                )[:240],
             })
 
     if 356 in skills:
@@ -573,7 +617,12 @@ def build_snapshot(
     return snapshot(snap, comp["slug"])
 
 
-def weights_for_cpp(plan: dict[str, Any], snap: dict[str, Any]) -> dict[str, float]:
+def weights_for_cpp(
+    plan: dict[str, Any],
+    snap: dict[str, Any],
+    *,
+    xp_capped_catchup: bool = False,
+) -> dict[str, float]:
     """Translate validated Hearthcore plan into bounded 0.5-1.5 keys read by CompanionBrain.cpp."""
     mods = plan["weight_modifiers"]
     cand_type = {c["id"]: c["type"] for c in snap["candidates"]}
@@ -595,21 +644,35 @@ def weights_for_cpp(plan: dict[str, Any], snap: dict[str, Any]) -> dict[str, flo
         eff("guild_order") if "guild_order" in mods or primary_type == "guild_order" else 0.5,
     )
     craft_val = _clamp(craft_val)
+    gather_val = eff("gather")
+    train_val = eff("train")
+    travel_val = eff("travel")
+    hearth_val = eff("rest")
+
+    # When XP-capped with lagging professions, suppress 0-XP questing and lower travel penalty so
+    # city CraftSession / GatherFarm / Trainer visits win over remote 0-XP quest zones!
+    if xp_capped_catchup and primary_type in ("craft", "gather", "guild_order", "train", "profession", "fish"):
+        q = _clamp(min(q, 0.55))
+        craft_val = _clamp(max(craft_val, 1.45))
+        gather_val = _clamp(max(gather_val, 1.45))
+        train_val = _clamp(max(train_val, 1.35))
+        travel_val = _clamp(min(travel_val, 0.65))
+        hearth_val = _clamp(max(hearth_val, 1.35))
 
     return {
         "quest_work": q,
-        "quest_turnin": _clamp(max(q, 1.0)),
+        "quest_turnin": _clamp(max(q, 0.7 if xp_capped_catchup else 1.0)),
         "quest_hub": q,
-        "quest_grind": _clamp(min(q, 1.15)),
+        "quest_grind": _clamp(min(q, 0.55 if xp_capped_catchup else 1.15)),
         "craft": craft_val,
-        "gather": eff("gather"),
+        "gather": gather_val,
         "fish": eff("fish"),
-        "train": eff("train"),
+        "train": train_val,
         "bank": eff("bank"),
         "repair": eff("repair"),
         "sell": _clamp((eff("repair") + eff("bank")) / 2.0),
-        "travel": eff("travel"),
-        "hearth": eff("rest"),
+        "travel": travel_val,
+        "hearth": hearth_val,
     }
 
 
@@ -650,6 +713,7 @@ def apply_plan_to_db(
     plan_id: int = 0,
     now_ts: int | None = None,
     sql_exec=None,
+    xp_capped_catchup: bool = False,
 ) -> tuple[dict[str, float], dict[str, Any]]:
     """Re-validate plan and atomically write expiring overrides + typed proposal to MySQL.
 
@@ -663,7 +727,7 @@ def apply_plan_to_db(
     ts = int(now_ts if now_ts is not None else time.time())
     expires_at = ts + int(plan["session_minutes"]) * 60
     revision = int(plan_id) if int(plan_id) > 0 else ts
-    cpp_weights = weights_for_cpp(plan, snap)
+    cpp_weights = weights_for_cpp(plan, snap, xp_capped_catchup=xp_capped_catchup)
     prop = build_proposal_spec(plan, snap)
     db_src = "hearthcore_ai" if source == "anthropic" else "hearthcore_fb"
 
@@ -1234,7 +1298,8 @@ def run_cycle(
         else:
             plan = fallback(char_prof, snap)
 
-        cpp_w = weights_for_cpp(plan, snap)
+        xp_catchup, _ = _is_xp_capped_prof_catchup(comp, world_ctx)
+        cpp_w = weights_for_cpp(plan, snap, xp_capped_catchup=xp_catchup)
         prop_spec = build_proposal_spec(plan, snap)
         primary_desc = desc_by_id.get(plan["primary_goal_id"], plan["primary_goal_id"])
 
@@ -1276,6 +1341,7 @@ def run_cycle(
                 plan_id=plan_id,
                 now_ts=now_ts,
                 sql_exec=sql_exec,
+                xp_capped_catchup=xp_catchup,
             )
             mem.record_plan_intention(slug, plan, primary_desc, now_ts)
             picked_oid = parse_order_id(plan["primary_goal_id"])
