@@ -47,3 +47,7 @@ python3 -m hearthcore quartermaster-tick --provider anthropic
 - **Strict Allowlist:** Claude may only choose from verified candidate IDs generated from authoritative DB state. `core.validate()` rejects any unknown ID or out-of-range weight (`[0.5, 1.5]`).
 - **Zero LLM Chat:** No model output is ever sent to in-game chat.
 - **Zero API Cost by Default:** CLI dry runs default to deterministic fallback; live API runs enforce `HEARTHCORE_DAILY_CALL_CAP` and fall back cleanly on any error.
+
+## Roadmap — Phase II (proposed)
+
+See [The Living Guild technical specification](docs/PHASE_II_LIVING_GUILD.md) and [implementation cards and verification](docs/PHASE_II_IMPLEMENTATION.md). Cooperative stock dungeon gameplay, opportunity admission, readiness, persona identity and performance testing are proposed; live rollout depends on verified Phase I issues #3–9 and explicit owner approval.
