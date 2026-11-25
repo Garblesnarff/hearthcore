@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Azeroth Watch — Hearthguard</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">
+        <svg class="crest" viewBox="0 0 32 32" width="28" height="28" aria-hidden="true">
+          <path d="M16 2 L28 7 V16 C28 23.2 22.8 28.4 16 30 C9.2 28.4 4 23.2 4 16 V7 Z"
+                fill="#161d2b" stroke="#d6b25e" stroke-width="1.8"/>
+          <path d="M16 7 L21 16 L16 25 L11 16 Z" fill="#d6b25e" opacity="0.88"/>
+          <circle cx="16" cy="16" r="2.4" fill="#0a0d12"/>
+        </svg>
+        <div class="brand-text">
+          <div class="brand-title">AZEROTH WATCH</div>
+          <div class="brand-sub" id="realm-sub">Hearthguard · Loading...</div>
+        </div>
+      </div>
+
+      <div class="vitals-strip" id="vitals-strip">
+        <div class="pill status-pill" id="status-pill">
+          <span class="dot"></span>
+          <span id="status-text">CONNECTING</span>
+        </div>
+        <div class="pill tick-pill" title="Worldserver tick time (Update time diff)">
+          <span class="pill-label">TICK</span>
+          <span class="pill-val mono" id="tick-val">-- ms</span>
+          <svg id="tick-spark" class="sparkline" viewBox="0 0 88 22" width="88" height="22"></svg>
+        </div>
+        <div class="pill" title="Host & Worldserver memory/CPU">
+          <span class="pill-label">WS</span>
+          <span class="pill-val mono" id="ws-vitals">--</span>
+        </div>
+        <div class="pill" title="Acer host RAM & CPU">
+          <span class="pill-label">ACER</span>
+          <span class="pill-val mono" id="host-vitals">--</span>
+        </div>
+        <div class="pill" id="err-pill" title="Errors.log size & SlowBot warnings">
+          <span class="pill-label">ERR</span>
+          <span class="pill-val mono" id="err-val">0</span>
+        </div>
+        <div class="pill ai-pill" id="ai-pill" data-jump="brain" style="cursor:pointer" title="Claude AI Brain — click to open AI Brain tab (Shortcut: 4)">
+          <span class="pill-label">AI</span>
+          <span class="pill-val mono" id="ai-val">--</span>
+        </div>
+        <div class="pill event-pill" id="event-pill" style="display:none" title="Active Hearthguard Weekly Guild Event">
+          <span class="pill-label">EVENT</span>
+          <span class="pill-val" id="event-val"></span>
+        </div>
+      </div>
+
+      <div class="header-right">
+        <div class="humans-banner" id="humans-banner"></div>
+        <nav class="tabs" role="tablist">
+          <button class="tab active" data-view="overview" title="Shortcut: 1">Overview</button>
+          <button class="tab" data-view="vault" title="Shortcut: 2">Mats &amp; Profs</button>
+          <button class="tab" data-view="roster" title="Shortcut: 3">Raid Roster</button>
+          <button class="tab" data-view="brain" title="Shortcut: 4">AI Brain</button>
+        </nav>
+        <div class="clock-box">
+          <span class="live-dot" id="sse-dot" title="Live SSE connection"></span>
+          <span class="mono" id="clock-val">--:--</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- VIEW 1: OVERVIEW (Default fullscreen Acer display) -->
+    <main id="view-overview" class="view active">
+      <section class="raid-banner card" id="raid-banner"></section>
+
+      <div class="overview-grid">
+        <div class="col-main">
+          <section class="card panel-companions">
+            <div class="card-head">
+              <h2>Active Hearthguard Companions <span class="badge mono" id="comp-online-badge">0 / 38</span></h2>
+              <div class="head-meta" id="active-shifts-meta"></div>
+            </div>
+            <div class="companions-groups" id="companions-groups"></div>
+          </section>
+
+          <section class="card panel-profs-mini">
+            <div class="card-head">
+              <h2>Guild Profession Pipeline <span class="muted" id="prof-cap-label">Classic Cap 300</span></h2>
+              <button class="link-btn" data-jump="vault">Full Matrix &rarr;</button>
+            </div>
+            <div class="prof-mini-grid" id="prof-mini-grid"></div>
+          </section>
+
+          <section class="card panel-world-strip">
+            <div class="world-strip-inner" id="world-strip"></div>
+          </section>
+        </div>
+
+        <div class="col-side">
+          <section class="card panel-showcase">
+            <div class="card-head">
+              <h2 id="showcase-title">Hearthguard Vault Mats <span class="badge mono" id="showcase-badge">0 / 196</span></h2>
+              <div class="showcase-controls">
+                <button class="ctl-btn" id="sc-prev" title="Previous slide">◀</button>
+                <button class="ctl-btn" id="sc-pause" title="Pause / resume auto-rotation">⏸</button>
+                <button class="ctl-btn" id="sc-next" title="Next slide">▶</button>
+                <button class="link-btn" data-jump="vault">Vault &rarr;</button>
+              </div>
+            </div>
+            <div class="showcase-body" id="showcase-body">
+              <div class="vault-slide" id="vault-slide">
+                <div class="vault-cat-pills" id="vault-cat-pills"></div>
+                <div class="vault-top-items" id="vault-top-items"></div>
+              </div>
+              <div class="map-slide" id="map-slide" style="display:none"></div>
+            </div>
+            <div class="showcase-dots" id="showcase-dots"></div>
+          </section>
+
+          <section class="card panel-chronicle">
+            <div class="card-head">
+              <h2>Guild Chronicle <span class="muted">Live Events</span></h2>
+              <span class="badge mono" id="events-count-badge">0</span>
+            </div>
+            <div class="chronicle-list" id="chronicle-list"></div>
+          </section>
+
+          <section class="card panel-shifts">
+            <div class="card-head">
+              <h2>24-Hour Shift Schedule</h2>
+              <span class="muted mono" id="shift-now-label"></span>
+            </div>
+            <div class="shift-timeline" id="shift-timeline"></div>
+          </section>
+        </div>
+      </div>
+    </main>
+
+    <!-- VIEW 2: MATS & PROFESSIONS DEEP-DIVE -->
+    <main id="view-vault" class="view">
+      <div class="vault-grid">
+        <section class="card vault-full-panel">
+          <div class="card-head">
+            <h2>Hearthguard Guild Bank — All Materials <span class="badge mono" id="vault-full-stats"></span></h2>
+            <div class="filter-bar">
+              <input type="text" id="vault-search" placeholder="Filter item..." autocomplete="off" />
+              <div class="cat-filters" id="vault-cat-filters"></div>
+            </div>
+          </div>
+          <div class="vault-full-list" id="vault-full-list"></div>
+        </section>
+
+        <div class="vault-right-col">
+          <section class="card prof-full-panel">
+            <div class="card-head">
+              <h2>Profession Coverage Matrix</h2>
+              <span class="muted" id="prof-full-cap"></span>
+            </div>
+            <div class="prof-full-list" id="prof-full-list"></div>
+          </section>
+
+          <section class="card ledger-panel">
+            <div class="card-head">
+              <h2>Recent Material &amp; Craft Flow</h2>
+              <span class="muted">companion_ledger</span>
+            </div>
+            <div class="ledger-list" id="ledger-list"></div>
+          </section>
+        </div>
+      </div>
+    </main>
+
+    <!-- VIEW 3: RAID ROSTER & PROGRESSION -->
+    <main id="view-roster" class="view">
+      <div class="roster-grid">
+        <section class="card roster-table-panel">
+          <div class="card-head">
+            <h2>Hearthguard Full Roster <span class="badge mono" id="roster-total-badge">38</span></h2>
+            <div class="filter-bar">
+              <button class="chip active" data-rfilter="all">All</button>
+              <button class="chip" data-rfilter="online">Online</button>
+              <button class="chip" data-rfilter="tank">Tanks</button>
+              <button class="chip" data-rfilter="healer">Healers</button>
+              <button class="chip" data-rfilter="dps">DPS</button>
+            </div>
+          </div>
+          <div class="roster-table-wrap">
+            <table class="roster-table">
+              <thead>
+                <tr>
+                  <th>Companion</th>
+                  <th>Shift</th>
+                  <th>Role</th>
+                  <th>Lv / Cap</th>
+                  <th>Primary Professions</th>
+                  <th>Archetype</th>
+                  <th>Status / Zone</th>
+                  <th class="num">Hours</th>
+                </tr>
+              </thead>
+              <tbody id="roster-tbody"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <div class="roster-side-col">
+          <section class="card">
+            <div class="card-head">
+              <h2>Reputation Goals</h2>
+              <span class="muted">Toward Exalted</span>
+            </div>
+            <div id="rep-goals-list" class="stack-list"></div>
+          </section>
+
+          <section class="card">
+            <div class="card-head">
+              <h2>Guild Work Orders</h2>
+              <span class="muted">Guild Life v2</span>
+            </div>
+            <div id="work-orders-list" class="stack-list"></div>
+          </section>
+
+          <section class="card">
+            <div class="card-head">
+              <h2>Guild Bonds</h2>
+              <span class="muted">Top Affinity</span>
+            </div>
+            <div id="relationships-list" class="stack-list"></div>
+          </section>
+        </div>
+      </div>
+    </main>
+
+    <!-- VIEW 4: CLAUDE AI BRAIN OBSERVABILITY -->
+    <main id="view-brain" class="view">
+      <section class="card brain-toolbar">
+        <div class="brain-toolbar-left">
+          <span class="brain-tb-title">🧠 Hearthguard AI Brain</span>
+          <span class="muted">Out-of-loop goal planner (CompanionBrain) + Hourly Guild Quartermaster</span>
+        </div>
+        <div class="brain-toolbar-right">
+          <div class="model-switch" id="model-switch" title="Choose which Claude model plans individual companion sessions">
+            <span class="muted" style="font-size:11px;margin-right:4px">Companion Model:</span>
+            <button class="ms-btn" data-model="claude-haiku-5-5">Haiku 5.5 <span class="muted">(Fast)</span></button>
+            <button class="ms-btn" data-model="claude-sonnet-5-5">Sonnet 5.5 <span class="muted">(Smart)</span></button>
+          </div>
+          <button class="ctl-action-btn" id="btn-run-brain" title="Plan any online companions whose session has expired">⚡ Plan Bots</button>
+          <button class="ctl-action-btn" id="btn-run-qm" title="Run Claude Sonnet 5.5 Guild Quartermaster now">📦 Run Quartermaster</button>
+          <button class="ctl-action-btn subtle" id="btn-sync-credit" title="Set your exact remaining Anthropic credit balance">💰 Sync Balance</button>
+          <span class="brain-toast" id="brain-toast"></span>
+        </div>
+      </section>
+
+      <section class="card brain-kpi-strip" id="brain-kpi-strip"></section>
+
+      <section class="card qm-panel" id="qm-panel" style="display:none">
+        <div class="card-head">
+          <h2>Guild Quartermaster &amp; 40-Character Supply Deficits <span class="badge mono" id="qm-model-badge"></span></h2>
+          <div class="head-meta" id="qm-focus-pills"></div>
+        </div>
+        <div class="qm-summary" id="qm-summary"></div>
+        <div class="qm-deficits-grid" id="qm-deficits-grid"></div>
+      </section>
+
+      <div class="brain-grid">
+        <section class="card brain-plans-panel">
+          <div class="card-head">
+            <h2>What Each Companion Is Focused On <span class="badge mono" id="brain-active-badge">0 active</span></h2>
+            <span class="muted">Plain-English goals &amp; priority nudges (zero in-game chat)</span>
+          </div>
+          <div class="roster-table-wrap">
+            <table class="roster-table">
+              <thead>
+                <tr>
+                  <th>Companion</th>
+                  <th>Current Focus &amp; Why Claude Picked It</th>
+                  <th>Backup Plans</th>
+                  <th>Bot Priority Nudges</th>
+                  <th class="num">Session &amp; Results</th>
+                </tr>
+              </thead>
+              <tbody id="brain-plans-tbody"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="card brain-history-panel">
+          <div class="card-head">
+            <h2>Recent Claude Decisions <span class="badge mono" id="brain-hist-badge">0</span></h2>
+            <span class="muted">Live audit log</span>
+          </div>
+          <div class="brain-history-list" id="brain-history-list"></div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

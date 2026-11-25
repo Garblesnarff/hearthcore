@@ -1,0 +1,15 @@
+[Unit]
+Description=Azeroth Watch — Lightweight Hearthguard Observability Daemon
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/wonky/azeroth-watch
+ExecStart=/usr/bin/taskset -c 0-1 /usr/bin/nice -n 15 /usr/bin/python3 /home/wonky/azeroth-watch/server.py --host 0.0.0.0 --port 8787 --interval 4.0
+Restart=on-failure
+RestartSec=3
+MemoryHigh=80M
+MemoryMax=128M
+
+[Install]
+WantedBy=default.target

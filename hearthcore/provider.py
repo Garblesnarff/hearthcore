@@ -33,7 +33,13 @@ def _strip_json_fences(text: str) -> str:
     return m.group(1).strip() if m else text.strip()
 
 
-def anthropic_with_meta(p, snap, model: str | None = None, effort: str | None = None):
+def anthropic_with_meta(
+    p,
+    snap,
+    model: str | None = None,
+    effort: str | None = None,
+    memory: dict | None = None,
+):
     """Call Anthropic Messages API for one validated session plan, returning (plan, meta)."""
     load_env()
     key = os.getenv("ANTHROPIC_API_KEY")
@@ -45,15 +51,22 @@ def anthropic_with_meta(p, snap, model: str | None = None, effort: str | None = 
     system = (
         "You are the out-of-game session goal planner for a single Alliance companion in a private "
         "WoW WotLK guild (Hearthguard). Pick coherent session goals that fit the character's "
-        "archetype, culture, professions, motivations, and current verified candidates. "
-        "Only use eligible candidate IDs provided in snapshot.candidates. Never invent game events, "
-        "items, or privileges. Return ONLY a raw JSON object with exact keys: "
+        "archetype, culture, professions, motivations, persistent memory (open intentions, milestones, "
+        "social bonds, variety/stall hints), and current verified candidates. "
+        "Only use eligible candidate IDs provided in snapshot.candidates. Respect '[Claimed by ...]' "
+        "soft reservations on guild orders when another good candidate exists, and heed stall_caution "
+        "or variety_hint when present. Never invent game events, items, or privileges. "
+        "Return ONLY a raw JSON object with exact keys: "
         "character_id, primary_goal_id, secondary_goal_ids, weight_modifiers, session_minutes, reason_code. "
         "Rules: max 3 unique secondary_goal_ids (none equal to primary_goal_id); weight_modifiers keys "
         "must be from allowed candidate types and values strictly between 0.5 and 1.5; session_minutes "
         "integer 20-240; reason_code short snake_case identifier (alphanumeric/underscore/colon/dot/dash, "
         "no spaces). No markdown fences, no commentary, JSON only."
     )
+
+    user_body = {"profile": p, "snapshot": snap}
+    if memory:
+        user_body["memory"] = memory
 
     payload = {
         "model": use_model,
@@ -62,7 +75,7 @@ def anthropic_with_meta(p, snap, model: str | None = None, effort: str | None = 
         "messages": [
             {
                 "role": "user",
-                "content": json.dumps({"profile": p, "snapshot": snap}, separators=(",", ":")),
+                "content": json.dumps(user_body, separators=(",", ":")),
             }
         ],
     }

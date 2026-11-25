@@ -22,6 +22,7 @@ from typing import Any
 
 from .core import Invalid, ROOT, fallback, profile, profiles, snapshot, validate
 from .guides import LEVELING_ORDER_CATALOG, ORDER_BY_ENTRY, SKILL_NAMES, best_farm_hint
+from .memory import MemoryEngine, goal_category, parse_order_id
 from .provider import anthropic_with_meta, load_env
 
 DB_CONTAINER = "ac-database"
@@ -125,6 +126,7 @@ def fetch_world_context() -> dict[str, Any]:
             "skills": {},
             "orders_delivered": 0,
             "recent_events": [],
+            "social_bonds": [],
         }
         guid_to_slug[guid] = slug
 
@@ -148,12 +150,35 @@ def fetch_world_context() -> dict[str, Any]:
     online_guids = [str(c["guid"]) for c in companions.values() if c["online"]]
     if online_guids:
         oglist = ",".join(online_guids)
-        # Recent 4 events per online companion
-        for r in run_sql(f"SELECT guid, event_type, summary FROM companion_events WHERE guid IN ({oglist}) ORDER BY id DESC LIMIT 120;"):
+        # Recent 5 factual milestones per online companion (never decay)
+        for r in run_sql(f"SELECT guid, event_type, summary FROM companion_events WHERE guid IN ({oglist}) ORDER BY id DESC LIMIT 180;"):
             if len(r) >= 3:
                 sl = guid_to_slug.get(int(r[0]))
-                if sl and len(companions[sl]["recent_events"]) < 4:
-                    companions[sl]["recent_events"].append(f"{r[1]}: {r[2][:70]}")
+                if sl and len(companions[sl]["recent_events"]) < 5:
+                    companions[sl]["recent_events"].append(f"{r[1]}: {r[2][:72]}")
+
+        # Top 3 social bonds per online companion from companion_relationships
+        rel_rows = run_sql(f"""
+            SELECT r.guid_a, ca.name, r.guid_b, cb.name, r.runs_together, r.help_given, r.affinity, r.last_event
+            FROM companion_relationships r
+            JOIN characters ca ON ca.guid = r.guid_a
+            JOIN characters cb ON cb.guid = r.guid_b
+            WHERE r.guid_a IN ({oglist}) OR r.guid_b IN ({oglist})
+            ORDER BY r.affinity DESC, r.runs_together DESC
+            LIMIT 160;
+        """)
+        for r in rel_rows:
+            if len(r) < 8:
+                continue
+            ga, na, gb, nb = int(r[0]), r[1], int(r[2]), r[3]
+            runs, helps, aff, last_ev = int(r[4]), int(r[5]), int(r[6]), r[7][:48]
+            for g_me, other_name in ((ga, nb), (gb, na)):
+                sl = guid_to_slug.get(g_me)
+                if sl and len(companions[sl]["social_bonds"]) < 3:
+                    bond = f"{other_name} (affinity {aff}, {runs} runs, {helps} helps)"
+                    if last_ev:
+                        bond = f"{bond}: {last_ev}"
+                    companions[sl]["social_bonds"].append(bond[:110])
 
     # Open guild work orders
     work_orders: list[dict[str, Any]] = []
@@ -210,7 +235,13 @@ def fetch_world_context() -> dict[str, Any]:
     }
 
 
-def build_snapshot(comp: dict[str, Any], world_ctx: dict[str, Any]) -> dict[str, Any]:
+def build_snapshot(
+    comp: dict[str, Any],
+    world_ctx: dict[str, Any],
+    *,
+    memory_ctx: dict[str, Any] | None = None,
+    order_reservations: dict[int, str] | None = None,
+) -> dict[str, Any]:
     """Generate a strictly validated candidate snapshot for one companion from authoritative DB state."""
     lvl = comp["level"]
     zone = comp["zone"]
@@ -219,6 +250,7 @@ def build_snapshot(comp: dict[str, Any], world_ctx: dict[str, Any]) -> dict[str,
     is_craft_night = "Craft" in weekly
     is_fish_night = "Fishing" in weekly
     is_sunday = "Sunday" in weekly
+    res_map = order_reservations or {}
 
     candidates: list[dict[str, Any]] = []
 
@@ -234,27 +266,38 @@ def build_snapshot(comp: dict[str, Any], world_ctx: dict[str, Any]) -> dict[str,
     })
 
     # 2. Eligible open guild work orders matching a skill this companion holds AT/NEAR the required skill level
-    added_wo = 0
+    #    Apply soft work-order reservations so online crafters spread across distinct orders.
+    eligible_wos = []
     for wo in world_ctx.get("work_orders", []):
         if wo["requester_guid"] == comp["guid"]:
             continue
         sk = wo["skill"]
-        if not sk or sk not in skills or added_wo >= 3:
+        if not sk or sk not in skills:
             continue
         comp_sk_val = skills[sk][0]
         tpl = ORDER_BY_ENTRY.get(wo["item_entry"])
         if tpl and comp_sk_val + 15 < tpl.min_skill:
             continue
+        holder = res_map.get(int(wo["id"]))
+        claimed_by_other = bool(holder and holder != comp["slug"])
+        eligible_wos.append((claimed_by_other, holder or "", wo, sk, comp_sk_val, tpl))
+
+    # Prefer unreserved orders first so the top-3 candidate slice naturally de-conflicts crafters
+    eligible_wos.sort(key=lambda x: (1 if x[0] else 0, -(x[5].priority if x[5] else 1)))
+    for claimed_by_other, holder, wo, sk, comp_sk_val, tpl in eligible_wos[:3]:
         score = 88 if is_craft_night else 82
         if tpl and tpl.priority == 2:
             score = min(90, score + 2)
+        claim_note = ""
+        if claimed_by_other:
+            score = max(40, score - 25)
+            claim_note = f" [Claimed by {holder.title()}]"
         candidates.append({
             "id": f"guild_order:{wo['id']}:{_slug_token(wo['item_name'])}",
             "type": "guild_order",
             "score": score,
-            "description": f"Craft {wo['quantity']}x {wo['item_name']} for {wo['requester_name']} ({SKILL_NAMES.get(sk, 'craft')} {comp_sk_val})"[:240],
+            "description": f"Craft {wo['quantity']}x {wo['item_name']} for {wo['requester_name']} ({SKILL_NAMES.get(sk, 'craft')} {comp_sk_val}){claim_note}"[:240],
         })
-        added_wo += 1
 
     # 3. Primary crafting & gathering professions (aligned with Claude Quartermaster guild deficits!)
     qm_focus = world_ctx.get("qm_focus") or set()
@@ -369,6 +412,23 @@ def build_snapshot(comp: dict[str, Any], world_ctx: dict[str, Any]) -> dict[str,
             "score": 52,
             "description": f"Explore neighboring hubs and questing roads near {zone}",
         })
+
+    # Apply bounded Memory v1 adjustments (variety fatigue + scoped stall caution only)
+    if memory_ctx:
+        fat_cat = str(memory_ctx.get("fatigue_category") or "")
+        stalled_id = str(memory_ctx.get("stalled_goal_id") or "")
+        for cand in candidates:
+            sc = int(cand["score"])
+            if fat_cat:
+                c_cat = goal_category(cand["id"])
+                if c_cat == fat_cat:
+                    sc -= 4 if cand["type"] == "guild_order" else 8
+                elif cand["type"] in ("quest", "gather", "craft", "fish"):
+                    sc += 6
+            if stalled_id and cand["id"] == stalled_id:
+                sc -= 15
+                cand["description"] = f"{cand['description']} [Stalled: 0 progress]"[:240]
+            cand["score"] = max(1, min(100, sc))
 
     snap = {
         "character_id": comp["slug"],
@@ -680,8 +740,36 @@ class BrainStore:
         }
 
 
-def write_active_plans_json(store: BrainStore, now_ts: int) -> dict[str, Any]:
+def write_active_plans_json(
+    store: BrainStore,
+    now_ts: int,
+    mem: MemoryEngine | None = None,
+) -> dict[str, Any]:
     data = store.summary(now_ts)
+    if mem is not None:
+        intentions_map = mem.all_open_intentions()
+        alerts: list[dict[str, Any]] = []
+        fatigue_map: dict[str, dict[str, Any]] = {}
+        for slug, pinfo in data.get("plans", {}).items():
+            rec = mem.analyze_recent_plans(slug, now_ts)
+            pinfo["open_intentions"] = [it["label"] for it in intentions_map.get(slug, [])]
+            pinfo["fatigue_category"] = rec["fatigue_category"]
+            pinfo["fatigue_streak"] = rec["fatigue_streak"]
+            pinfo["stalled_goal_id"] = rec["stalled_goal_id"]
+            if rec["fatigue_category"]:
+                fatigue_map[slug] = {
+                    "category": rec["fatigue_category"],
+                    "streak": rec["fatigue_streak"],
+                }
+            if rec["operational_alert"]:
+                alerts.append(rec["operational_alert"])
+        data["memory"] = {
+            "open_intentions": intentions_map,
+            "completed_intentions": mem.recent_completed_intentions(10),
+            "operational_alerts": alerts,
+            "active_reservations": {str(k): v for k, v in mem.active_order_reservations(now_ts).items()},
+            "fatigue_count": len(fatigue_map),
+        }
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     tmp = ACTIVE_PLANS_PATH.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
@@ -702,12 +790,14 @@ def run_cycle(
     now_ts = int(time.time())
     day_key = datetime.now().strftime("%Y-%m-%d")
     daily_cap = int(os.getenv("HEARTHCORE_DAILY_CALL_CAP", "100"))
-    cfg_model = os.getenv("ANTHROPIC_MODEL", "claude-haiku-5-5")
+    cfg_model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
     cfg_effort = os.getenv("ANTHROPIC_EFFORT", "medium")
 
     store = BrainStore()
+    mem = MemoryEngine(store.path)
     world_ctx = fetch_world_context()
     store.refresh_outcomes(world_ctx["companions"], now_ts)
+    reservations = mem.active_order_reservations(now_ts)
     known_slugs = set(profiles())
 
     targets = []
@@ -731,7 +821,13 @@ def run_cycle(
     for comp in targets:
         slug = comp["slug"]
         char_prof = profile(slug)
-        snap = build_snapshot(comp, world_ctx)
+        mem_ctx = mem.build_packet(comp, world_ctx, now_ts)
+        snap = build_snapshot(
+            comp,
+            world_ctx,
+            memory_ctx=mem_ctx,
+            order_reservations=reservations,
+        )
         desc_by_id = {c["id"]: c["description"] for c in snap["candidates"]}
 
         source = provider
@@ -745,7 +841,13 @@ def run_cycle(
                 plan = fallback(char_prof, snap)
             else:
                 try:
-                    plan, meta = anthropic_with_meta(char_prof, snap, model=cfg_model, effort=cfg_effort)
+                    plan, meta = anthropic_with_meta(
+                        char_prof,
+                        snap,
+                        model=cfg_model,
+                        effort=cfg_effort,
+                        memory=mem_ctx["packet"],
+                    )
                     api_calls_used += 1
                 except Invalid as exc:
                     source = "fallback_after_api"
@@ -779,6 +881,11 @@ def run_cycle(
             start_skill_sum=sum(v for v, _ in comp["skills"].values()),
             start_orders_done=int(comp.get("orders_delivered", 0)),
         )
+        mem.record_plan_intention(slug, plan, primary_desc, now_ts)
+        # Immediately update in-memory soft reservations so subsequent bots in this same tick don't collide
+        picked_oid = parse_order_id(plan["primary_goal_id"])
+        if picked_oid is not None:
+            reservations[picked_oid] = slug
         planned.append({
             "name": comp["name"],
             "level": comp["level"],
@@ -792,7 +899,7 @@ def run_cycle(
             "error": err_note,
         })
 
-    summary = write_active_plans_json(store, now_ts)
+    summary = write_active_plans_json(store, now_ts, mem=mem)
     return {
         "planned_count": len(planned),
         "planned": planned,

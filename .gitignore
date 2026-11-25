@@ -8,3 +8,5 @@ __pycache__/
 *.db-*
 runtime/
 plans/
+azeroth-watch/static/icons/
+azeroth-watch/static/maps/

@@ -1,0 +1,13 @@
+[Unit]
+Description=Hearthcore AI Brain session-boundary planner (Claude AI via .env)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/wonky/hearthcore
+ExecStart=/usr/bin/python3 -m hearthcore brain-tick --provider anthropic
+Nice=15
+CPUQuota=20%
+MemoryMax=128M
+StandardOutput=journal
+StandardError=journal

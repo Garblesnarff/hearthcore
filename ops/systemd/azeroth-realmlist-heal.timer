@@ -1,0 +1,10 @@
+[Unit]
+Description=Check AzerothCore realmlist.flag every 60s (and 45s after boot)
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=60s
+Unit=azeroth-realmlist-heal.service
+
+[Install]
+WantedBy=timers.target
