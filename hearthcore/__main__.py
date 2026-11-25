@@ -36,6 +36,13 @@ def main():
     qm.add_argument("--shadow", action="store_true", help="Compute & log without writing DB")
     qm.add_argument("--model", help="Override strategist model (default: claude-sonnet-5-5)")
 
+    commands.add_parser("phase2-shadow-match", help="Run pure Phase II shadow dungeon matchmaking (zero live DB writes)")
+    commands.add_parser("phase2-readiness", help="Evaluate distinct-persona Raid Readiness & shortfalls (read-only)")
+    bmk = commands.add_parser("phase2-benchmark", help="Capture non-destructive live baseline benchmark artifact")
+    bmk.add_argument("--scenario", default="baseline_outdoor_solo")
+    bmk.add_argument("--samples", type=int, default=3)
+    bmk.add_argument("--interval", type=float, default=2.0)
+
     args = cli.parse_args()
     try:
         if args.command in ("roster", "validate-roster"):
@@ -123,6 +130,56 @@ def main():
                 print(f"  {br['name']:<22} min={br['min_count']:<3} ({br['note']})")
             if res["error_note"]:
                 print("Error note:", res["error_note"])
+            return 0
+
+        if args.command == "phase2-shadow-match":
+            from .bridge import BRAIN_DB_PATH, RUNTIME_DIR, fetch_world_context
+            from .opportunities import run_shadow_match_snapshot
+            import urllib.request
+            vitals = {}
+            raid_stage = 0
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:8787/api/state", timeout=3) as r:
+                    st = json.load(r)
+                vitals = {
+                    "mem_avail_gib": (st.get("vitals") or {}).get("mem_avail_gib"),
+                    "tick_p99": (st.get("ticks") or {}).get("p99"),
+                }
+                raid_stage = int((st.get("raid") or {}).get("stage") or 0)
+            except Exception:
+                pass
+            world_ctx = fetch_world_context()
+            res = run_shadow_match_snapshot(
+                world_ctx, db_path=BRAIN_DB_PATH, runtime_dir=RUNTIME_DIR, vitals=vitals, raid_stage=raid_stage
+            )
+            print(f"Phase II Shadow Match | coop_live={res['coop_enabled_live']} | headroom_ok={res['headroom']['admit_ok']} ({res['headroom']['reasons'] or 'OK'})")
+            for d in res["shadow_dungeons"]:
+                print(
+                    f"  {d['name']:<16} (Lv {d['level_band']}) eligible={d['eligible_counts']} "
+                    f"feasible={d['feasible_now']} shortfalls={d['shortfalls']} live_enabled={d['pilot_enabled_live']}"
+                )
+            return 0
+
+        if args.command == "phase2-readiness":
+            from .bridge import RUNTIME_DIR, fetch_world_context
+            from .readiness import evaluate_raid_roster
+            world_ctx = fetch_world_context()
+            rep = evaluate_raid_roster(world_ctx["companions"], raid_stage=0, observed_at=world_ctx["observed_at"])
+            out_path = RUNTIME_DIR / "phase2_readiness.json"
+            RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(rep, indent=2) + "\n", encoding="utf-8")
+            print(f"Raid Readiness ({rep['tier_name']}): {rep['summary_counts']} | feasible_now={rep['feasible_now']}")
+            for b in rep["bottlenecks"]:
+                print("  -", b)
+            return 0
+
+        if args.command == "phase2-benchmark":
+            from .benchmark import run_live_baseline_benchmark
+            art = run_live_baseline_benchmark(
+                scenario=args.scenario, sample_count=args.samples, interval_sec=args.interval
+            )
+            print(f"Benchmark saved: {art['saved_path']}")
+            print(f"Metrics: {art['metrics']} | correctness={art['all_correctness_passed']} | sha256={art['artifact_sha256'][:16]}")
             return 0
 
         character = profile(args.character)

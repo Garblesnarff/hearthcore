@@ -42,6 +42,8 @@ PLAYERBOTS_LOG = os.path.join(LOG_DIR, "Playerbots.log")
 LIVE_POS_FILE = os.path.join(LOG_DIR, "live_positions.json")
 AI_PLANS_FILE = "/home/wonky/hearthcore/runtime/active_plans.json"
 AI_QM_FILE = "/home/wonky/hearthcore/runtime/quartermaster.json"
+AI_P2_SHADOW_FILE = "/home/wonky/hearthcore/runtime/phase2_shadow.json"
+AI_P2_READY_FILE = "/home/wonky/hearthcore/runtime/phase2_readiness.json"
 AI_BRAIN_DB = "/home/wonky/hearthcore/runtime/brain.db"
 AI_ENV_FILE = "/home/wonky/hearthcore/.env"
 WORLDMAP_META_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "worldmap_areas.json")
@@ -548,6 +550,8 @@ class AzerothCollector:
             },
             "model_stats": [],
             "budget": {},
+            "phase2_shadow": None,
+            "phase2_readiness": None,
             "memory": {
                 "open_intentions": {},
                 "completed_intentions": [],
@@ -610,6 +614,12 @@ class AzerothCollector:
             if os.path.isfile(AI_QM_FILE):
                 with open(AI_QM_FILE, "r", encoding="utf-8") as f:
                     ai_brain["quartermaster"] = json.load(f)
+            if os.path.isfile(AI_P2_SHADOW_FILE):
+                with open(AI_P2_SHADOW_FILE, "r", encoding="utf-8") as f:
+                    ai_brain["phase2_shadow"] = json.load(f)
+            if os.path.isfile(AI_P2_READY_FILE):
+                with open(AI_P2_READY_FILE, "r", encoding="utf-8") as f:
+                    ai_brain["phase2_readiness"] = json.load(f)
             if os.path.isfile(AI_BRAIN_DB):
                 now_epoch = int(time.time())
                 today_key = now.strftime("%Y-%m-%d")

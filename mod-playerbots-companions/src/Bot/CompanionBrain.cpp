@@ -51,6 +51,16 @@ std::unordered_map<uint32, ActiveOrderProp> gActiveOrderProps;  // lowGuid -> ac
 bool gPropMissingLogged = false;
 bool gOverrideMissingLogged = false;
 
+struct CoopMembership
+{
+    uint64 opportunityId = 0;
+    uint32 targetMapId = 0;
+    uint32 groupId = 0;
+    uint32 expiresAt = 0;
+};
+std::mutex gCoopMutex;
+std::unordered_map<uint32, CoopMembership> gCoopMembers;  // lowGuid -> active authorized coop run
+
 // WotLK 3.3.5a (1-450) profession leveling-guide materials whitelist (Mining/BS, Eng, JC, Herb/Alch, Inscription,
 // Skinning/LW, Tailoring, Enchanting, First Aid, and guide-standard Cooking meats/fish).
 std::unordered_set<uint32> const& LevelingGuideMats()
@@ -317,12 +327,14 @@ void CompanionBrain::Update(uint32 elapsed)
         ReloadBankRequests();
         _proposalTimer = 0;
         ReloadProposals();
+        ReloadCoopMemberships();
         return;
     }
     if (_proposalTimer >= PROPOSAL_REFRESH_MS)
     {
         _proposalTimer = 0;
         ReloadProposals();
+        ReloadCoopMemberships();
     }
 }
 
@@ -688,6 +700,78 @@ void CompanionBrain::MarkProposalCompleted(uint32 lowGuid, uint64 proposalId, ui
         "UPDATE companion_proposals SET status = 'completed', outcome_reason = 'order_delivered', "
         "ended_at = {}, progress_delta = {} WHERE id = {}",
         now, progressDelta, proposalId);
+}
+
+bool CompanionBrain::CoopEnabled()
+{
+    // Safe default OFF (Phase II Card II-05/II-11 feature gate).
+    return sConfigMgr->GetOption<bool>("AiPlayerbot.Companion.Coop.Enabled", false, false);
+}
+
+void CompanionBrain::ReloadCoopMemberships()
+{
+    if (!CoopEnabled())
+    {
+        std::lock_guard<std::mutex> lock(gCoopMutex);
+        if (!gCoopMembers.empty())
+            gCoopMembers.clear();
+        return;
+    }
+
+    QueryResult probe = CharacterDatabase.Query(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() "
+        "AND table_name IN ('companion_opportunities', 'companion_opportunity_interests')");
+    if (!probe || probe->Fetch()[0].Get<uint64>() < 2)
+        return;
+
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    uint32 const graceSec = sConfigMgr->GetOption<uint32>("AiPlayerbot.Companion.Coop.ExitGraceMinutes", 10, false) * 60;
+    std::unordered_map<uint32, CoopMembership> next;
+
+    QueryResult res = CharacterDatabase.Query(
+        "SELECT o.id, o.dungeon_map_id, o.group_guid, o.recruit_until, o.estimated_minutes, i.character_guid "
+        "FROM companion_opportunities o "
+        "JOIN companion_opportunity_interests i ON i.opportunity_id = o.id "
+        "WHERE o.is_shadow = 0 AND o.state IN ('assembling', 'active') "
+        "AND i.state IN ('reserved', 'accepted', 'active') LIMIT 25");
+    if (res)
+    {
+        do
+        {
+            Field* f = res->Fetch();
+            uint64 const oppId = f[0].Get<uint64>();
+            uint32 const mapId = f[1].Get<uint32>();
+            uint32 const grpGuid = f[2].Get<uint32>();
+            uint32 const baseUntil = f[3].Get<uint32>();
+            uint32 const estMin = f[4].Get<uint32>();
+            uint32 const charGuid = f[5].Get<uint32>();
+            uint32 const expAt = baseUntil + estMin * 60 + graceSec;
+            if (expAt <= now)
+                continue;
+            next[charGuid] = CoopMembership{oppId, mapId, grpGuid, expAt};
+        } while (res->NextRow());
+    }
+
+    std::lock_guard<std::mutex> lock(gCoopMutex);
+    gCoopMembers.swap(next);
+}
+
+bool CompanionBrain::IsAuthorizedCoopMember(uint32 lowGuid, uint64& outOppId, uint32& outTargetMap, uint32& outGroupId)
+{
+    outOppId = 0;
+    outTargetMap = 0;
+    outGroupId = 0;
+    if (!CoopEnabled())
+        return false;
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    std::lock_guard<std::mutex> lock(gCoopMutex);
+    auto it = gCoopMembers.find(lowGuid);
+    if (it == gCoopMembers.end() || it->second.expiresAt <= now)
+        return false;
+    outOppId = it->second.opportunityId;
+    outTargetMap = it->second.targetMapId;
+    outGroupId = it->second.groupId;
+    return true;
 }
 
 float CompanionBrain::Weight(uint32 lowGuid, std::string const& key, float defaultValue)

@@ -23,9 +23,12 @@ done
 echo "[sync] 2/4 mod-playerbots companion C++ mirror..."
 mkdir -p "$REPO_ROOT/mod-playerbots-companions/src/Bot" \
          "$REPO_ROOT/mod-playerbots-companions/src/Ai/Base/Actions" \
+         "$REPO_ROOT/mod-playerbots-companions/src/Ai/Base/Strategy" \
          "$REPO_ROOT/mod-playerbots-companions/src/Script"
 cp -f "$MPB_SRC"/src/Bot/Companion*.{h,cpp} "$REPO_ROOT/mod-playerbots-companions/src/Bot/"
+cp -f "$MPB_SRC/src/Bot/PlayerbotAI.h" "$REPO_ROOT/mod-playerbots-companions/src/Bot/"
 cp -f "$MPB_SRC/src/Ai/Base/Actions/ReviveFromCorpseAction.cpp" "$REPO_ROOT/mod-playerbots-companions/src/Ai/Base/Actions/"
+cp -f "$MPB_SRC/src/Ai/Base/Strategy/CompanionLeadStrategy.cpp" "$REPO_ROOT/mod-playerbots-companions/src/Ai/Base/Strategy/"
 cp -f "$MPB_SRC/src/Script/PlayerbotCommandScript.cpp" "$REPO_ROOT/mod-playerbots-companions/src/Script/"
 
 echo "[sync] 3/4 Operational scripts & LAN laptop installer..."

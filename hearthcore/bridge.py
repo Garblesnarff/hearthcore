@@ -38,6 +38,7 @@ from .memory import (
     is_advisory_goal,
     parse_order_id,
 )
+from .playstyle import apply_playstyle_scoring
 from .provider import anthropic_with_meta, load_env
 
 DB_CONTAINER = "ac-database"
@@ -374,6 +375,7 @@ def build_snapshot(
     *,
     memory_ctx: dict[str, Any] | None = None,
     order_reservations: dict[int, str] | None = None,
+    char_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Generate a strictly validated candidate snapshot for one companion from authoritative DB state."""
     lvl = comp["level"]
@@ -552,6 +554,16 @@ def build_snapshot(
                 sc -= 15
                 cand["description"] = f"{cand['description']} [Stalled: 0 progress]"[:240]
             cand["score"] = max(1, min(100, sc))
+
+    has_fat = bool(memory_ctx and memory_ctx.get("fatigue_category"))
+    has_stall = bool(memory_ctx and memory_ctx.get("stalled_goal_id"))
+    if char_profile is not None:
+        candidates, _ = apply_playstyle_scoring(
+            candidates,
+            char_profile,
+            has_fatigue_nudge=has_fat,
+            has_stall_caution=has_stall,
+        )
 
     snap = {
         "character_id": comp["slug"],
@@ -1185,6 +1197,7 @@ def run_cycle(
             world_ctx,
             memory_ctx=mem_ctx,
             order_reservations=reservations,
+            char_profile=char_prof,
         )
         desc_by_id = {c["id"]: c["description"] for c in snap["candidates"]}
 

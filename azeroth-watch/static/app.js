@@ -801,6 +801,46 @@
       })
       .join("");
 
+    // Phase II Shadow Opportunity Board & Raid Readiness (Card II-07/II-08)
+    const p2El = $("p2-summary-list");
+    if (p2El) {
+      const p2s = d.ai_brain && d.ai_brain.phase2_shadow;
+      const p2r = d.ai_brain && d.ai_brain.phase2_readiness;
+      const badge = $("p2-mode-badge");
+      if (badge) {
+        badge.textContent = p2s && p2s.coop_enabled_live ? "COOP LIVE" : "SHADOW / OFF";
+      }
+      const blocks = [];
+      if (p2s && p2s.shadow_dungeons) {
+        const hr = p2s.headroom || {};
+        blocks.push(`
+          <div class="stack-item">
+            <div style="display:flex;justify-content:space-between">
+              <b>Pilot Dungeons (Shadow Match)</b>
+              <span class="act-badge">${hr.admit_ok ? "Headroom OK" : "Paused"}</span>
+            </div>
+            ${p2s.shadow_dungeons
+              .map(
+                (dg) =>
+                  `<div class="muted" style="font-size:11px;margin-top:2px"><b>${esc(dg.name)}</b> (Lv ${esc(dg.level_band)}): T:${dg.eligible_counts.tank} H:${dg.eligible_counts.healer} D:${dg.eligible_counts.damage} · ${dg.feasible_now ? '<span style="color:var(--green)">Feasible</span>' : "Waiting"}</div>`
+              )
+              .join("")}
+          </div>`);
+      }
+      if (p2r) {
+        const sc = p2r.summary_counts || {};
+        blocks.push(`
+          <div class="stack-item">
+            <div style="display:flex;justify-content:space-between">
+              <b>${esc(p2r.tier_name || "Raid Readiness")}</b>
+              <span class="mono muted">${sc.ready_available || 0} ready · ${sc.unknown || 0} unk</span>
+            </div>
+            <div class="muted" style="font-size:11px;margin-top:2px">${(p2r.bottlenecks || []).slice(0, 3).map(esc).join(" · ") || "Roster feasible"}</div>
+          </div>`);
+      }
+      p2El.innerHTML = blocks.join("") || `<div class="empty-note">Run <code>phase2-shadow-match</code> &amp; <code>phase2-readiness</code> to populate.</div>`;
+    }
+
     // Rep goals
     $("rep-goals-list").innerHTML =
       d.raid.rep_goals.length > 0

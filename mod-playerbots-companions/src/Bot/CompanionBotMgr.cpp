@@ -1282,6 +1282,32 @@ bool CompanionBotMgr::IsGroupedWithOwner(Player const* bot) const
     return group && ownerLow && group->IsMember(ObjectGuid::Create<HighGuid::Player>(ownerLow));
 }
 
+bool CompanionBotMgr::IsInAuthorizedCoopGroup(Player const* bot) const
+{
+    if (!bot || !CompanionBrain::CoopEnabled())
+        return false;
+    Group const* group = bot->GetGroup();
+    if (!group || group->isRaidGroup())
+        return false;  // Phase II: strictly 5-player dungeon parties, NEVER autonomous raids!
+
+    uint64 oppId = 0;
+    uint32 targetMap = 0;
+    uint32 expectedGroup = 0;
+    if (!CompanionBrain::IsAuthorizedCoopMember(bot->GetGUID().GetCounter(), oppId, targetMap, expectedGroup))
+        return false;
+
+    // Never auto-control a group containing an unrecognized human player
+    for (GroupReference const* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
+    {
+        Player const* member = itr->GetSource();
+        if (!member)
+            continue;
+        if (!IsCompanion(member))
+            return false;
+    }
+    return true;
+}
+
 void CompanionBotMgr::RepairHeirlooms(Player* bot, std::vector<std::string>& report)
 {
     if (!bot)
@@ -1378,7 +1404,8 @@ void CompanionBotMgr::ApplyLeadStrategies(PlayerbotAI* botAI)
         return;
 
     bool dungeon = bot->GetMap() && (bot->GetMap()->IsDungeon() || bot->GetMap()->IsRaid());
-    bool on = dungeon && IsGroupedWithOwner(bot) && LeadModeOn(bot->GetGUID().GetCounter());
+    bool groupAllowed = IsGroupedWithOwner(bot) || (bot->GetMap() && bot->GetMap()->IsDungeon() && IsInAuthorizedCoopGroup(bot));
+    bool on = dungeon && groupAllowed && LeadModeOn(bot->GetGUID().GetCounter());
     bool tank = PlayerbotAI::IsTank(bot);
     bool wantLead = on && tank;
     bool wantAssist = on && !tank;
@@ -1592,7 +1619,32 @@ void CompanionBotMgr::TickBot(PlayerbotAI* botAI)
         return;
     }
 
-    // Not with the owner: any group it is in ends, and it goes back to questing.
+    // Phase II (Card II-05): Explicit COMPANION_COOPERATIVE mode for authorized bot-only 5-player
+    // dungeon groups (gated by AiPlayerbot.Companion.Coop.Enabled=0 by default). Owner groups ALWAYS
+    // take precedence above; arbitrary/unrecognized groups are still disbanded below.
+    if (group && IsInAuthorizedCoopGroup(bot))
+    {
+        CompanionLease::RequestInterrupt(bot, CompanionLease::Interrupt::Group);
+        Player* leader = ObjectAccessor::FindConnectedPlayer(group->GetLeaderGUID());
+        bool const isLeader = (leader == bot);
+        if (botAI->GetCompanionMode() != PlayerbotAI::COMPANION_COOPERATIVE)
+        {
+            if (isLeader)
+                botAI->ChangeStrategy("-follow,-stay,-new rpg,-quest,-gather,-grind,-companion duty,-companion quest",
+                                      BOT_STATE_NON_COMBAT);
+            else
+                botAI->ChangeStrategy("+follow,-stay,-new rpg,-quest,-gather,-grind,-companion duty,-companion quest",
+                                      BOT_STATE_NON_COMBAT);
+            botAI->SetCompanionMode(PlayerbotAI::COMPANION_COOPERATIVE);
+            CompanionDuty::CompleteDuty(bot->GetGUID().GetCounter(), "cleared: cooperative dungeon group",
+                                        CompanionDuty::DutyEnd::Interrupted, "interrupt:coop_group");
+        }
+        if (!isLeader && leader && botAI->GetMaster() != leader)
+            botAI->SetMaster(leader);
+        return;
+    }
+
+    // Not with the owner (and not in an authorized cooperative group): any stray group ends.
     if (group)
     {
         LOG_WARN("playerbots", "[Companion] {} left its group: owner {} not a member (owner online: {})",

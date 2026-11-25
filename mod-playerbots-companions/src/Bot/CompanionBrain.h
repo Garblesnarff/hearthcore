@@ -90,6 +90,11 @@ public:
     static void MarkProposalCompleted(uint32 lowGuid, uint64 proposalId, uint32 progressDelta);
     static void ReloadProposals();
 
+    // Phase II Cooperative Mode (Cards II-05/II-06, gated by AiPlayerbot.Companion.Coop.Enabled = 0 by default).
+    static bool CoopEnabled();
+    static bool IsAuthorizedCoopMember(uint32 lowGuid, uint64& outOppId, uint32& outTargetMap, uint32& outGroupId);
+    static void ReloadCoopMemberships();
+
     static constexpr uint32 WEIGHT_REFRESH_MS = 300000;
     static constexpr uint32 PROPOSAL_REFRESH_MS = 60000;
     static constexpr float WEIGHT_MIN_FACTOR = 0.5f;

@@ -78,6 +78,9 @@ public:
     bool IsOwnerLow(uint32 lowGuid) const { return _ownerLow.load() != 0 && lowGuid == _ownerLow.load(); }
     // Any thread. True when the companion is in a group with the owner.
     bool IsGroupedWithOwner(Player const* bot) const;
+    // Phase II (Card II-05): true ONLY when AiPlayerbot.Companion.Coop.Enabled=1, this bot holds an
+    // active authorized cooperative commitment, and the group contains zero unrecognized human players.
+    bool IsInAuthorizedCoopGroup(Player const* bot) const;
 
     // Map thread, once per companion sync interval. Chooses follow or autonomy strategies and leaves stray groups.
     void TickBot(PlayerbotAI* botAI);
