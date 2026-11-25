@@ -1,26 +1,35 @@
-"""Optional out-of-loop API planning with shared budget & billable-usage accounting."""
+"""Optional out-of-loop API planning with mandatory shared budget, Retry-After & circuit breaker."""
 from __future__ import annotations
 
+import email.utils
 import json
 import os
 import re
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .budget import BudgetExceeded, BudgetLedger, InvalidWithUsage, extract_usage_meta
+from .budget import (
+    BudgetExceeded,
+    BudgetLedger,
+    InvalidWithUsage,
+    ProviderBackoffError,
+    extract_usage_meta,
+)
 from .core import Invalid, ROOT, validate
 
 VALID_EFFORTS = {"low", "medium", "high", "max"}
 FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*\Z", re.DOTALL)
 DEFAULT_MAX_TOKENS = 1600
+DEFAULT_BUDGET_DB = ROOT / "runtime" / "brain.db"
 
 
 def load_env(env_path: Path | None = None) -> None:
     """Populate os.environ from .env (setdefault only, never prints secrets)."""
-    path = env_path or (ROOT / ".env")
+    path = env_path or Path(os.getenv("HEARTHCORE_ENV_PATH", str(ROOT / ".env")))
     if not path.is_file():
         return
     for raw in path.read_text(encoding="utf-8").splitlines():
@@ -39,6 +48,27 @@ def _strip_json_fences(text: str) -> str:
     return m.group(1).strip() if m else text.strip()
 
 
+def parse_retry_after_seconds(headers: Any, now_ts: int | None = None) -> int:
+    """Parse HTTP Retry-After header (seconds or HTTP-date), clamped to [1, 3600]."""
+    if headers is None:
+        return 0
+    val = headers.get("Retry-After") if hasattr(headers, "get") else None
+    if not val:
+        return 0
+    s = str(val).strip()
+    if s.isdigit():
+        return max(1, min(3600, int(s)))
+    try:
+        dt = email.utils.parsedate_to_datetime(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        now = float(now_ts if now_ts is not None else time.time())
+        delta = int(dt.timestamp() - now)
+        return max(1, min(3600, delta)) if delta > 0 else 1
+    except Exception:
+        return 0
+
+
 def anthropic_with_meta(
     p: dict[str, Any],
     snap: dict[str, Any],
@@ -47,18 +77,23 @@ def anthropic_with_meta(
     memory: dict[str, Any] | None = None,
     *,
     budget: BudgetLedger | None = None,
+    budget_db_path: Path | None = None,
+    allow_unbudgeted_for_test: bool = False,
     caller: str = "planner",
     is_shadow: bool = False,
     http_post_fn=None,
+    now_ts: int | None = None,
 ):
     """Call Anthropic Messages API for one validated session plan, returning (plan, meta).
 
-    Accounting invariant (Issue #8):
+    Accounting & resilience invariants (Issues #8 & #55):
+    - Mandatory BudgetLedger boundary: creates/uses shared ledger unless allow_unbudgeted_for_test=True.
+    - Enforces provider circuit breaker & Retry-After backoff before reserving or calling.
     - Reserves conservative worst-case budget atomically BEFORE making the HTTP call.
-    - Extracts response usage tokens IMMEDIATELY upon HTTP 200 BEFORE JSON parsing or validate().
-    - Settles 'rejected' with exact billable usage if JSON/schema validation fails, 'error' ($0)
-      on clear pre-generation HTTP 4xx, and 'uncertain' (keeping conservative reserve) on timeout
-      or ambiguous transport failure.
+    - Extracts response usage tokens IMMEDIATELY upon HTTP 200 BEFORE checking stop_reason or parsing JSON.
+    - Explicitly reports stop_reason == 'max_tokens' truncation instead of misreporting invalid JSON.
+    - Settles 'rejected' with exact billable usage if truncated or invalid, 'error' ($0, still counted
+      as an attempted call) on HTTP 4xx, and 'uncertain' on 5xx/timeout/transport errors.
     """
     load_env()
     key = os.getenv("ANTHROPIC_API_KEY")
@@ -66,6 +101,13 @@ def anthropic_with_meta(
     use_effort = (effort or os.getenv("ANTHROPIC_EFFORT") or "medium").strip().lower()
     if not use_model or (http_post_fn is None and not key):
         raise Invalid("Set ANTHROPIC_API_KEY and ANTHROPIC_MODEL explicitly")
+
+    ledger: BudgetLedger | None = budget
+    if ledger is None and not allow_unbudgeted_for_test:
+        ledger = BudgetLedger(budget_db_path or DEFAULT_BUDGET_DB)
+
+    if ledger is not None:
+        ledger.check_provider_available("anthropic", now_ts=now_ts)
 
     system = (
         "You are the out-of-game session goal planner for a single Alliance companion in a private "
@@ -98,15 +140,16 @@ def anthropic_with_meta(
         payload["output_config"] = {"effort": use_effort}
 
     res_id: int | None = None
-    if budget is not None:
+    if ledger is not None:
         est_in = max(600, (len(system) + len(user_json)) // 3)
-        res_id = budget.reserve(
+        res_id = ledger.reserve(
             caller=caller,
             model=use_model,
             est_input_tokens=est_in,
             max_output_tokens=DEFAULT_MAX_TOKENS,
             character_id=str(snap.get("character_id") or ""),
             is_shadow=is_shadow,
+            now_ts=now_ts,
         )
 
     t0 = time.monotonic()
@@ -129,25 +172,48 @@ def anthropic_with_meta(
                 result = json.load(r)
         latency_ms = int((time.monotonic() - t0) * 1000)
     except urllib.error.HTTPError as exc:
-        if budget is not None and res_id is not None:
-            # 4xx (400/401/403/404/429) failed before generation; 5xx may be uncertain
-            st = "error" if 400 <= exc.code < 500 else "uncertain"
-            budget.settle(res_id, status=st, error_note=f"HTTP {exc.code}")
-        raise Invalid(f"API HTTP {exc.code}") from exc
-    except BudgetExceeded:
+        retry_after = parse_retry_after_seconds(getattr(exc, "headers", None), now_ts=now_ts)
+        if ledger is not None:
+            if res_id is not None:
+                st = "error" if 400 <= exc.code < 500 else "uncertain"
+                ledger.settle(res_id, status=st, error_note=f"HTTP {exc.code}", now_ts=now_ts)
+            ledger.record_provider_failure(
+                "anthropic",
+                error_note=f"HTTP {exc.code}",
+                retry_after_sec=retry_after,
+                now_ts=now_ts,
+            )
+        suffix = f" (Retry-After {retry_after}s)" if retry_after > 0 else ""
+        raise Invalid(f"API HTTP {exc.code}{suffix}") from exc
+    except (BudgetExceeded, ProviderBackoffError):
         raise
     except Exception as exc:
-        if budget is not None and res_id is not None:
-            budget.settle(res_id, status="uncertain", error_note=f"transport:{type(exc).__name__}")
+        if ledger is not None:
+            if res_id is not None:
+                ledger.settle(res_id, status="uncertain", error_note=f"transport:{type(exc).__name__}", now_ts=now_ts)
+            ledger.record_provider_failure(
+                "anthropic",
+                error_note=f"transport:{type(exc).__name__}",
+                now_ts=now_ts,
+            )
         raise Invalid("API transport error: " + type(exc).__name__) from exc
 
-    # Extract billable usage BEFORE parsing/validating response content!
+    if ledger is not None:
+        ledger.record_provider_success("anthropic", now_ts=now_ts)
+
+    # Extract billable usage BEFORE checking truncation or parsing response content!
     meta = extract_usage_meta(
         result if isinstance(result, dict) else {},
         fallback_model=use_model,
         effort=use_effort if use_effort in VALID_EFFORTS else "",
         latency_ms=latency_ms,
     )
+
+    if isinstance(result, dict) and str(result.get("stop_reason") or "") == "max_tokens":
+        note = "API response truncated: stop_reason=max_tokens"
+        if ledger is not None and res_id is not None:
+            ledger.settle(res_id, status="rejected", meta=meta, error_note=note, now_ts=now_ts)
+        raise InvalidWithUsage(note, meta=meta)
 
     try:
         raw_text = "".join(
@@ -157,20 +223,35 @@ def anthropic_with_meta(
         parsed = json.loads(cleaned)
         plan = validate(parsed, snap)
     except Invalid as exc:
-        if budget is not None and res_id is not None:
-            budget.settle(res_id, status="rejected", meta=meta, error_note=str(exc))
+        if ledger is not None and res_id is not None:
+            ledger.settle(res_id, status="rejected", meta=meta, error_note=str(exc), now_ts=now_ts)
         raise InvalidWithUsage(str(exc), meta=meta) from exc
     except Exception as exc:
         note = f"Invalid response payload: {type(exc).__name__}"
-        if budget is not None and res_id is not None:
-            budget.settle(res_id, status="rejected", meta=meta, error_note=note)
+        if ledger is not None and res_id is not None:
+            ledger.settle(res_id, status="rejected", meta=meta, error_note=note, now_ts=now_ts)
         raise InvalidWithUsage(note, meta=meta) from exc
 
-    if budget is not None and res_id is not None:
-        budget.settle(res_id, status="ok", meta=meta)
+    if ledger is not None and res_id is not None:
+        ledger.settle(res_id, status="ok", meta=meta, now_ts=now_ts)
     return plan, meta
 
 
-def anthropic(p, snap):
-    plan, _ = anthropic_with_meta(p, snap)
+def anthropic(
+    p,
+    snap,
+    *,
+    budget: BudgetLedger | None = None,
+    budget_db_path: Path | None = None,
+    caller: str = "cli_plan",
+    http_post_fn=None,
+):
+    plan, _ = anthropic_with_meta(
+        p,
+        snap,
+        budget=budget,
+        budget_db_path=budget_db_path,
+        caller=caller,
+        http_post_fn=http_post_fn,
+    )
     return plan

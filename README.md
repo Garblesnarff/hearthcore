@@ -51,3 +51,10 @@ python3 -m hearthcore quartermaster-tick --provider anthropic
 ## Roadmap — Phase II (proposed)
 
 See [The Living Guild technical specification](docs/PHASE_II_LIVING_GUILD.md) and [implementation cards and verification](docs/PHASE_II_IMPLEMENTATION.md). Cooperative stock dungeon gameplay, opportunity admission, readiness, persona identity and performance testing are proposed; live rollout depends on verified Phase I issues #3–9 and explicit owner approval.
+
+---
+
+## Licensing & Upstream Attribution
+
+- **Original Hearthcore code** (`hearthcore/`, `azeroth-watch/`, `characters/`, `ops/`, `docs/`, `tests/`): licensed under the **MIT License** — see root [`LICENSE`](./LICENSE).
+- **C++ companion mirror** (`mod-playerbots-companions/`): derived from [AzerothCore](https://github.com/azerothcore/azerothcore-wotlk) and [mod-playerbots](https://github.com/mod-playerbots/mod-playerbots) (upstream `origin/master` commit `405f8119`) and licensed under **GPL-2.0** — see [`mod-playerbots-companions/LICENSE`](./mod-playerbots-companions/LICENSE), [`mod-playerbots-companions/AUTHORS`](./mod-playerbots-companions/AUTHORS), and [`mod-playerbots-companions/NOTICE.md`](./mod-playerbots-companions/NOTICE.md).

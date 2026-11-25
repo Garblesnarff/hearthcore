@@ -25,8 +25,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .bridge import BRAIN_DB_PATH, RUNTIME_DIR, run_sql
-from .budget import BudgetExceeded, BudgetLedger, InvalidWithUsage, extract_usage_meta
+from .bridge import (
+    BRAIN_DB_PATH,
+    RUNTIME_DIR,
+    acquire_run_lock,
+    is_brain_disabled,
+    run_sql,
+)
+from .budget import (
+    BudgetExceeded,
+    BudgetLedger,
+    InvalidWithUsage,
+    ProviderBackoffError,
+    extract_usage_meta,
+)
 from .core import Invalid
 from .guides import (
     LEVELING_ORDER_CATALOG,
@@ -34,7 +46,13 @@ from .guides import (
     SKILL_NAMES,
     compute_supply_report,
 )
-from .provider import VALID_EFFORTS, _strip_json_fences, load_env
+from .provider import (
+    DEFAULT_BUDGET_DB,
+    VALID_EFFORTS,
+    _strip_json_fences,
+    load_env,
+    parse_retry_after_seconds,
+)
 
 QUARTERMASTER_JSON = RUNTIME_DIR / "quartermaster.json"
 QUARTERMASTER_SHADOW_JSON = RUNTIME_DIR / "quartermaster_shadow.json"
@@ -306,8 +324,11 @@ def call_claude_quartermaster(
     effort: str | None = None,
     *,
     budget: BudgetLedger | None = None,
+    budget_db_path: Path | None = None,
+    allow_unbudgeted_for_test: bool = False,
     is_shadow: bool = False,
     http_post_fn=None,
+    now_ts: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     load_env()
     key = os.getenv("ANTHROPIC_API_KEY")
@@ -315,6 +336,12 @@ def call_claude_quartermaster(
     use_effort = (effort or os.getenv("ANTHROPIC_EFFORT") or "medium").strip().lower()
     if http_post_fn is None and not key:
         raise Invalid("ANTHROPIC_API_KEY not set")
+
+    ledger: BudgetLedger | None = budget
+    if ledger is None and not allow_unbudgeted_for_test:
+        ledger = BudgetLedger(budget_db_path or DEFAULT_BUDGET_DB)
+    if ledger is not None:
+        ledger.check_provider_available("anthropic", now_ts=now_ts)
 
     system = (
         "You are the Guild Quartermaster strategist for Hearthguard, a 40-character Alliance WoW WotLK 3.3.5a "
@@ -358,14 +385,15 @@ def call_claude_quartermaster(
         body["output_config"] = {"effort": use_effort}
 
     res_id: int | None = None
-    if budget is not None:
+    if ledger is not None:
         est_in = max(1200, (len(system) + len(user_json)) // 3)
-        res_id = budget.reserve(
+        res_id = ledger.reserve(
             caller="shadow_quartermaster" if is_shadow else "quartermaster",
             model=use_model,
             est_input_tokens=est_in,
             max_output_tokens=QM_MAX_TOKENS,
             is_shadow=is_shadow,
+            now_ts=now_ts,
         )
 
     t0 = time.monotonic()
@@ -387,18 +415,36 @@ def call_claude_quartermaster(
                 res = json.load(r)
         latency_ms = int((time.monotonic() - t0) * 1000)
     except urllib.error.HTTPError as exc:
-        if budget is not None and res_id is not None:
-            st = "error" if 400 <= exc.code < 500 else "uncertain"
-            budget.settle(res_id, status=st, error_note=f"HTTP {exc.code}")
-        raise Invalid(f"Quartermaster API HTTP {exc.code}") from exc
-    except BudgetExceeded:
+        retry_after = parse_retry_after_seconds(getattr(exc, "headers", None), now_ts=now_ts)
+        if ledger is not None:
+            if res_id is not None:
+                st = "error" if 400 <= exc.code < 500 else "uncertain"
+                ledger.settle(res_id, status=st, error_note=f"HTTP {exc.code}", now_ts=now_ts)
+            ledger.record_provider_failure(
+                "anthropic",
+                error_note=f"QM HTTP {exc.code}",
+                retry_after_sec=retry_after,
+                now_ts=now_ts,
+            )
+        suffix = f" (Retry-After {retry_after}s)" if retry_after > 0 else ""
+        raise Invalid(f"Quartermaster API HTTP {exc.code}{suffix}") from exc
+    except (BudgetExceeded, ProviderBackoffError):
         raise
     except Exception as exc:
-        if budget is not None and res_id is not None:
-            budget.settle(res_id, status="uncertain", error_note=f"transport:{type(exc).__name__}")
+        if ledger is not None:
+            if res_id is not None:
+                ledger.settle(res_id, status="uncertain", error_note=f"transport:{type(exc).__name__}", now_ts=now_ts)
+            ledger.record_provider_failure(
+                "anthropic",
+                error_note=f"QM transport:{type(exc).__name__}",
+                now_ts=now_ts,
+            )
         raise Invalid(f"Quartermaster API error: {type(exc).__name__}") from exc
 
-    # Extract billable usage BEFORE parsing/validating response content! (Issue #8)
+    if ledger is not None:
+        ledger.record_provider_success("anthropic", now_ts=now_ts)
+
+    # Extract billable usage BEFORE checking truncation or parsing response content! (Issues #8 & #55)
     meta = extract_usage_meta(
         res if isinstance(res, dict) else {},
         fallback_model=use_model,
@@ -406,22 +452,28 @@ def call_claude_quartermaster(
         latency_ms=latency_ms,
     )
 
+    if isinstance(res, dict) and str(res.get("stop_reason") or "") == "max_tokens":
+        note = "Quartermaster response truncated: stop_reason=max_tokens"
+        if ledger is not None and res_id is not None:
+            ledger.settle(res_id, status="rejected", meta=meta, error_note=note, now_ts=now_ts)
+        raise InvalidWithUsage(note, meta=meta)
+
     try:
         raw_txt = "".join(b.get("text", "") for b in res.get("content", []) if isinstance(b, dict) and b.get("type") == "text")
         parsed = json.loads(_strip_json_fences(raw_txt))
         validated = _validate_quartermaster_output(parsed, order_menu, bank_menu, slots_needed)
     except Invalid as exc:
-        if budget is not None and res_id is not None:
-            budget.settle(res_id, status="rejected", meta=meta, error_note=str(exc))
+        if ledger is not None and res_id is not None:
+            ledger.settle(res_id, status="rejected", meta=meta, error_note=str(exc), now_ts=now_ts)
         raise InvalidWithUsage(str(exc), meta=meta) from exc
     except Exception as exc:
         note = f"Quartermaster invalid payload: {type(exc).__name__}"
-        if budget is not None and res_id is not None:
-            budget.settle(res_id, status="rejected", meta=meta, error_note=note)
+        if ledger is not None and res_id is not None:
+            ledger.settle(res_id, status="rejected", meta=meta, error_note=note, now_ts=now_ts)
         raise InvalidWithUsage(note, meta=meta) from exc
 
-    if budget is not None and res_id is not None:
-        budget.settle(res_id, status="ok", meta=meta)
+    if ledger is not None and res_id is not None:
+        ledger.settle(res_id, status="ok", meta=meta, now_ts=now_ts)
     return validated, meta
 
 
@@ -439,41 +491,84 @@ def _pick_requester(order: dict[str, Any], chars: list[dict[str, Any]], idx: int
     pool = [c for c in chars if c["name"] not in ("Wonky", "Logan") and skill_id not in c["skills"]]
     if not pool:
         pool = [c for c in chars if c["name"] not in ("Wonky", "Logan")]
+    if not pool:
+        pool = list(chars)
     chosen = pool[idx % len(pool)]
     return chosen["guid"], chosen["name"]
 
 
-def apply_quartermaster_plan(plan: dict[str, Any], state: dict[str, Any]) -> tuple[int, int]:
-    """Write validated work orders & bank requests directly into MySQL (auto-reloaded by C++ within 5m)."""
+def apply_quartermaster_plan(
+    plan: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    sql_exec=None,
+    target_open_orders: int = TARGET_OPEN_ORDERS,
+) -> tuple[int, int]:
+    """Atomically apply validated work orders & bank requests in one MySQL transaction (Issue #54).
+
+    Invariants:
+    - Single transaction (START TRANSACTION ... COMMIT): native reloads never observe empty/half-written sets.
+    - Re-checks open/claimed order count & duplicate item_entry INSIDE the transaction with FOR UPDATE.
+    - Upserts Quartermaster bank requests first and deletes stale Quartermaster rows after (no empty gap).
+    - NEVER modifies or deletes manual GM rows (requested_by != 'Quartermaster').
+    """
     now = int(time.time())
-    stmts: list[str] = []
-    orders_added = 0
+    stmts: list[str] = ["START TRANSACTION;"]
+    stmts.append("SELECT id FROM companion_work_orders WHERE status IN ('open', 'claimed') FOR UPDATE;")
+    stmts.append("SET @qm_orders_added = 0;")
 
     for idx, wo in enumerate(plan["work_orders"]):
         req_guid, req_name = _pick_requester(wo, state["characters"], idx)
         prefix = "[P1 Supply]" if wo["priority"] == 1 else "[P2 Buff]"
         story = f"{req_name}: {prefix} {wo['reason']}"[:215]
+        entry = int(wo["item_entry"])
+        qty = int(wo["quantity"])
         stmts.append(
             "INSERT INTO companion_work_orders "
             "(requester_guid, requester_name, crafter_guid, crafter_name, item_entry, item_name, quantity, story, status, created_at, updated_at) "
-            f"VALUES ({req_guid}, '{_sql_esc(req_name)}', 0, '', {int(wo['item_entry'])}, "
-            f"'{_sql_esc(wo['name'])}', {int(wo['quantity'])}, '{_sql_esc(story)}', 'open', {now}, {now});"
+            f"SELECT {int(req_guid)}, '{_sql_esc(req_name)}', 0, '', {entry}, "
+            f"'{_sql_esc(wo['name'])}', {qty}, '{_sql_esc(story)}', 'open', {now}, {now} FROM DUAL "
+            f"WHERE (SELECT COUNT(*) FROM (SELECT id FROM companion_work_orders WHERE status IN ('open', 'claimed')) AS open_cnt) < {int(target_open_orders)} "
+            f"AND NOT EXISTS (SELECT 1 FROM (SELECT item_entry FROM companion_work_orders WHERE status IN ('open', 'claimed')) AS open_items WHERE item_entry = {entry});"
         )
-        orders_added += 1
+        stmts.append("SET @qm_orders_added = @qm_orders_added + ROW_COUNT();")
 
-    # Refresh Quartermaster-owned rows in companion_bank_requests (preserve any manual GM rows!)
-    stmts.append("DELETE FROM companion_bank_requests WHERE requested_by = 'Quartermaster';")
-    banks_set = 0
+    # Upsert Quartermaster-owned rows first; NEVER modify manual GM rows (requested_by != 'Quartermaster')!
+    desired_entries: list[int] = []
     for br in plan["bank_requests"]:
+        entry = int(br["item_entry"])
+        desired_entries.append(entry)
         stmts.append(
             "INSERT INTO companion_bank_requests (item_entry, requested_by, min_count, note) "
-            f"VALUES ({int(br['item_entry'])}, 'Quartermaster', {int(br['min_count'])}, '{_sql_esc(br['note'])}') "
-            "ON DUPLICATE KEY UPDATE min_count = VALUES(min_count), note = VALUES(note);"
+            f"VALUES ({entry}, 'Quartermaster', {int(br['min_count'])}, '{_sql_esc(br['note'])}') "
+            "ON DUPLICATE KEY UPDATE "
+            "min_count = IF(requested_by = 'Quartermaster', VALUES(min_count), min_count), "
+            "note = IF(requested_by = 'Quartermaster', VALUES(note), note);"
         )
-        banks_set += 1
 
-    if stmts:
-        run_sql("\n".join(stmts) + "\n")
+    # Delete ONLY stale Quartermaster rows not in the new set (preserving all manual rows and avoiding any empty gap)
+    if desired_entries:
+        in_list = ",".join(str(e) for e in desired_entries)
+        stmts.append(
+            f"DELETE FROM companion_bank_requests WHERE requested_by = 'Quartermaster' AND item_entry NOT IN ({in_list});"
+        )
+    else:
+        stmts.append("DELETE FROM companion_bank_requests WHERE requested_by = 'Quartermaster';")
+
+    stmts.append(
+        "SELECT @qm_orders_added, (SELECT COUNT(*) FROM companion_bank_requests WHERE requested_by = 'Quartermaster');"
+    )
+    stmts.append("COMMIT;")
+
+    runner = sql_exec if sql_exec is not None else run_sql
+    rows = runner("\n".join(stmts) + "\n")
+    orders_added = len(plan["work_orders"])
+    banks_set = len(desired_entries)
+    if rows:
+        last = rows[-1]
+        if len(last) >= 2 and str(last[0]).isdigit() and str(last[1]).isdigit():
+            orders_added = int(last[0])
+            banks_set = int(last[1])
     return orders_added, banks_set
 
 
@@ -546,89 +641,107 @@ def run_quartermaster(
     runtime_dir: Path = RUNTIME_DIR,
     state_override: dict[str, Any] | None = None,
     http_post_fn=None,
+    sql_exec=None,
+    lock_timeout_sec: float = 2.0,
 ) -> dict[str, Any]:
     load_env()
-    state = state_override if state_override is not None else fetch_40char_supply_state()
-    slots_needed = max(0, TARGET_OPEN_ORDERS - len(state["open_orders"]))
-    order_menu, bank_menu = build_eligible_menus(state)
     budget = BudgetLedger(db_path)
+    budget.configured_caps()
 
-    source = provider
-    meta: dict[str, Any] = {}
-    err_note = ""
+    if apply and is_brain_disabled(runtime_dir):
+        return {
+            "source": "disabled",
+            "meta": {},
+            "error_note": "brain_disabled",
+            "plan": {"strategy_summary": "Skipped: brain kill switch active.", "work_orders": [], "bank_requests": [], "focus_skills": []},
+            "orders_added": 0,
+            "banks_set": 0,
+            "is_shadow": False,
+            "disabled": True,
+            "supply": {},
+        }
 
-    if provider == "anthropic":
-        try:
-            plan, meta = call_claude_quartermaster(
-                state,
-                order_menu,
-                bank_menu,
-                slots_needed,
-                model=model,
-                effort=effort,
-                budget=budget,
-                is_shadow=not apply,
-                http_post_fn=http_post_fn,
-            )
-        except BudgetExceeded as exc:
-            source = "fallback"
-            err_note = str(exc)
+    with acquire_run_lock(runtime_dir, timeout_sec=lock_timeout_sec):
+        state = state_override if state_override is not None else fetch_40char_supply_state()
+        slots_needed = max(0, TARGET_OPEN_ORDERS - len(state["open_orders"]))
+        order_menu, bank_menu = build_eligible_menus(state)
+
+        source = provider
+        meta: dict[str, Any] = {}
+        err_note = ""
+
+        if provider == "anthropic":
+            try:
+                plan, meta = call_claude_quartermaster(
+                    state,
+                    order_menu,
+                    bank_menu,
+                    slots_needed,
+                    model=model,
+                    effort=effort,
+                    budget=budget,
+                    is_shadow=not apply,
+                    http_post_fn=http_post_fn,
+                )
+            except (BudgetExceeded, ProviderBackoffError) as exc:
+                source = "fallback"
+                err_note = str(exc)
+                plan = _fallback_quartermaster(order_menu, bank_menu, slots_needed)
+            except InvalidWithUsage as exc:
+                source = "fallback_after_api"
+                err_note = str(exc)
+                meta = exc.meta
+                plan = _fallback_quartermaster(order_menu, bank_menu, slots_needed)
+            except Invalid as exc:
+                source = "fallback_after_api"
+                err_note = str(exc)
+                plan = _fallback_quartermaster(order_menu, bank_menu, slots_needed)
+        else:
             plan = _fallback_quartermaster(order_menu, bank_menu, slots_needed)
-        except InvalidWithUsage as exc:
-            source = "fallback_after_api"
-            err_note = str(exc)
-            meta = exc.meta
-            plan = _fallback_quartermaster(order_menu, bank_menu, slots_needed)
-        except Invalid as exc:
-            source = "fallback_after_api"
-            err_note = str(exc)
-            plan = _fallback_quartermaster(order_menu, bank_menu, slots_needed)
-    else:
-        plan = _fallback_quartermaster(order_menu, bank_menu, slots_needed)
 
-    orders_added, banks_set = (0, 0)
-    if apply:
-        orders_added, banks_set = apply_quartermaster_plan(plan, state)
+        orders_added, banks_set = (0, 0)
+        if apply:
+            orders_added, banks_set = apply_quartermaster_plan(plan, state, sql_exec=sql_exec)
 
-    _record_quartermaster_run(
-        plan, source, meta, orders_added, banks_set, err_note, is_shadow=not apply, db_path=db_path
-    )
+        _record_quartermaster_run(
+            plan, source, meta, orders_added, banks_set, err_note, is_shadow=not apply, db_path=db_path
+        )
 
-    # Strict shadow isolation (Issue #7): shadow runs write quartermaster_shadow.json, NEVER live quartermaster.json!
-    snapshot_out = {
-        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "is_shadow": not apply,
-        "source": source,
-        "model": meta.get("model") or source,
-        "effort": meta.get("effort") or "",
-        "latency_ms": meta.get("latency_ms", 0),
-        "input_tokens": meta.get("input_tokens", 0),
-        "output_tokens": meta.get("output_tokens", 0),
-        "error_note": err_note,
-        "strategy_summary": plan["strategy_summary"],
-        "focus_skills": plan["focus_skills"],
-        "bank_requests": plan["bank_requests"],
-        "orders_added_last_run": orders_added,
-        "target_open_orders": TARGET_OPEN_ORDERS,
-        "budget": budget.summary(),
-        "supply": {
-            "characters_analyzed": state["supply"]["characters_analyzed"],
-            "professions": state["supply"]["professions"],
-            "top_deficits": state["supply"]["materials"][:24],
-        },
-    }
-    runtime_dir.mkdir(parents=True, exist_ok=True)
-    target_path = (runtime_dir / "quartermaster.json") if apply else (runtime_dir / "quartermaster_shadow.json")
-    tmp = target_path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(snapshot_out, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(target_path)
-    return {
-        "source": source,
-        "meta": meta,
-        "error_note": err_note,
-        "plan": plan,
-        "orders_added": orders_added,
-        "banks_set": banks_set,
-        "is_shadow": not apply,
-        "supply": state["supply"],
-    }
+        # Strict shadow isolation (Issue #7): shadow runs write quartermaster_shadow.json, NEVER live quartermaster.json!
+        snapshot_out = {
+            "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "is_shadow": not apply,
+            "source": source,
+            "model": meta.get("model") or source,
+            "effort": meta.get("effort") or "",
+            "latency_ms": meta.get("latency_ms", 0),
+            "input_tokens": meta.get("input_tokens", 0),
+            "output_tokens": meta.get("output_tokens", 0),
+            "error_note": err_note,
+            "strategy_summary": plan["strategy_summary"],
+            "focus_skills": plan["focus_skills"],
+            "bank_requests": plan["bank_requests"],
+            "orders_added_last_run": orders_added,
+            "target_open_orders": TARGET_OPEN_ORDERS,
+            "budget": budget.summary(),
+            "supply": {
+                "characters_analyzed": state["supply"]["characters_analyzed"],
+                "professions": state["supply"]["professions"],
+                "top_deficits": state["supply"]["materials"][:24],
+            },
+        }
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        target_path = (runtime_dir / "quartermaster.json") if apply else (runtime_dir / "quartermaster_shadow.json")
+        tmp = target_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(snapshot_out, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(target_path)
+        return {
+            "source": source,
+            "meta": meta,
+            "error_note": err_note,
+            "plan": plan,
+            "orders_added": orders_added,
+            "banks_set": banks_set,
+            "is_shadow": not apply,
+            "supply": state["supply"],
+        }

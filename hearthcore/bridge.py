@@ -17,6 +17,8 @@ Safety & architecture invariants (Issues #3-#8, docs/ARCHITECTURE.md, docs/PERSI
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -27,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .budget import BudgetExceeded, BudgetLedger, InvalidWithUsage
+from .budget import BudgetExceeded, BudgetLedger, InvalidWithUsage, ProviderBackoffError
 from .core import Invalid, ROOT, fallback, profile, profiles, snapshot, validate
 from .guides import LEVELING_ORDER_CATALOG, ORDER_BY_ENTRY, SKILL_NAMES, best_farm_hint
 from .memory import (
@@ -41,13 +43,20 @@ from .memory import (
 from .playstyle import apply_playstyle_scoring
 from .provider import anthropic_with_meta, load_env
 
-DB_CONTAINER = "ac-database"
-LIVE_POS_FILE = Path("/home/wonky/AzerothCore/azerothcore-wotlk/env/dist/logs/live_positions.json")
-RUNTIME_DIR = ROOT / "runtime"
+DB_CONTAINER = os.getenv("HEARTHCORE_DB_CONTAINER", "ac-database")
+LIVE_POS_FILE = Path(
+    os.getenv(
+        "HEARTHCORE_LIVE_POS_FILE",
+        str(Path.home() / "AzerothCore" / "azerothcore-wotlk" / "env" / "dist" / "logs" / "live_positions.json"),
+    )
+)
+RUNTIME_DIR = Path(os.getenv("HEARTHCORE_RUNTIME_DIR", str(ROOT / "runtime")))
 BRAIN_DB_PATH = RUNTIME_DIR / "brain.db"
 ACTIVE_PLANS_PATH = RUNTIME_DIR / "active_plans.json"
 SHADOW_PLANS_PATH = RUNTIME_DIR / "shadow_plans.json"
 QUARTERMASTER_PATH = RUNTIME_DIR / "quartermaster.json"
+DEFAULT_SQL_TIMEOUT_SEC = float(os.getenv("HEARTHCORE_SQL_TIMEOUT_SEC", "20") or 20)
+DEFAULT_STALE_MINUTES = int(os.getenv("HEARTHCORE_STALE_MINUTES", "45") or 45)
 
 CRAFT_SKILLS = {164, 165, 171, 197, 202, 333, 755, 773}
 GATHER_SKILLS = {182, 186, 393}
@@ -77,7 +86,104 @@ def _sql_esc(text: str) -> str:
     return str(text).replace("\\", "\\\\").replace("'", "\\'")
 
 
-def run_sql(sql: str) -> list[list[str]]:
+class RunLockBusy(Invalid):
+    """Raised when another brain-tick or quartermaster-tick already holds the shared flock."""
+
+
+@contextlib.contextmanager
+def acquire_run_lock(runtime_dir: Path = RUNTIME_DIR, *, timeout_sec: float = 0.0):
+    """Process-safe shared flock between brain-tick and quartermaster-tick (Issues #54 & #59)."""
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = runtime_dir / "hearthcore.lock"
+    fh = open(lock_path, "a+", encoding="utf-8")
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    acquired = False
+    try:
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RunLockBusy(f"Shared run lock busy: {lock_path}")
+                time.sleep(0.1)
+        fh.seek(0)
+        fh.truncate()
+        fh.write(f"pid={os.getpid()} ts={int(time.time())}\n")
+        fh.flush()
+        yield lock_path
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        fh.close()
+
+
+def brain_disabled_path(runtime_dir: Path = RUNTIME_DIR) -> Path:
+    return runtime_dir / "brain.disabled"
+
+
+def is_brain_disabled(runtime_dir: Path = RUNTIME_DIR) -> bool:
+    return brain_disabled_path(runtime_dir).is_file()
+
+
+def set_brain_disabled(
+    disabled: bool,
+    *,
+    runtime_dir: Path = RUNTIME_DIR,
+    guid: int | None = None,
+    sql_exec=None,
+    skip_db: bool = False,
+) -> dict[str, Any]:
+    """Operator kill switch: toggle global flag file and/or MySQL companion_weight_overrides.enabled (Issue #59)."""
+    flag_path = brain_disabled_path(runtime_dir)
+    if guid is None:
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        if disabled:
+            flag_path.write_text(
+                f"disabled_at={datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}\n",
+                encoding="utf-8",
+            )
+        elif flag_path.exists():
+            flag_path.unlink()
+    db_updated = False
+    db_error = ""
+    if not skip_db:
+        try:
+            set_override_enabled(guid, not disabled, sql_exec=sql_exec)
+            db_updated = True
+        except Exception as exc:
+            db_error = f"{type(exc).__name__}: {exc}"
+    return {
+        "disabled": disabled,
+        "guid": guid,
+        "flag_file": str(flag_path),
+        "flag_present": flag_path.is_file(),
+        "db_updated": db_updated,
+        "db_error": db_error,
+    }
+
+
+def record_failure_alert(source: str, detail: str, *, runtime_dir: Path = RUNTIME_DIR) -> None:
+    """Append a structured failure alert entry to runtime/failure_alerts.log (Issue #59)."""
+    try:
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "source": str(source)[:48],
+            "detail": str(detail)[:240],
+        }
+        with open(runtime_dir / "failure_alerts.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+    except OSError:
+        pass
+
+
+def run_sql(sql: str, *, timeout: float | None = None) -> list[list[str]]:
+    use_timeout = float(timeout if timeout is not None else os.getenv("HEARTHCORE_SQL_TIMEOUT_SEC", str(DEFAULT_SQL_TIMEOUT_SEC)))
     res = subprocess.run(
         [
             "docker", "exec", "-i", DB_CONTAINER, "sh", "-c",
@@ -87,12 +193,32 @@ def run_sql(sql: str) -> list[list[str]]:
         text=True,
         capture_output=True,
         check=True,
+        timeout=max(1.0, use_timeout),
     )
     rows: list[list[str]] = []
     for line in res.stdout.splitlines():
         if line != "":
             rows.append(line.split("\t"))
     return rows
+
+
+def fetch_remote_max_revision(*, sql_exec=None) -> int:
+    """Query MySQL for the highest existing plan_id / revision across overrides and proposals (Issue #53)."""
+    runner = sql_exec if sql_exec is not None else run_sql
+    rows = runner(
+        "SELECT GREATEST("
+        "COALESCE((SELECT MAX(revision) FROM companion_weight_overrides), 0), "
+        "COALESCE((SELECT MAX(plan_id) FROM companion_weight_overrides), 0), "
+        "COALESCE((SELECT MAX(plan_id) FROM companion_proposals), 0), "
+        "COALESCE((SELECT MAX(snapshot_rev) FROM companion_proposals), 0)"
+        ");\n"
+    )
+    if rows and rows[0]:
+        try:
+            return max(0, int(rows[0][0]))
+        except (TypeError, ValueError):
+            return 0
+    return 0
 
 
 def read_live_context() -> dict[str, Any]:
@@ -788,6 +914,7 @@ class BrainStore:
     def __init__(self, path: Path = BRAIN_DB_PATH) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._sequence_floor = 0
         with self._conn() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA busy_timeout=5000")
@@ -821,6 +948,12 @@ class BrainStore:
             """)
             db.execute("CREATE INDEX IF NOT EXISTS idx_plans_char_exp ON plans(character_id, expires_at DESC)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_plans_day ON plans(day_key, source)")
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS brain_meta (
+                    k TEXT PRIMARY KEY,
+                    v TEXT NOT NULL
+                )
+            """)
             existing_cols = {r[1] for r in db.execute("PRAGMA table_info(plans)").fetchall()}
             for col, typ in [
                 ("start_level", "INTEGER NOT NULL DEFAULT 0"),
@@ -846,11 +979,65 @@ class BrainStore:
                     db.execute(f"ALTER TABLE plans ADD COLUMN {col} {typ}")
             # Mark any historical unapplied rows explicitly as 'shadow' (Issue #7 provenance)
             db.execute("UPDATE plans SET plan_state = 'shadow' WHERE applied = 0 AND plan_state = 'applied'")
+            floor_row = db.execute("SELECT v FROM brain_meta WHERE k = 'sequence_floor'").fetchone()
+            if floor_row and str(floor_row["v"]).isdigit():
+                self._sequence_floor = int(floor_row["v"])
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=5.0)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def get_meta(self, key: str, default: str = "") -> str:
+        with self._conn() as db:
+            row = db.execute("SELECT v FROM brain_meta WHERE k = ?", (key,)).fetchone()
+            return str(row["v"]) if row else default
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._conn() as db:
+            db.execute(
+                "INSERT INTO brain_meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                (key, str(value)),
+            )
+
+    def sync_sequence_floor(self, remote_max_rev: int) -> dict[str, Any]:
+        """Detect if brain.db is behind MySQL revisions and advance monotonic sequence floor (Issue #53)."""
+        remote_max = max(0, int(remote_max_rev))
+        with self._conn() as db:
+            row = db.execute("SELECT COALESCE(MAX(id), 0) AS mx FROM plans").fetchone()
+            local_max = int(row["mx"] or 0)
+            new_floor = max(self._sequence_floor, local_max, remote_max)
+            behind = remote_max > max(local_max, self._sequence_floor)
+            if new_floor > self._sequence_floor:
+                self._sequence_floor = new_floor
+                db.execute(
+                    "INSERT INTO brain_meta (k, v) VALUES ('sequence_floor', ?) "
+                    "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                    (str(new_floor),),
+                )
+        return {
+            "local_max": local_max,
+            "remote_max": remote_max,
+            "sequence_floor": self._sequence_floor,
+            "resynced": behind,
+        }
+
+    def mark_plan_applied(self, plan_id: int) -> None:
+        """Promote a pending plan to applied=1 ONLY after MySQL write acknowledges (Issue #52)."""
+        with self._conn() as db:
+            db.execute(
+                "UPDATE plans SET applied = 1, plan_state = 'applied' WHERE id = ?",
+                (int(plan_id),),
+            )
+
+    def mark_plan_failed(self, plan_id: int, error_note: str) -> None:
+        """Mark a pending plan as apply_failed so it never blocks replanning on the next tick (Issue #52)."""
+        with self._conn() as db:
+            db.execute(
+                "UPDATE plans SET applied = 0, plan_state = 'apply_failed', proposal_status = 'apply_failed', "
+                "error_note = ? WHERE id = ?",
+                (str(error_note)[:200], int(plan_id)),
+            )
 
     def refresh_outcomes(
         self,
@@ -864,7 +1051,7 @@ class BrainStore:
             # Determine latest applied plan id per character so superseded plans finalize immediately
             latest_applied: dict[str, int] = {}
             for lr in db.execute(
-                "SELECT character_id, MAX(id) AS max_id FROM plans WHERE applied = 1 AND plan_state != 'shadow' GROUP BY character_id"
+                "SELECT character_id, MAX(id) AS max_id FROM plans WHERE applied = 1 AND plan_state = 'applied' GROUP BY character_id"
             ).fetchall():
                 latest_applied[str(lr["character_id"])] = int(lr["max_id"])
 
@@ -875,7 +1062,7 @@ class BrainStore:
                        outcome_finalized, proposal_status, proposal_reason
                 FROM plans
                 WHERE applied = 1
-                  AND plan_state != 'shadow'
+                  AND plan_state = 'applied'
                   AND outcome_finalized = 0
                   AND start_level > 0
                 ORDER BY id DESC LIMIT 200
@@ -938,18 +1125,33 @@ class BrainStore:
                         u,
                     )
 
-    def finalize_character_open_plans(self, slug: str, comp: dict[str, Any], now_ts: int) -> None:
-        """Finalize any unfinalized active applied plan for slug right BEFORE recording a new applied plan."""
+    def finalize_character_open_plans(
+        self, slug: str, comp: dict[str, Any], now_ts: int, *, exclude_plan_id: int | None = None
+    ) -> None:
+        """Finalize any unfinalized active applied plan for slug right BEFORE marking a new plan applied."""
         with self._conn() as db:
-            rows = db.execute(
-                """
-                SELECT id, start_level, start_xp, start_skill_sum, start_orders_done,
-                       start_quests_done, start_ledger_ops
-                FROM plans
-                WHERE character_id = ? AND applied = 1 AND plan_state != 'shadow' AND outcome_finalized = 0
-                """,
-                (slug,),
-            ).fetchall()
+            if exclude_plan_id is not None:
+                rows = db.execute(
+                    """
+                    SELECT id, start_level, start_xp, start_skill_sum, start_orders_done,
+                           start_quests_done, start_ledger_ops
+                    FROM plans
+                    WHERE character_id = ? AND applied = 1 AND plan_state = 'applied'
+                      AND outcome_finalized = 0 AND id != ?
+                    """,
+                    (slug, int(exclude_plan_id)),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    """
+                    SELECT id, start_level, start_xp, start_skill_sum, start_orders_done,
+                           start_quests_done, start_ledger_ops
+                    FROM plans
+                    WHERE character_id = ? AND applied = 1 AND plan_state = 'applied'
+                      AND outcome_finalized = 0
+                    """,
+                    (slug,),
+                ).fetchall()
             if not rows:
                 return
             cur_lvl = int(comp["level"])
@@ -977,12 +1179,12 @@ class BrainStore:
                 )
 
     def active_plan(self, slug: str, now_ts: int) -> dict[str, Any] | None:
-        """Return unexpired APPLIED live plan for slug (shadow plans never suppress live planning, Issue #7)."""
+        """Return unexpired APPLIED live plan for slug (pending/failed/shadow never suppress live planning)."""
         with self._conn() as db:
             row = db.execute(
                 """
                 SELECT * FROM plans
-                WHERE character_id = ? AND applied = 1 AND plan_state != 'shadow' AND expires_at > ?
+                WHERE character_id = ? AND applied = 1 AND plan_state = 'applied' AND expires_at > ?
                 ORDER BY id DESC LIMIT 1
                 """,
                 (slug, now_ts),
@@ -1021,17 +1223,20 @@ class BrainStore:
         start_ledger_ops: int = 0,
         advisory_only: bool = False,
         proposal_status: str = "",
+        plan_state: str | None = None,
     ) -> int:
         dt = datetime.fromtimestamp(now_ts, tz=timezone.utc)
-        day_key = datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d")
+        day_key = dt.strftime("%Y-%m-%d")
         expires_at = now_ts + int(plan["session_minutes"]) * 60
-        p_state = "applied" if applied else "shadow"
-        p_status = proposal_status or ("proposed" if applied else "shadow")
+        p_state = plan_state if plan_state is not None else ("applied" if applied else "shadow")
+        p_status = proposal_status or ("proposed" if applied else ("pending" if p_state == "pending" else "shadow"))
         with self._conn() as db:
+            mx_row = db.execute("SELECT COALESCE(MAX(id), 0) AS mx FROM plans").fetchone()
+            next_id = max(int(mx_row["mx"] or 0), self._sequence_floor) + 1
             cur = db.execute(
                 """
                 INSERT INTO plans (
-                    planned_at, planned_iso, day_key, expires_at, character_id, game_guid,
+                    id, planned_at, planned_iso, day_key, expires_at, character_id, game_guid,
                     source, model, effort, primary_goal_id, primary_desc, secondary_goal_ids,
                     reason_code, session_minutes, weight_modifiers, cpp_weights,
                     input_tokens, output_tokens, thinking_tokens, latency_ms,
@@ -1039,9 +1244,10 @@ class BrainStore:
                     start_level, start_xp, start_skill_sum, start_orders_done,
                     start_quests_done, start_ledger_ops,
                     plan_state, proposal_status, advisory_only
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
+                    next_id,
                     now_ts,
                     dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     day_key,
@@ -1076,18 +1282,19 @@ class BrainStore:
                     1 if advisory_only else 0,
                 ),
             )
-            return int(cur.lastrowid)
+            self._sequence_floor = max(self._sequence_floor, next_id)
+            return int(cur.lastrowid or next_id)
 
     def summary(self, now_ts: int) -> dict[str, Any]:
-        day_key = datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d")
+        day_key = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%d")
         with self._conn() as db:
-            # Latest APPLIED live plan per character (shadow runs excluded, Issue #7)
+            # Latest APPLIED live plan per character (shadow/pending/failed excluded)
             latest_rows = db.execute("""
                 SELECT p.* FROM plans p
                 INNER JOIN (
                     SELECT character_id, MAX(id) AS max_id
                     FROM plans
-                    WHERE applied = 1 AND plan_state != 'shadow'
+                    WHERE applied = 1 AND plan_state = 'applied'
                     GROUP BY character_id
                 ) m ON m.max_id = p.id
                 ORDER BY p.planned_at DESC
@@ -1134,12 +1341,20 @@ class BrainStore:
                 "error_note": d["error_note"],
             }
 
+        last_ok_raw = self.get_meta("last_success_at", "0")
+        last_success_at = int(last_ok_raw) if last_ok_raw.isdigit() else 0
+        stale_min = int(os.getenv("HEARTHCORE_STALE_MINUTES", str(DEFAULT_STALE_MINUTES)) or DEFAULT_STALE_MINUTES)
+        stale_alarm = bool(last_success_at > 0 and (now_ts - last_success_at) > stale_min * 60)
+
         return {
             "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "day": day_key,
             "model": os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5"),
             "effort": os.getenv("ANTHROPIC_EFFORT", "medium"),
-            "daily_cap": int(os.getenv("HEARTHCORE_DAILY_CALL_CAP", "500")),
+            "daily_cap": int(os.getenv("HEARTHCORE_DAILY_CALL_CAP", "500") or 500),
+            "last_success_at": last_success_at,
+            "stale_alarm": stale_alarm,
+            "stale_threshold_minutes": stale_min,
             "today": {
                 "total": int(day_row["total_today"] or 0),
                 "ai_ok": int(day_row["ai_ok"] or 0),
@@ -1213,6 +1428,8 @@ def run_cycle(
     http_post_fn=None,
     sql_exec=None,
     now_ts_override: int | None = None,
+    remote_max_rev_override: int | None = None,
+    lock_timeout_sec: float = 2.0,
 ) -> dict[str, Any]:
     """Run one session-boundary planning cycle for online Hearthguard companions."""
     load_env()
@@ -1223,170 +1440,231 @@ def run_cycle(
     store = BrainStore(db_path)
     mem = MemoryEngine(store.path)
     budget = BudgetLedger(store.path)
-    world_ctx = (
-        world_ctx_override
-        if world_ctx_override is not None
-        else fetch_world_context(mem=mem, now_ts=now_ts)
-    )
-    if apply:
-        store.refresh_outcomes(
-            world_ctx["companions"],
-            now_ts,
-            proposals_by_plan_id=world_ctx.get("proposals_by_plan_id"),
-        )
-    # Shadow runs read a snapshot copy of reservations and NEVER mutate live reservations (Issue #7)
-    reservations = dict(mem.active_order_reservations(now_ts))
-    known_slugs = set(profiles())
 
-    targets = []
-    for slug, comp in sorted(world_ctx["companions"].items()):
-        if character and slug != character.lower():
-            continue
-        if not comp["online"] and not character:
-            continue
-        if slug not in known_slugs:
-            continue
-        if not force and store.active_plan(slug, now_ts) is not None:
-            continue
-        targets.append(comp)
+    # Validate budget config up front so invalid env vars fail fast (Issue #55)
+    budget.configured_caps()
 
-    if limit > 0:
-        targets = targets[:limit]
-
-    planned = []
-    for comp in targets:
-        slug = comp["slug"]
-        char_prof = profile(slug)
-        mem_ctx = mem.build_packet(comp, world_ctx, now_ts, mutate_intentions=apply)
-        snap = build_snapshot(
-            comp,
-            world_ctx,
-            memory_ctx=mem_ctx,
-            order_reservations=reservations,
-            char_profile=char_prof,
-        )
-        desc_by_id = {c["id"]: c["description"] for c in snap["candidates"]}
-
-        source = provider
-        meta: dict[str, Any] = {}
-        err_note = ""
-
-        if provider == "anthropic":
-            try:
-                plan, meta = anthropic_with_meta(
-                    char_prof,
-                    snap,
-                    model=cfg_model,
-                    effort=cfg_effort,
-                    memory=mem_ctx["packet"],
-                    budget=budget,
-                    caller="shadow_planner" if not apply else "planner",
-                    is_shadow=not apply,
-                    http_post_fn=http_post_fn,
-                )
-            except BudgetExceeded as exc:
-                source = "fallback"
-                err_note = str(exc)
-                plan = fallback(char_prof, snap)
-            except InvalidWithUsage as exc:
-                source = "fallback_after_api"
-                err_note = str(exc)
-                meta = exc.meta
-                plan = fallback(char_prof, snap)
-            except Invalid as exc:
-                source = "fallback_after_api"
-                err_note = str(exc)
-                plan = fallback(char_prof, snap)
-        else:
-            plan = fallback(char_prof, snap)
-
-        xp_catchup, _ = _is_xp_capped_prof_catchup(comp, world_ctx)
-        cpp_w = weights_for_cpp(plan, snap, xp_capped_catchup=xp_catchup)
-        prop_spec = build_proposal_spec(plan, snap)
-        primary_desc = desc_by_id.get(plan["primary_goal_id"], plan["primary_goal_id"])
-
-        if apply:
-            # Finalize any previous open plan for this character BEFORE inserting the new one (Issue #5)
-            store.finalize_character_open_plans(slug, comp, now_ts)
-
-        plan_id = store.record_plan(
-            now_ts=now_ts,
-            slug=slug,
-            guid=comp["guid"],
-            source=source,
-            model=meta.get("model") or (cfg_model if source == "anthropic" else "fallback"),
-            effort=meta.get("effort") or (cfg_effort if source == "anthropic" else ""),
-            plan=plan,
-            primary_desc=primary_desc,
-            cpp_weights=cpp_w,
-            meta=meta,
-            applied=apply,
-            error_note=err_note,
-            observed_at=snap["observed_at"],
-            start_level=int(comp["level"]),
-            start_xp=int(comp.get("xp", 0)),
-            start_skill_sum=sum(v for v, _ in comp["skills"].values()),
-            start_orders_done=int(comp.get("orders_delivered", 0)),
-            start_quests_done=int(comp.get("quests_rewarded", 0)),
-            start_ledger_ops=int(comp.get("ledger_ops", 0)),
-            advisory_only=bool(prop_spec["advisory_only"]),
-            proposal_status=("advisory" if prop_spec["advisory_only"] else "proposed") if apply else "shadow",
-        )
-
-        if apply:
-            cpp_w, prop_spec = apply_plan_to_db(
-                comp["guid"],
-                comp["name"],
-                plan,
-                snap,
-                source,
-                plan_id=plan_id,
-                now_ts=now_ts,
-                sql_exec=sql_exec,
-                xp_capped_catchup=xp_catchup,
-            )
-            mem.record_plan_intention(slug, plan, primary_desc, now_ts)
-            picked_oid = parse_order_id(plan["primary_goal_id"])
-            if picked_oid is not None:
-                reservations[picked_oid] = slug
-
-        planned.append({
-            "plan_id": plan_id,
-            "name": comp["name"],
-            "level": comp["level"],
-            "source": source,
-            "model": meta.get("model") or "fallback",
-            "applied": apply,
-            "advisory_only": bool(prop_spec["advisory_only"]),
-            "primary_goal_id": plan["primary_goal_id"],
-            "reason_code": plan["reason_code"],
-            "session_minutes": plan["session_minutes"],
-            "tokens": f"{meta.get('input_tokens', 0)}/{meta.get('output_tokens', 0)}",
-            "latency_ms": meta.get("latency_ms", 0),
-            "error": err_note,
-        })
-
-    if apply:
+    # Check operator kill switch (Issue #59)
+    if apply and is_brain_disabled(runtime_dir):
         summary = write_active_plans_json(store, now_ts, mem=mem, budget=budget, runtime_dir=runtime_dir)
-    else:
-        # Strict shadow isolation (Issue #7): never overwrite active_plans.json!
-        summary = store.summary(now_ts)
-        summary["budget"] = budget.summary(now_ts)
-        runtime_dir.mkdir(parents=True, exist_ok=True)
-        sh_path = runtime_dir / "shadow_plans.json"
-        sh_out = {
-            "generated_at": datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "is_shadow": True,
+        summary["disabled"] = True
+        return {
+            "planned_count": 0,
+            "planned": [],
+            "failed": [],
+            "disabled": True,
+            "summary": summary,
+        }
+
+    with acquire_run_lock(runtime_dir, timeout_sec=lock_timeout_sec):
+        # Sync monotonic plan_id / revision authority with MySQL before planning (Issue #53)
+        seq_info: dict[str, Any] = {"resynced": False}
+        if apply:
+            remote_max = remote_max_rev_override
+            if remote_max is None:
+                if world_ctx_override is not None and sql_exec is None:
+                    remote_max = int(world_ctx_override.get("remote_max_revision") or 0)
+                else:
+                    try:
+                        remote_max = fetch_remote_max_revision(sql_exec=sql_exec)
+                    except Exception:
+                        remote_max = 0
+            seq_info = store.sync_sequence_floor(int(remote_max or 0))
+            if seq_info.get("resynced"):
+                record_failure_alert(
+                    "brain_sequence_resync",
+                    f"brain.db behind MySQL ({seq_info['local_max']} < {seq_info['remote_max']}); resynced floor",
+                    runtime_dir=runtime_dir,
+                )
+
+        world_ctx = (
+            world_ctx_override
+            if world_ctx_override is not None
+            else fetch_world_context(mem=mem, now_ts=now_ts)
+        )
+        if apply:
+            store.refresh_outcomes(
+                world_ctx["companions"],
+                now_ts,
+                proposals_by_plan_id=world_ctx.get("proposals_by_plan_id"),
+            )
+        # Shadow runs read a snapshot copy of reservations and NEVER mutate live reservations (Issue #7)
+        reservations = dict(mem.active_order_reservations(now_ts))
+        known_slugs = set(profiles())
+
+        targets = []
+        for slug, comp in sorted(world_ctx["companions"].items()):
+            if character and slug != character.lower():
+                continue
+            if not comp["online"] and not character:
+                continue
+            if slug not in known_slugs:
+                continue
+            if not force and store.active_plan(slug, now_ts) is not None:
+                continue
+            targets.append(comp)
+
+        if limit > 0:
+            targets = targets[:limit]
+
+        planned: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        try:
+            for comp in targets:
+                slug = str(comp.get("slug") or comp.get("name", "")).lower()
+                pending_plan_id: int | None = None
+                try:
+                    char_prof = profile(slug)
+                    mem_ctx = mem.build_packet(comp, world_ctx, now_ts, mutate_intentions=apply)
+                    snap = build_snapshot(
+                        comp,
+                        world_ctx,
+                        memory_ctx=mem_ctx,
+                        order_reservations=reservations,
+                        char_profile=char_prof,
+                    )
+                    desc_by_id = {c["id"]: c["description"] for c in snap["candidates"]}
+
+                    source = provider
+                    meta: dict[str, Any] = {}
+                    err_note = ""
+
+                    if provider == "anthropic":
+                        try:
+                            plan, meta = anthropic_with_meta(
+                                char_prof,
+                                snap,
+                                model=cfg_model,
+                                effort=cfg_effort,
+                                memory=mem_ctx["packet"],
+                                budget=budget,
+                                caller="shadow_planner" if not apply else "planner",
+                                is_shadow=not apply,
+                                http_post_fn=http_post_fn,
+                                now_ts=now_ts,
+                            )
+                        except (BudgetExceeded, ProviderBackoffError) as exc:
+                            source = "fallback"
+                            err_note = str(exc)
+                            plan = fallback(char_prof, snap)
+                        except InvalidWithUsage as exc:
+                            source = "fallback_after_api"
+                            err_note = str(exc)
+                            meta = exc.meta
+                            plan = fallback(char_prof, snap)
+                        except Invalid as exc:
+                            source = "fallback_after_api"
+                            err_note = str(exc)
+                            plan = fallback(char_prof, snap)
+                    else:
+                        plan = fallback(char_prof, snap)
+
+                    xp_catchup, _ = _is_xp_capped_prof_catchup(comp, world_ctx)
+                    cpp_w = weights_for_cpp(plan, snap, xp_capped_catchup=xp_catchup)
+                    prop_spec = build_proposal_spec(plan, snap)
+                    primary_desc = desc_by_id.get(plan["primary_goal_id"], plan["primary_goal_id"])
+
+                    # Issue #52: record live plan as 'pending' (applied=0) BEFORE MySQL write;
+                    # promote to applied=1 ONLY after apply_plan_to_db succeeds!
+                    plan_id = store.record_plan(
+                        now_ts=now_ts,
+                        slug=slug,
+                        guid=comp["guid"],
+                        source=source,
+                        model=meta.get("model") or (cfg_model if source == "anthropic" else "fallback"),
+                        effort=meta.get("effort") or (cfg_effort if source == "anthropic" else ""),
+                        plan=plan,
+                        primary_desc=primary_desc,
+                        cpp_weights=cpp_w,
+                        meta=meta,
+                        applied=False,
+                        plan_state="pending" if apply else "shadow",
+                        error_note=err_note,
+                        observed_at=snap["observed_at"],
+                        start_level=int(comp["level"]),
+                        start_xp=int(comp.get("xp", 0)),
+                        start_skill_sum=sum(v for v, _ in comp["skills"].values()),
+                        start_orders_done=int(comp.get("orders_delivered", 0)),
+                        start_quests_done=int(comp.get("quests_rewarded", 0)),
+                        start_ledger_ops=int(comp.get("ledger_ops", 0)),
+                        advisory_only=bool(prop_spec["advisory_only"]),
+                        proposal_status=("advisory" if prop_spec["advisory_only"] else "proposed") if apply else "shadow",
+                    )
+                    if apply:
+                        pending_plan_id = plan_id
+                        cpp_w, prop_spec = apply_plan_to_db(
+                            comp["guid"],
+                            comp["name"],
+                            plan,
+                            snap,
+                            source,
+                            plan_id=plan_id,
+                            now_ts=now_ts,
+                            sql_exec=sql_exec,
+                            xp_capped_catchup=xp_catchup,
+                        )
+                        # MySQL acknowledged! Finalize previous open plan and mark this one applied.
+                        store.finalize_character_open_plans(slug, comp, now_ts, exclude_plan_id=plan_id)
+                        store.mark_plan_applied(plan_id)
+                        pending_plan_id = None
+                        mem.record_plan_intention(slug, plan, primary_desc, now_ts)
+                        picked_oid = parse_order_id(plan["primary_goal_id"])
+                        if picked_oid is not None:
+                            reservations[picked_oid] = slug
+
+                    planned.append({
+                        "plan_id": plan_id,
+                        "name": comp["name"],
+                        "level": comp["level"],
+                        "source": source,
+                        "model": meta.get("model") or "fallback",
+                        "applied": apply,
+                        "advisory_only": bool(prop_spec["advisory_only"]),
+                        "primary_goal_id": plan["primary_goal_id"],
+                        "reason_code": plan["reason_code"],
+                        "session_minutes": plan["session_minutes"],
+                        "tokens": f"{meta.get('input_tokens', 0)}/{meta.get('output_tokens', 0)}",
+                        "latency_ms": meta.get("latency_ms", 0),
+                        "error": err_note,
+                    })
+                except Exception as exc:
+                    err_msg = f"{type(exc).__name__}: {exc}"
+                    if pending_plan_id is not None:
+                        try:
+                            store.mark_plan_failed(pending_plan_id, err_msg)
+                        except Exception:
+                            pass
+                    failed.append({"character_id": slug, "name": comp.get("name", slug), "error": err_msg[:200]})
+                    record_failure_alert("brain_companion_error", f"{slug}: {err_msg}", runtime_dir=runtime_dir)
+                    continue
+        finally:
+            if apply:
+                if not failed or planned:
+                    store.set_meta("last_success_at", str(now_ts))
+                summary = write_active_plans_json(store, now_ts, mem=mem, budget=budget, runtime_dir=runtime_dir)
+            else:
+                # Strict shadow isolation (Issue #7): never overwrite active_plans.json!
+                summary = store.summary(now_ts)
+                summary["budget"] = budget.summary(now_ts)
+                runtime_dir.mkdir(parents=True, exist_ok=True)
+                sh_path = runtime_dir / "shadow_plans.json"
+                sh_out = {
+                    "generated_at": datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "is_shadow": True,
+                    "planned_count": len(planned),
+                    "failed_count": len(failed),
+                    "planned": planned,
+                    "failed": failed,
+                    "budget": summary["budget"],
+                }
+                tmp = sh_path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(sh_out, indent=2) + "\n", encoding="utf-8")
+                tmp.replace(sh_path)
+
+        return {
             "planned_count": len(planned),
             "planned": planned,
-            "budget": summary["budget"],
+            "failed": failed,
+            "sequence_sync": seq_info,
+            "summary": summary,
         }
-        tmp = sh_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(sh_out, indent=2) + "\n", encoding="utf-8")
-        tmp.replace(sh_path)
-
-    return {
-        "planned_count": len(planned),
-        "planned": planned,
-        "summary": summary,
-    }

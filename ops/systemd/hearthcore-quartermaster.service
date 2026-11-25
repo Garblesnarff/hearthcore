@@ -1,11 +1,13 @@
 [Unit]
 Description=Hearthcore Claude Guild Quartermaster (Sonnet 5.5 40-char supply & work orders)
 After=network-online.target
+OnFailure=hearthcore-failure@%n.service
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/wonky/hearthcore
+WorkingDirectory=%h/hearthcore
 ExecStart=/usr/bin/python3 -m hearthcore quartermaster-tick --provider anthropic
+TimeoutStartSec=120
 Nice=15
 CPUQuota=20%
 MemoryMax=128M

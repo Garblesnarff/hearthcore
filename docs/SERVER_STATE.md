@@ -95,6 +95,14 @@ flowchart LR
 | `quartermaster_runs` | Hourly Guild Quartermaster run logs (`is_shadow` isolated from live `quartermaster.json`). |
 | `intentions` | Open/completed character intentions (`skill_tier` breakpoints `75/150/225/300` and claimed `work_order` IDs), reconciled against authoritative MySQL state each turn. |
 | `event_journal` & `event_cursors` | Durable autobiographical event journal keyed by `companion_events.id` (`INSERT OR IGNORE`) with cursor checkpoints and honest gap detection. |
+| `brain_meta` | Durable monotonic `sequence_floor` (synced against MySQL `companion_weight_overrides`/`companion_proposals` max revision on start) and `last_success_at` staleness timestamp. |
+
+#### Backup & Restore of `runtime/brain.db` (Issue #53)
+- **Nightly backup:** `/home/wonky/AzerothCore/backup.sh` runs an online WAL-safe SQLite `.backup()` of `hearthcore/runtime/brain.db` into each nightly `acore-YYYYmmdd-HHMMSS.tar` archive alongside `database.sql.gz` and `.env`.
+- **Restore procedure:**
+  1. Disable timers temporarily (`python3 -m hearthcore brain-disable --skip-db`).
+  2. Extract `brain.db` from the desired `acore-*.tar` bundle into `hearthcore/runtime/brain.db` (removing any stale `-wal`/`-shm` sidecars).
+  3. Re-enable (`python3 -m hearthcore brain-enable --skip-db`). On the next `brain-tick`, `BrainStore.sync_sequence_floor()` automatically queries MySQL `MAX(revision)/MAX(plan_id)` and advances the sequence floor above any newer MySQL rows so new plans always take effect cleanly.
 
 ---
 

@@ -28,6 +28,12 @@ def main():
     bt.add_argument("--character", help="Plan only a single companion slug")
 
     commands.add_parser("brain-status", help="Show active AI Brain session plans and today's API stats")
+    bd = commands.add_parser("brain-disable", help="Disable AI Brain live cycles and/or MySQL weight overrides")
+    bd.add_argument("--guid", type=int, default=None, help="Optional single character GUID to disable in MySQL")
+    bd.add_argument("--skip-db", action="store_true", help="Only write the local kill-switch flag file")
+    be = commands.add_parser("brain-enable", help="Re-enable AI Brain live cycles and/or MySQL weight overrides")
+    be.add_argument("--guid", type=int, default=None, help="Optional single character GUID to re-enable in MySQL")
+    be.add_argument("--skip-db", action="store_true", help="Only remove the local kill-switch flag file")
 
     commands.add_parser("supply-report", help="Compute 40-char Classic (1-300) profession material deficits vs Guild Bank")
 
@@ -77,11 +83,17 @@ def main():
             return 0
 
         if args.command == "brain-status":
-            from .bridge import BrainStore, load_env
+            from .bridge import BrainStore, is_brain_disabled, load_env
             load_env()
             s = BrainStore().summary(int(time.time()))
             t = s["today"]
-            print(f"Hearthcore AI Brain | model={s['model']} effort={s['effort']} day={s['day']}")
+            flags = []
+            if is_brain_disabled():
+                flags.append("DISABLED")
+            if s.get("stale_alarm"):
+                flags.append(f"STALE>{s.get('stale_threshold_minutes')}m")
+            flag_str = f" [{' '.join(flags)}]" if flags else ""
+            print(f"Hearthcore AI Brain | model={s['model']} effort={s['effort']} day={s['day']}{flag_str}")
             print(
                 f"Today: ai_ok={t['ai_ok']} ai_err={t['ai_err']} fallback={t['fallback']} "
                 f"cap={s['daily_cap']} tokens={t['input_tokens']}in/{t['output_tokens']}out "
@@ -95,6 +107,16 @@ def main():
                     f"  {v['character_id']:<12} [{v['source']:<9}] {v['primary_goal_id']:<28} "
                     f"({v['reason_code']}, {rem}m left) - {v['primary_desc']}"
                 )
+            return 0
+
+        if args.command in ("brain-disable", "brain-enable"):
+            from .bridge import set_brain_disabled
+            res = set_brain_disabled(
+                args.command == "brain-disable",
+                guid=args.guid,
+                skip_db=args.skip_db,
+            )
+            print(json.dumps(res, indent=2, sort_keys=True))
             return 0
 
         if args.command == "supply-report":
@@ -186,9 +208,13 @@ def main():
         snap = snapshot(json.loads(Path(args.snapshot).read_text()), args.character)
         source = args.provider
         if source == "anthropic":
+            from .bridge import BRAIN_DB_PATH
+            from .budget import BudgetLedger
             from .provider import anthropic
+            ledger_path = (Path(args.db).parent / "brain.db") if args.db else BRAIN_DB_PATH
+            ledger = BudgetLedger(ledger_path)
             try:
-                plan = anthropic(character, snap)
+                plan = anthropic(character, snap, budget=ledger, caller="cli_plan")
             except Invalid as e:
                 print("API plan rejected; using fallback: " + str(e), file=sys.stderr)
                 plan, source = fallback(character, snap), "fallback_after_api"

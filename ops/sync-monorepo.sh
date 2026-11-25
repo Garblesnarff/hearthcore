@@ -5,11 +5,11 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-AW_SRC="/home/wonky/azeroth-watch"
-MPB_SRC="/home/wonky/AzerothCore/azerothcore-wotlk/modules/mod-playerbots"
-PERF_SRC="/home/wonky/perf"
-SHARE_SRC="/home/wonky/wow-lan-share"
-SYS_SRC="/home/wonky/.config/systemd/user"
+AW_SRC="${AW_SRC:-$HOME/azeroth-watch}"
+MPB_SRC="${MPB_SRC:-$HOME/AzerothCore/azerothcore-wotlk/modules/mod-playerbots}"
+PERF_SRC="${PERF_SRC:-$HOME/perf}"
+SHARE_SRC="${SHARE_SRC:-$HOME/wow-lan-share}"
+SYS_SRC="${SYS_SRC:-$HOME/.config/systemd/user}"
 
 echo "[sync] 1/4 Azeroth Watch (source only; no MPQ maps/icons)..."
 mkdir -p "$REPO_ROOT/azeroth-watch/static"
@@ -29,6 +29,7 @@ cp -f "$MPB_SRC"/src/Bot/Companion*.{h,cpp} "$REPO_ROOT/mod-playerbots-companion
 cp -f "$MPB_SRC/src/Bot/PlayerbotAI.h" "$REPO_ROOT/mod-playerbots-companions/src/Bot/"
 cp -f "$MPB_SRC/src/Ai/Base/Actions/ReviveFromCorpseAction.cpp" "$REPO_ROOT/mod-playerbots-companions/src/Ai/Base/Actions/"
 cp -f "$MPB_SRC/src/Ai/Base/Strategy/CompanionLeadStrategy.cpp" "$REPO_ROOT/mod-playerbots-companions/src/Ai/Base/Strategy/"
+cp -f "$MPB_SRC/src/Ai/Base/Strategy/CompanionCraftStrategy.cpp" "$REPO_ROOT/mod-playerbots-companions/src/Ai/Base/Strategy/"
 cp -f "$MPB_SRC/src/Script/PlayerbotCommandScript.cpp" "$REPO_ROOT/mod-playerbots-companions/src/Script/"
 
 echo "[sync] 3/4 Operational scripts & LAN laptop installer..."
@@ -44,6 +45,7 @@ for u in azeroth-realmlist-heal.service azeroth-realmlist-heal.timer \
          azeroth-watch.service \
          hearthcore-brain.service hearthcore-brain.timer \
          hearthcore-quartermaster.service hearthcore-quartermaster.timer \
+         hearthcore-failure@.service \
          wow-lan-share.service; do
   [[ -f "$SYS_SRC/$u" ]] && cp -f "$SYS_SRC/$u" "$REPO_ROOT/ops/systemd/$u"
 done
