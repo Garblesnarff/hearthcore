@@ -502,26 +502,92 @@ def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = No
     }
 
 
-def _is_xp_capped_prof_catchup(comp: dict[str, Any], world_ctx: dict[str, Any]) -> tuple[bool, int]:
-    """Return (True, cap_level) when companion is near/at CompanionLevelLead XP cap AND has lagging primary skills."""
+def _xp_cap_prof_catchup_state(comp: dict[str, Any], world_ctx: dict[str, Any]) -> dict[str, Any]:
+    """Compute authoritative per-character XP-cap & primary-profession catch-up state (Issue #23).
+
+    Rules:
+    - Scoped ONLY to companions with an authoritative owner-cap binding (`core-wonky`, `core-logan`,
+      or explicit `owner_name` / `xp_cap_level`). Ordinary guild bots are never falsely treated as
+      Wonky-capped!
+    - Respects explicit `xp_eligible` and configured `HEARTHCORE_COMPANION_LEVEL_LEAD` (default 3).
+    - Distinguishes `at_cap` (0 XP) from `near_cap` (1 level below cap, still earning XP).
+    - Respects trained skill ceilings (`val >= mx` and `mx < 300` -> needs profession trainer!).
+    """
     lvl = int(comp.get("level") or 0)
+    sg = str(comp.get("shift_group") or "").strip().lower()
     owner_levels = world_ctx.get("owner_levels") or {}
-    sg = str(comp.get("shift_group") or "")
-    owner_lvl = owner_levels.get("logan", 0) if sg == "core-logan" else owner_levels.get("wonky", 0)
-    if owner_lvl <= 0:
-        return False, 0
-    cap_lvl = owner_lvl + 3  # AiPlayerbot.CompanionLevelLead = 3
-    # Trigger catch-up at cap or 1 level below cap when primary professions lag badly behind character level
-    if lvl < cap_lvl - 1:
-        return False, cap_lvl
+    level_lead = int(world_ctx.get("companion_level_lead") or os.getenv("HEARTHCORE_COMPANION_LEVEL_LEAD", "3") or 3)
+
+    cap_lvl = 0
+    if comp.get("xp_cap_level") is not None:
+        cap_lvl = int(comp["xp_cap_level"])
+    else:
+        owner_name = str(comp.get("owner_name") or "").strip().lower()
+        if not owner_name:
+            if sg == "core-logan":
+                owner_name = "logan"
+            elif sg == "core-wonky":
+                owner_name = "wonky"
+        if owner_name and owner_levels.get(owner_name, 0) > 0:
+            cap_lvl = int(owner_levels[owner_name]) + level_lead
+
+    if cap_lvl <= 0 and comp.get("xp_eligible") is not False:
+        return {
+            "mode": "none",
+            "at_cap": False,
+            "near_cap": False,
+            "cap_level": 0,
+            "lagging_primary": False,
+            "needs_trainer": False,
+            "target_skill": 0,
+        }
+
+    explicit_xp_elig = comp.get("xp_eligible")
+    at_cap = (explicit_xp_elig is False) or (cap_lvl > 0 and lvl >= cap_lvl)
+    near_cap = (not at_cap) and (cap_lvl > 0 and lvl == cap_lvl - 1)
+
+    if not at_cap and not near_cap:
+        return {
+            "mode": "none",
+            "at_cap": False,
+            "near_cap": False,
+            "cap_level": cap_lvl,
+            "lagging_primary": False,
+            "needs_trainer": False,
+            "target_skill": 0,
+        }
+
     skills = comp.get("skills") or {}
-    target_skill = min(225, max(75, lvl * 4))
-    lagging = any(
-        val < target_skill
-        for sid, (val, _mx) in skills.items()
-        if sid in CRAFT_SKILLS or sid in GATHER_SKILLS
-    )
-    return lagging, cap_lvl
+    prof_cap = int(world_ctx.get("prof_cap") or 300)
+    target_skill = min(prof_cap, max(75, lvl * 4))
+    needs_trainer = False
+    lagging_trainable = False
+    for sid, (val, mx) in skills.items():
+        if sid not in CRAFT_SKILLS and sid not in GATHER_SKILLS:
+            continue
+        v_i, mx_i = int(val), int(mx)
+        if v_i >= mx_i and mx_i < prof_cap and mx_i < target_skill:
+            needs_trainer = True
+        elif v_i < min(target_skill, mx_i):
+            lagging_trainable = True
+
+    active_catchup = lagging_trainable or needs_trainer
+    mode = "at_cap" if (at_cap and active_catchup) else ("near_cap" if (near_cap and active_catchup) else "none")
+    return {
+        "mode": mode,
+        "at_cap": mode == "at_cap",
+        "near_cap": mode == "near_cap",
+        "cap_level": cap_lvl,
+        "lagging_primary": lagging_trainable,
+        "needs_trainer": needs_trainer,
+        "target_skill": target_skill,
+    }
+
+
+def _is_xp_capped_prof_catchup(comp: dict[str, Any], world_ctx: dict[str, Any]) -> tuple[bool, int]:
+    """Compatibility wrapper returning (True, cap_level) ONLY when companion is actually AT XP cap with lagging primary skills."""
+    st = _xp_cap_prof_catchup_state(comp, world_ctx)
+    return bool(st["at_cap"]), int(st["cap_level"])
 
 
 def build_snapshot(
@@ -541,14 +607,23 @@ def build_snapshot(
     is_fish_night = "Fishing" in weekly
     is_sunday = "Sunday" in weekly
     res_map = order_reservations or {}
-    xp_capped_catchup, cap_lvl = _is_xp_capped_prof_catchup(comp, world_ctx)
+    catchup = _xp_cap_prof_catchup_state(comp, world_ctx)
+    xp_capped_catchup = bool(catchup["at_cap"])
+    near_cap_catchup = bool(catchup["near_cap"])
+    cap_lvl = int(catchup["cap_level"])
+    needs_trainer = bool(catchup["needs_trainer"])
+    target_skill = int(catchup["target_skill"] or min(225, max(75, lvl * 4)))
 
     candidates: list[dict[str, Any]] = []
 
     if xp_capped_catchup:
-        # Companion is at/near owner XP cap (0 XP from quests/mobs!) and primary professions lag behind level.
-        q_score = 32
-        q_desc = f"Quest around {zone} (Lv {lvl} XP-capped at {cap_lvl}: 0 XP — prefer catching up lagging professions!)"
+        # Companion is AT owner XP cap (0 XP from quests/mobs!) — keep gear/rep/gold turn-ins viable while preferring lagging professions.
+        q_score = 35
+        q_desc = f"Quest around {zone} (Lv {lvl} at XP cap {cap_lvl}: 0 XP; gear/gold/rep only — catch up lagging professions!)"
+    elif near_cap_catchup:
+        # 1 level below cap still earns full XP — keep questing viable while gently encouraging professions!
+        q_score = 72
+        q_desc = f"Complete quests and turn-ins around {zone} (Lv {lvl}, 1 level below cap {cap_lvl}; still earns XP)"
     else:
         q_score = 78 if lvl < 20 else 72
         if comp["shift_group"] in ("core-wonky", "core-logan"):
@@ -599,7 +674,13 @@ def build_snapshot(
             sk_name = SKILL_NAMES[sk_id]
             gap = max(0, min(lvl * 5, mx) - val)
             qm_boost = 10 if sk_name.lower() in qm_focus else 0
-            catchup_boost = 18 if (xp_capped_catchup and val < min(225, lvl * 4)) else 0
+            at_trained_cap = (val >= mx and mx < 300)
+            catchup_boost = 0
+            if not at_trained_cap and val < target_skill:
+                if xp_capped_catchup:
+                    catchup_boost = 18
+                elif near_cap_catchup:
+                    catchup_boost = 8
             score = min(96, 52 + gap // 2 + (14 if is_craft_night else 0) + qm_boost + catchup_boost)
             candidates.append({
                 "id": f"craft:{_slug_token(sk_name)}",
@@ -607,7 +688,8 @@ def build_snapshot(
                 "score": max(45, score),
                 "description": (
                     f"Advance {sk_name} ({val}/{mx}) and supply Hearthguard"
-                    + (" [XP-Cap Profession Catch-Up!]" if catchup_boost else "")
+                    + (" [At Trained Cap — Visit Trainer!]" if at_trained_cap else "")
+                    + (" [XP-Cap Profession Catch-Up!]" if catchup_boost >= 18 else "")
                     + (" [Guild Priority]" if qm_boost else "")
                 )[:240],
             })
@@ -616,7 +698,13 @@ def build_snapshot(
             gap = max(0, min(lvl * 5, mx) - val)
             needed_names = qm_mats.get(sk_name.lower(), [])[:3]
             qm_boost = 12 if (sk_name.lower() in qm_focus or needed_names) else 0
-            catchup_boost = 18 if (xp_capped_catchup and val < min(225, lvl * 4)) else 0
+            at_trained_cap = (val >= mx and mx < 300)
+            catchup_boost = 0
+            if not at_trained_cap and val < target_skill:
+                if xp_capped_catchup:
+                    catchup_boost = 18
+                elif near_cap_catchup:
+                    catchup_boost = 8
             score = min(96, 54 + gap // 2 + (8 if is_craft_night else 0) + qm_boost + catchup_boost)
             need_txt = f" — needs {', '.join(needed_names)}" if needed_names else ""
             spot_hint = best_farm_hint(sk_id, lvl)
@@ -627,7 +715,8 @@ def build_snapshot(
                 "score": max(45, score),
                 "description": (
                     f"Gather {sk_name} ({val}/{mx}) for guild vault{need_txt}{hint_txt}"
-                    + (" [XP-Cap Catch-Up!]" if catchup_boost else "")
+                    + (" [At Trained Cap — Visit Trainer!]" if at_trained_cap else "")
+                    + (" [XP-Cap Catch-Up!]" if catchup_boost >= 18 else "")
                 )[:240],
             })
 
@@ -670,12 +759,17 @@ def build_snapshot(
                             + (" [Sunday Dungeon Day!]" if is_sunday else ""))[:240],
         })
 
-    t_score = 70 if (lvl % 2 == 0 and lvl >= 4) else 52
+    t_score = 90 if needs_trainer else (70 if (lvl % 2 == 0 and lvl >= 4) else 52)
+    t_desc = (
+        f"Visit profession trainer to unlock next skill cap (at trained ceiling, Lv {lvl})"
+        if needs_trainer
+        else f"Visit class or profession trainer at level {lvl} [Advisory]"
+    )
     candidates.append({
         "id": "train:skills",
         "type": "train",
         "score": t_score,
-        "description": f"Visit class or profession trainer at level {lvl} [Advisory]",
+        "description": t_desc[:240],
     })
     candidates.append({
         "id": "bank:vault",
@@ -776,22 +870,23 @@ def weights_for_cpp(
     travel_val = eff("travel")
     hearth_val = eff("rest")
 
-    # When XP-capped with lagging primary professions, suppress 0-XP questing AND non-primary fishing
-    # (which otherwise scores ~65 right next to any water and stalls Alchemy/LW/JC/Inscription catch-up!)
+    # Issue #23: When AT XP cap with lagging primary professions, suppress 0-XP mob grinding
+    # while preserving necessary travel (trainers/nodes), quest turn-ins (gear/gold/rep), and
+    # fishing if fishing is the explicit primary goal!
     if xp_capped_catchup and primary_type in ("craft", "gather", "guild_order", "train", "profession"):
         q = _clamp(min(q, 0.55))
-        fish_val = _clamp(min(fish_val, 0.50))
+        fish_val = _clamp(min(fish_val, 0.65))
         craft_val = _clamp(max(craft_val, 1.45))
         gather_val = _clamp(max(gather_val, 1.45))
-        train_val = _clamp(max(train_val, 1.35))
-        travel_val = _clamp(min(travel_val, 0.65))
-        hearth_val = _clamp(max(hearth_val, 1.45))
+        train_val = _clamp(max(train_val, 1.40))
+        travel_val = _clamp(max(travel_val, 0.90))
+        hearth_val = _clamp(max(hearth_val, 1.35))
 
     return {
         "quest_work": q,
-        "quest_turnin": _clamp(max(q, 0.7 if xp_capped_catchup else 1.0)),
-        "quest_hub": q,
-        "quest_grind": _clamp(min(q, 0.55 if xp_capped_catchup else 1.15)),
+        "quest_turnin": _clamp(max(q, 0.95 if xp_capped_catchup else 1.0)),
+        "quest_hub": _clamp(max(q, 0.75 if xp_capped_catchup else q)),
+        "quest_grind": _clamp(min(q, 0.50 if xp_capped_catchup else 1.15)),
         "craft": craft_val,
         "gather": gather_val,
         "fish": fish_val,

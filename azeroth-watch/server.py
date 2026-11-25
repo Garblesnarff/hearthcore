@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Azeroth Watch — lightweight HTTP + SSE server with authenticated admin controls (zero external deps).
+"""Azeroth Watch — lightweight HTTP + SSE server with authenticated admin & read-view protection.
 
-Security model (Issue #9):
+Security model (Issues #9 & #71):
 - Default CLI bind is 127.0.0.1 (safe local default); LAN family dashboard explicitly binds 0.0.0.0
-  in systemd while read-only GET/SSE endpoints stay separated from privileged POST endpoints.
+  in systemd while strictly validating Host headers on EVERY route (DNS-rebinding protection).
+- Read-only unauthenticated kiosk view (/api/state, /api/stream) uses an explicit field allow-list:
+  - Never exposes login account names, raw exception strings, API spend/credit balance, or raw
+    runtime planner/admin JSON.
+  - Full AI Brain & budget telemetry is served ONLY to authenticated admin sessions (via
+    X-Azeroth-Admin-Token header or HttpOnly SameSite=Strict HMAC session cookie).
 - ALL administrative POST endpoints (/api/brain/model, /api/brain/credit, /api/brain/run) require:
-  1. Strict Content-Length <= 4096 bytes and JSON Content-Type.
-  2. Same-Origin / CSRF check (rejects cross-origin Origin/Referer headers with 403).
-  3. Explicit authorization via X-Azeroth-Admin-Token header OR HttpOnly SameSite=Strict
-     HMAC-signed session cookie issued by POST /api/brain/auth (401 otherwise).
+  1. Host-header allow-list + Same-Origin / CSRF check (403 on mismatch).
+  2. Strict Content-Length <= 4096 bytes and application/json Content-Type.
+  3. Explicit authorization via X-Azeroth-Admin-Token or HttpOnly SameSite=Strict session cookie.
   4. Rate limiting (15s run cooldown + 5/min auth brute-force protection).
   5. Audit logging to runtime/admin_audit.log (zero secrets logged or returned).
 """
@@ -25,19 +29,33 @@ import mimetypes
 import os
 import secrets
 import signal
+import socket
 import socketserver
 import subprocess
 import sys
 import threading
 import time
 import urllib.parse
+from pathlib import Path
 
 from collector import AzerothCollector
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
-HEARTHCORE_ENV = "/home/wonky/hearthcore/.env"
-AUDIT_LOG_PATH = "/home/wonky/hearthcore/runtime/admin_audit.log"
+
+
+def _default_hearthcore_root() -> Path:
+    env_root = os.getenv("HEARTHCORE_ROOT")
+    if env_root:
+        return Path(env_root)
+    parent = Path(BASE_DIR).parent
+    if (parent / "hearthcore").is_dir():
+        return parent
+    return Path.home() / "hearthcore"
+
+
+HEARTHCORE_ENV = os.getenv("HEARTHCORE_ENV_PATH", str(_default_hearthcore_root() / ".env"))
+AUDIT_LOG_PATH = os.getenv("AZEROTH_WATCH_AUDIT_LOG", str(_default_hearthcore_root() / "runtime" / "admin_audit.log"))
 ALLOWED_MODELS = {"claude-haiku-5-5", "claude-sonnet-5-5"}
 MAX_POST_BYTES = 4096
 SESSION_COOKIE_NAME = "aw_admin_session"
@@ -46,6 +64,135 @@ SESSION_TTL_SEC = 30 * 86400
 _CTL_LOCK = threading.Lock()
 _LAST_RUN_TS: dict[str, float] = {}
 _AUTH_FAILS: dict[str, list[float]] = {}
+
+# Explicit read-only kiosk allow-list (Issue #71)
+PUBLIC_TOP_KEYS = (
+    "generated_at",
+    "clock",
+    "hour",
+    "minute",
+    "realm",
+    "vitals",
+    "ticks",
+    "errors_bytes",
+    "slow_warnings",
+    "population",
+    "humans",
+    "raid",
+    "companions",
+    "professions",
+    "bank",
+    "ledger",
+    "events",
+    "work_orders",
+    "relationships",
+    "shifts",
+    "world_zones",
+    "map_slides",
+    "weekly_event",
+)
+PUBLIC_HUMAN_KEYS = (
+    "guid",
+    "name",
+    "level",
+    "class_id",
+    "class_name",
+    "class_color",
+    "race_id",
+    "gender",
+    "race",
+    "zone_id",
+    "zone",
+    "map_id",
+    "x",
+    "y",
+    "xp",
+    "xp_max",
+    "xp_pct",
+)
+
+
+def _discover_default_allowed_hosts() -> set[str]:
+    hosts = {"127.0.0.1", "localhost", "[::1]", "::1"}
+    try:
+        hn = socket.gethostname().strip().lower()
+        if hn:
+            hosts.add(hn)
+            hosts.add(f"{hn}.local")
+    except OSError:
+        pass
+    try:
+        # Discover primary LAN IP without sending packets
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("192.168.1.1", 80))
+            ip = s.getsockname()[0]
+            if ip:
+                hosts.add(ip)
+        finally:
+            s.close()
+    except OSError:
+        pass
+    extra = os.getenv("AZEROTH_WATCH_ALLOWED_HOSTS", "")
+    for item in extra.split(","):
+        tok = item.strip().lower()
+        if tok:
+            hosts.add(tok)
+    return hosts
+
+
+def _strip_host_port(host_header: str) -> str:
+    h = (host_header or "").strip().lower()
+    if not h:
+        return ""
+    if h.startswith("["):
+        # IPv6 literal [::1]:8787
+        end = h.find("]")
+        return h[: end + 1] if end != -1 else h
+    if ":" in h:
+        return h.split(":", 1)[0]
+    return h
+
+
+def _host_allowed(host_header: str, allowed_hosts: set[str]) -> bool:
+    host_only = _strip_host_port(host_header)
+    if not host_only:
+        return False
+    return host_only in allowed_hosts
+
+
+def project_snapshot(snap: dict | None, *, authenticated: bool) -> dict:
+    """Apply explicit field allow-list for public kiosk vs authenticated admin view (Issue #71)."""
+    if not isinstance(snap, dict):
+        return {}
+    out: dict = {}
+    for k in PUBLIC_TOP_KEYS:
+        if k not in snap:
+            continue
+        if k == "humans" and isinstance(snap[k], list):
+            out["humans"] = [
+                {hk: h[hk] for hk in PUBLIC_HUMAN_KEYS if hk in h}
+                for h in snap[k]
+                if isinstance(h, dict)
+            ]
+        else:
+            out[k] = snap[k]
+
+    if authenticated:
+        # Authenticated admin session receives full AI Brain & budget dashboard data (minus any raw account field)
+        if "ai_brain" in snap:
+            out["ai_brain"] = snap["ai_brain"]
+        out["view_mode"] = "admin"
+    else:
+        ab = snap.get("ai_brain") if isinstance(snap.get("ai_brain"), dict) else {}
+        active_list = ab.get("active_list") if isinstance(ab.get("active_list"), list) else []
+        out["ai_brain"] = {
+            "auth_required": True,
+            "redacted": True,
+            "active_plans_count": sum(1 for item in active_list if isinstance(item, dict) and item.get("active")),
+        }
+        out["view_mode"] = "kiosk"
+    return out
 
 
 def _read_env_value(key: str, env_path: str = HEARTHCORE_ENV) -> str:
@@ -174,8 +321,10 @@ def make_handler(
     env_path: str = HEARTHCORE_ENV,
     audit_path: str = AUDIT_LOG_PATH,
     systemctl_runner=None,
+    allowed_hosts: set[str] | None = None,
 ):
     token_secret = admin_token if admin_token is not None else ensure_admin_token(env_path)
+    host_allowlist = set(allowed_hosts) if allowed_hosts is not None else _discover_default_allowed_hosts()
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -205,6 +354,12 @@ def make_handler(
             self.end_headers()
             self.wfile.write(body)
 
+        def _check_host_header(self) -> bool:
+            if not _host_allowed(self.headers.get("Host") or "", host_allowlist):
+                self._send_bytes(403, "application/json; charset=utf-8", b'{"ok":false,"error":"Host not allowed"}')
+                return False
+            return True
+
         def _is_authenticated(self) -> bool:
             if not token_secret:
                 return False
@@ -224,6 +379,8 @@ def make_handler(
             return False
 
         def do_GET(self):
+            if not self._check_host_header():
+                return
             path = self.path.split("?", 1)[0]
 
             if path == "/api/health":
@@ -238,11 +395,13 @@ def make_handler(
 
             if path == "/api/state":
                 _, snap = collector.get_snapshot()
-                body = json.dumps(snap, separators=(",", ":")).encode("utf-8")
+                view = project_snapshot(snap, authenticated=self._is_authenticated())
+                body = json.dumps(view, separators=(",", ":")).encode("utf-8")
                 self._send_bytes(200, "application/json; charset=utf-8", body)
                 return
 
             if path == "/api/stream":
+                is_auth = self._is_authenticated()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
@@ -253,7 +412,8 @@ def make_handler(
                     while True:
                         ver, snap = collector.get_snapshot()
                         if ver != last_ver and snap:
-                            payload = json.dumps(snap, separators=(",", ":"))
+                            view = project_snapshot(snap, authenticated=is_auth)
+                            payload = json.dumps(view, separators=(",", ":"))
                             msg = f"id: {ver}\nevent: state\ndata: {payload}\n\n".encode("utf-8")
                             self.wfile.write(msg)
                             self.wfile.flush()
@@ -278,6 +438,8 @@ def make_handler(
             self._send_bytes(404, "text/plain; charset=utf-8", b"Not found")
 
         def do_POST(self):
+            if not self._check_host_header():
+                return
             path = self.path.split("?", 1)[0]
             ip = self._client_ip()
 
@@ -332,7 +494,7 @@ def make_handler(
                     self._send_bytes(401, "application/json; charset=utf-8", b'{"ok":false,"error":"Invalid admin token"}')
                     return
                 signed = _sign_session(token_secret, int(time.time()))
-                cookie_hdr = f"{SESSION_COOKIE_NAME}={signed}; HttpOnly; SameSite=Strict; Path=/api/brain; Max-Age={SESSION_TTL_SEC}"
+                cookie_hdr = f"{SESSION_COOKIE_NAME}={signed}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SEC}"
                 _audit_log(ip, path, 200, "auth_ok", audit_path=audit_path)
                 self._send_bytes(
                     200,
@@ -343,7 +505,7 @@ def make_handler(
                 return
 
             if path == "/api/brain/logout":
-                cookie_hdr = f"{SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/api/brain; Max-Age=0"
+                cookie_hdr = f"{SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
                 _audit_log(ip, path, 200, "logout", audit_path=audit_path)
                 self._send_bytes(
                     200,
@@ -465,7 +627,7 @@ def main():
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
 
-    print(f"Azeroth Watch listening on http://{args.host}:{args.port} (admin POST auth enabled)", flush=True)
+    print(f"Azeroth Watch listening on http://{args.host}:{args.port} (Host allow-list + admin auth enabled)", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

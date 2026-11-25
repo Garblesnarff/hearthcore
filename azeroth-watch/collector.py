@@ -848,9 +848,9 @@ class AzerothCollector:
         except Exception:
             pass
 
-        # 3. Online human players (non-RNDBOT, non-companion)
+        # 3. Online human players (non-RNDBOT, non-companion; never exposes login account username, Issue #71)
         human_rows = self.db.query("""
-            SELECT c.guid, c.name, c.level, c.class, c.race, c.gender, c.zone, c.money, c.xp, a.username,
+            SELECT c.guid, c.name, c.level, c.class, c.race, c.gender, c.zone, c.money, c.xp,
                    c.map, c.position_x, c.position_y
             FROM acore_characters.characters c
             JOIN acore_auth.account a ON a.id = c.account
@@ -870,9 +870,9 @@ class AzerothCollector:
             xp_max = self._xp_table.get(lvl, 0)
             xp_pct = round(min(100.0, 100.0 * xp / xp_max), 1) if xp_max > 0 else 100.0
             lp = live_pos.get(guid)
-            map_id = int(lp["m"]) if lp else int(r[10])
-            pos_x = float(lp["x"]) if lp else float(r[11])
-            pos_y = float(lp["y"]) if lp else float(r[12])
+            map_id = int(lp["m"]) if lp else int(r[9])
+            pos_x = float(lp["x"]) if lp else float(r[10])
+            pos_y = float(lp["y"]) if lp else float(r[11])
             zid = int(lp["z"]) if lp else int(r[6])
             cls = CLASSES.get(cls_id, {"name": "?", "short": "?", "color": "#fff"})
             humans.append({
@@ -894,7 +894,6 @@ class AzerothCollector:
                 "xp": xp,
                 "xp_max": xp_max,
                 "xp_pct": xp_pct,
-                "account": r[9],
             })
 
         # 4. All 38 companions + schedule + profiles + live health, xp, position & bag usage

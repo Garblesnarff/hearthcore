@@ -265,7 +265,7 @@ class Phase2Tests(unittest.TestCase):
             hearthcore_sha="5ee45be",
             mod_playerbots_sha="2bcb40bf",
         )
-        self.assertEqual(art["schema_version"], 1)
+        self.assertEqual(art["schema_version"], 2)
         self.assertTrue(art["all_correctness_passed"])
         self.assertEqual(art["metrics"]["tick_p99_ms"], 25.0)
         self.assertEqual(art["metrics"]["swap_delta_mib"], 4.0)
