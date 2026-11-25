@@ -645,19 +645,21 @@ def weights_for_cpp(
     )
     craft_val = _clamp(craft_val)
     gather_val = eff("gather")
+    fish_val = eff("fish")
     train_val = eff("train")
     travel_val = eff("travel")
     hearth_val = eff("rest")
 
-    # When XP-capped with lagging professions, suppress 0-XP questing and lower travel penalty so
-    # city CraftSession / GatherFarm / Trainer visits win over remote 0-XP quest zones!
-    if xp_capped_catchup and primary_type in ("craft", "gather", "guild_order", "train", "profession", "fish"):
+    # When XP-capped with lagging primary professions, suppress 0-XP questing AND non-primary fishing
+    # (which otherwise scores ~65 right next to any water and stalls Alchemy/LW/JC/Inscription catch-up!)
+    if xp_capped_catchup and primary_type in ("craft", "gather", "guild_order", "train", "profession"):
         q = _clamp(min(q, 0.55))
+        fish_val = _clamp(min(fish_val, 0.50))
         craft_val = _clamp(max(craft_val, 1.45))
         gather_val = _clamp(max(gather_val, 1.45))
         train_val = _clamp(max(train_val, 1.35))
         travel_val = _clamp(min(travel_val, 0.65))
-        hearth_val = _clamp(max(hearth_val, 1.35))
+        hearth_val = _clamp(max(hearth_val, 1.45))
 
     return {
         "quest_work": q,
@@ -666,7 +668,7 @@ def weights_for_cpp(
         "quest_grind": _clamp(min(q, 0.55 if xp_capped_catchup else 1.15)),
         "craft": craft_val,
         "gather": gather_val,
-        "fish": eff("fish"),
+        "fish": fish_val,
         "train": train_val,
         "bank": eff("bank"),
         "repair": eff("repair"),
