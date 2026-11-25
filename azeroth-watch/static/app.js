@@ -127,10 +127,17 @@
 
   function renderHeader(d) {
     const v = d.vitals;
-    const up = v.worldserver_up && d.realm.flag === 0;
+    const up = v.worldserver_up && d.realm.flag === 0 && d.db_ok !== false;
+    const stale = d.db_ok === false || (typeof d.data_age_sec === "number" && d.data_age_sec > 30);
     const sp = $("status-pill");
-    sp.className = `pill status-pill ${up ? "online" : "offline"}`;
-    $("status-text").textContent = up ? `ONLINE · ${fmtUptime(v.worldserver_uptime_s)}` : "OFFLINE";
+    sp.className = `pill status-pill ${up && !stale ? "online" : "offline"}`;
+    if (d.db_ok === false) {
+      $("status-text").textContent = `DB STALE (${d.data_age_sec || 0}s)`;
+    } else if (stale) {
+      $("status-text").textContent = `STALE (${d.data_age_sec}s)`;
+    } else {
+      $("status-text").textContent = up ? `ONLINE · ${fmtUptime(v.worldserver_uptime_s)}` : "OFFLINE";
+    }
 
     $("realm-sub").textContent = `${d.realm.name} · ${d.realm.address}:${d.realm.port} · ${d.population.total_online} Online`;
     $("clock-val").textContent = d.clock;

@@ -1,6 +1,10 @@
 [Unit]
 Description=Auto-heal AzerothCore realmlist.flag=2 when ac-worldserver is live on 8085
+OnFailure=hearthcore-failure@%n.service
 
 [Service]
 Type=oneshot
-ExecStart=/home/wonky/perf/heal-realmlist.sh
+ExecStart=%h/perf/heal-realmlist.sh
+TimeoutStartSec=30
+NoNewPrivileges=yes
+UMask=0077

@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -28,6 +30,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("hearthcore")
 
 from .budget import BudgetExceeded, BudgetLedger, InvalidWithUsage, ProviderBackoffError
 from .core import Invalid, ROOT, fallback, profile, profiles, snapshot, validate
@@ -57,6 +61,24 @@ SHADOW_PLANS_PATH = RUNTIME_DIR / "shadow_plans.json"
 QUARTERMASTER_PATH = RUNTIME_DIR / "quartermaster.json"
 DEFAULT_SQL_TIMEOUT_SEC = float(os.getenv("HEARTHCORE_SQL_TIMEOUT_SEC", "20") or 20)
 DEFAULT_STALE_MINUTES = int(os.getenv("HEARTHCORE_STALE_MINUTES", "45") or 45)
+DEFAULT_QM_MAX_AGE_SEC = int(os.getenv("HEARTHCORE_QM_MAX_AGE_SEC", str(6 * 3600)) or (6 * 3600))
+DEFAULT_FALLBACK_HOLDOUT_PCT = int(os.getenv("HEARTHCORE_FALLBACK_HOLDOUT_PCT", "10") or 10)
+
+# Canonical 1-to-many mapping between character profile preference keys and native CompanionBrain keys (Issue #60).
+# Native C++ merge rule (CompanionBrain.cpp): active companion_weight_overrides rows REPLACE baseline
+# companion_weights values for each key present, EXCEPT manually tuned keys (manualKeys) which always win.
+PROFILE_PREF_TO_NATIVE_WEIGHTS: dict[str, tuple[str, ...]] = {
+    "quest": ("quest_work", "quest_turnin", "quest_hub", "quest_grind"),
+    "craft": ("craft",),
+    "gather": ("gather",),
+    "fish": ("fish",),
+    "train": ("train",),
+    "bank": ("bank",),
+    "repair": ("repair", "sell"),
+    "travel": ("travel",),
+    "rest": ("hearth",),
+}
+NATIVE_MERGE_RULE = "replace_except_manual"
 
 CRAFT_SKILLS = {164, 165, 171, 197, 202, 333, 755, 773}
 GATHER_SKILLS = {182, 186, 393}
@@ -182,24 +204,121 @@ def record_failure_alert(source: str, detail: str, *, runtime_dir: Path = RUNTIM
         pass
 
 
-def run_sql(sql: str, *, timeout: float | None = None) -> list[list[str]]:
-    use_timeout = float(timeout if timeout is not None else os.getenv("HEARTHCORE_SQL_TIMEOUT_SEC", str(DEFAULT_SQL_TIMEOUT_SEC)))
-    res = subprocess.run(
-        [
-            "docker", "exec", "-i", DB_CONTAINER, "sh", "-c",
-            'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -u root -N -B acore_characters',
-        ],
-        input=sql,
-        text=True,
-        capture_output=True,
-        check=True,
-        timeout=max(1.0, use_timeout),
-    )
-    rows: list[list[str]] = []
-    for line in res.stdout.splitlines():
-        if line != "":
-            rows.append(line.split("\t"))
+def _unescape_mysql_batch_field(field: str) -> str | None:
+    """Decode one mysql --batch (-B) TSV field: NULL -> None, unescape \\t/\\n/\\\\/\\0 (Issue #62)."""
+    if field == "NULL":
+        return None
+    if "\\" not in field:
+        return field
+    out: list[str] = []
+    i = 0
+    n = len(field)
+    while i < n:
+        ch = field[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = field[i + 1]
+            if nxt == "t":
+                out.append("\t")
+            elif nxt == "n":
+                out.append("\n")
+            elif nxt == "r":
+                out.append("\r")
+            elif nxt == "0":
+                out.append("\x00")
+            elif nxt == "\\":
+                out.append("\\")
+            else:
+                out.append(nxt)
+            i += 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def parse_mysql_tsv(raw_stdout: str, *, expected_cols: int | None = None) -> list[list[str | None]]:
+    """Parse mysql -N -B output splitting strictly on '\\n' ONLY (never U+2028/\\x0b/\\x0c/\\x85, Issue #62).
+
+    Decodes SQL NULL to None and raises ValueError loudly if expected_cols is violated.
+    """
+    if not raw_stdout:
+        return []
+    rows: list[list[str | None]] = []
+    for raw_line in raw_stdout.split("\n"):
+        if raw_line == "":
+            continue
+        if raw_line.endswith("\r"):
+            raw_line = raw_line[:-1]
+        parts = [_unescape_mysql_batch_field(f) for f in raw_line.split("\t")]
+        if expected_cols is not None and len(parts) != expected_cols:
+            raise ValueError(f"Malformed MySQL row: expected {expected_cols} columns, got {len(parts)}")
+        rows.append(parts)
     return rows
+
+
+def _int_or(val: Any, default: int = 0) -> int:
+    if val is None or val == "":
+        return default
+    return int(val)
+
+
+def run_sql(sql: str, *, timeout: float | None = None, expected_cols: int | None = None) -> list[list[Any]]:
+    use_timeout = float(timeout if timeout is not None else os.getenv("HEARTHCORE_SQL_TIMEOUT_SEC", str(DEFAULT_SQL_TIMEOUT_SEC)))
+    db_host = os.getenv("HEARTHCORE_DB_HOST", "").strip()
+    db_port = os.getenv("HEARTHCORE_DB_PORT", "3306").strip()
+    db_name = os.getenv("HEARTHCORE_DB_NAME", "acore_characters").strip()
+    db_user = os.getenv("HEARTHCORE_DB_USER", "").strip()
+    db_pass = os.getenv("HEARTHCORE_DB_PASSWORD", "")
+
+    if db_host:
+        # Direct TCP mysql client (used for least-privilege host connections & CI MySQL service container!)
+        env = dict(os.environ)
+        env["MYSQL_PWD"] = db_pass
+        cmd = [
+            "mysql",
+            f"-h{db_host}",
+            f"-P{db_port}",
+            f"-u{db_user or 'root'}",
+            "-N",
+            "-B",
+            db_name,
+        ]
+        res = subprocess.run(
+            cmd,
+            input=sql,
+            text=True,
+            capture_output=True,
+            check=True,
+            timeout=max(1.0, use_timeout),
+            env=env,
+        )
+    elif db_user and db_pass:
+        # Least-privilege user inside container without passing password on argv
+        cmd = [
+            "docker", "exec", "-i", "-e", f"MYSQL_PWD={db_pass}", DB_CONTAINER,
+            "mysql", f"-u{db_user}", "-N", "-B", db_name,
+        ]
+        res = subprocess.run(
+            cmd,
+            input=sql,
+            text=True,
+            capture_output=True,
+            check=True,
+            timeout=max(1.0, use_timeout),
+        )
+    else:
+        res = subprocess.run(
+            [
+                "docker", "exec", "-i", DB_CONTAINER, "sh", "-c",
+                f'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -u root -N -B {db_name}',
+            ],
+            input=sql,
+            text=True,
+            capture_output=True,
+            check=True,
+            timeout=max(1.0, use_timeout),
+        )
+    return parse_mysql_tsv(res.stdout, expected_cols=expected_cols)
 
 
 def fetch_remote_max_revision(*, sql_exec=None) -> int:
@@ -236,53 +355,85 @@ def read_live_context() -> dict[str, Any]:
     return ctx
 
 
-def sync_event_journal(mem: MemoryEngine, guid_to_slug: dict[int, str], now_ts: int) -> dict[str, Any]:
-    """Incrementally ingest companion_events into durable event_journal using checkpoint cursor (Issue #4)."""
+def sync_event_journal(
+    mem: MemoryEngine,
+    guid_to_slug: dict[int, str],
+    now_ts: int,
+    *,
+    sql_exec=None,
+) -> dict[str, Any]:
+    """Incrementally ingest companion_events into durable event_journal with stall/reset/gap protection (Issues #4 & #57)."""
+    runner = sql_exec if sql_exec is not None else run_sql
     cursor = mem.get_event_cursor()
-    min_rows = run_sql("SELECT COALESCE(MIN(id), 0) FROM companion_events;")
-    min_avail = int(min_rows[0][0]) if (min_rows and min_rows[0]) else 0
+    bounds_rows = runner("SELECT COALESCE(MIN(id), 0), COALESCE(MAX(id), 0) FROM companion_events;")
+    min_avail = _int_or(bounds_rows[0][0], 0) if (bounds_rows and len(bounds_rows[0]) >= 2) else 0
+    max_avail = _int_or(bounds_rows[0][1], 0) if (bounds_rows and len(bounds_rows[0]) >= 2) else 0
+
+    # Detect source counter reset / truncation BEFORE querying WHERE id > cursor (Issue #57)
+    if cursor > 0 and max_avail < cursor:
+        reset_info = mem.ingest_events(
+            [],
+            now_ts=now_ts,
+            min_available_source_id=min_avail,
+            max_available_source_id=max_avail,
+        )
+        logger.warning("Event journal source counter reset detected: %s", reset_info.get("gap_note"))
+        cursor = int(reset_info["cursor"])
 
     total_inserted = 0
-    last_info: dict[str, Any] = {"inserted": 0, "cursor": cursor, "gap_detected": False, "gap_note": ""}
-    # Paginate in bounded chunks so bursts never lose or crowd out quieter companions
+    last_info: dict[str, Any] = {
+        "inserted": 0,
+        "cursor": cursor,
+        "latest_source_id": max_avail,
+        "journal_lag": max(0, max_avail - cursor),
+        "gap_detected": False,
+        "gap_note": "",
+    }
+    # Paginate in bounded chunks; ALWAYS advance persisted cursor past filtered non-companion pages!
     for _ in range(10):
-        rows = run_sql(
+        rows = runner(
             f"SELECT id, guid, event_type, summary, partner_guid, zone_id, created_at "
             f"FROM companion_events WHERE id > {int(cursor)} ORDER BY id ASC LIMIT 500;"
         )
         if not rows:
-            if min_avail > 0 and cursor == 0:
-                last_info = mem.ingest_events([], now_ts=now_ts, min_available_source_id=min_avail)
+            last_info = mem.ingest_events(
+                [],
+                now_ts=now_ts,
+                min_available_source_id=min_avail,
+                max_available_source_id=max_avail,
+            )
             break
+        scanned_max = _int_or(rows[-1][0], cursor)
         batch = []
         for r in rows:
             if len(r) < 7:
                 continue
-            g = int(r[1])
+            g = _int_or(r[1], 0)
             slug = guid_to_slug.get(g)
             if not slug:
                 continue
             batch.append({
-                "source_id": int(r[0]),
+                "source_id": _int_or(r[0], 0),
                 "guid": g,
                 "character_id": slug,
-                "event_type": r[2],
-                "summary": r[3],
-                "partner_guid": int(r[4]),
-                "zone_id": int(r[5]),
-                "created_at": int(r[6]),
+                "event_type": str(r[2] or ""),
+                "summary": str(r[3] or ""),
+                "partner_guid": _int_or(r[4], 0),
+                "zone_id": _int_or(r[5], 0),
+                "created_at": _int_or(r[6], now_ts),
             })
         last_info = mem.ingest_events(
             batch,
             now_ts=now_ts,
-            min_available_source_id=min_avail if cursor == 0 else None,
+            min_available_source_id=min_avail,
+            max_available_source_id=max_avail,
+            scanned_max_source_id=scanned_max,
         )
         total_inserted += last_info["inserted"]
-        new_cursor = int(rows[-1][0])
-        if new_cursor <= cursor or len(rows) < 500:
-            cursor = new_cursor
+        if scanned_max <= cursor or len(rows) < 500:
+            cursor = scanned_max
             break
-        cursor = new_cursor
+        cursor = scanned_max
 
     last_info["inserted"] = total_inserted
     return last_info
@@ -372,12 +523,13 @@ def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = No
                 if sl:
                     companions[sl]["ledger_ops"] = int(r[1])
 
-    # Sync durable event journal with fair cursor-based pagination (Issue #4)
+    # Sync durable event journal with fair cursor-based pagination (Issues #4 & #57)
     if mem is not None and guid_to_slug:
         try:
             sync_event_journal(mem, guid_to_slug, ts)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("sync_event_journal failed: %s: %s", type(exc).__name__, exc)
+            record_failure_alert("event_journal_sync", f"{type(exc).__name__}: {exc}")
 
     online_guids = [str(c["guid"]) for c in companions.values() if c["online"]]
     if online_guids:
@@ -474,20 +626,8 @@ def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = No
         if len(r) >= 2:
             owner_levels[r[0].lower()] = int(r[1])
 
-    # Live Quartermaster directives (strictly reads live quartermaster.json, never shadow)
-    qm_focus: set[str] = set()
-    qm_mats_by_skill: dict[str, list[str]] = {}
-    try:
-        if QUARTERMASTER_PATH.is_file():
-            qm = json.loads(QUARTERMASTER_PATH.read_text(encoding="utf-8"))
-            if not qm.get("is_shadow"):
-                qm_focus = {str(s).lower() for s in (qm.get("focus_skills") or [])}
-                for br in qm.get("bank_requests") or []:
-                    gsk = str(br.get("gather_skill") or "").lower()
-                    if gsk:
-                        qm_mats_by_skill.setdefault(gsk, []).append(str(br.get("name") or ""))
-    except Exception:
-        pass
+    # Live Quartermaster directives with freshness check (Issues #7 & #61)
+    qm_focus, qm_mats_by_skill, qm_meta = load_fresh_quartermaster_directives(QUARTERMASTER_PATH, now_ts=ts)
 
     return {
         "observed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -498,6 +638,7 @@ def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = No
         "owner_levels": owner_levels,
         "qm_focus": qm_focus,
         "qm_mats_by_skill": qm_mats_by_skill,
+        "qm_directives_meta": qm_meta,
         "proposals_by_plan_id": proposals_by_plan_id,
     }
 
@@ -837,31 +978,104 @@ def build_snapshot(
     return snapshot(snap, comp["slug"])
 
 
+def load_fresh_quartermaster_directives(
+    qm_path: Path = QUARTERMASTER_PATH,
+    *,
+    now_ts: int | None = None,
+    max_age_sec: int | None = None,
+) -> tuple[set[str], dict[str, list[str]], dict[str, Any]]:
+    """Load live quartermaster.json ONLY when non-shadow and fresh (Issue #61)."""
+    ts = int(now_ts if now_ts is not None else time.time())
+    limit_sec = int(max_age_sec if max_age_sec is not None else os.getenv("HEARTHCORE_QM_MAX_AGE_SEC", str(DEFAULT_QM_MAX_AGE_SEC)))
+    qm_focus: set[str] = set()
+    qm_mats: dict[str, list[str]] = {}
+    meta: dict[str, Any] = {"present": False, "stale": False, "age_sec": None, "max_age_sec": limit_sec}
+    if not qm_path.is_file():
+        return qm_focus, qm_mats, meta
+    meta["present"] = True
+    try:
+        qm = json.loads(qm_path.read_text(encoding="utf-8"))
+        if qm.get("is_shadow"):
+            meta["stale"] = True
+            return qm_focus, qm_mats, meta
+        upd = str(qm.get("updated_at") or "")
+        if upd:
+            dt = datetime.strptime(upd, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            age = max(0, ts - int(dt.timestamp()))
+        else:
+            age = max(0, int(ts - qm_path.stat().st_mtime))
+        meta["age_sec"] = age
+        if age > limit_sec:
+            meta["stale"] = True
+            logger.warning("Ignoring stale quartermaster.json (age=%ds > max=%ds)", age, limit_sec)
+            return qm_focus, qm_mats, meta
+        qm_focus = {str(s).lower() for s in (qm.get("focus_skills") or [])}
+        for br in qm.get("bank_requests") or []:
+            gsk = str(br.get("gather_skill") or "").lower()
+            if gsk:
+                qm_mats.setdefault(gsk, []).append(str(br.get("name") or ""))
+    except Exception as exc:
+        meta["stale"] = True
+        logger.warning("Failed reading quartermaster.json: %s: %s", type(exc).__name__, exc)
+    return qm_focus, qm_mats, meta
+
+
+def persona_baseline_weights(char_profile: dict[str, Any] | None) -> dict[str, float]:
+    """Map character profile preferences into the canonical native CompanionBrain weight namespace (Issue #60)."""
+    base: dict[str, float] = {}
+    for keys in PROFILE_PREF_TO_NATIVE_WEIGHTS.values():
+        for k in keys:
+            base[k] = 1.0
+    if not char_profile:
+        return base
+    prefs = char_profile.get("preferences") or {}
+    for pkey, native_keys in PROFILE_PREF_TO_NATIVE_WEIGHTS.items():
+        if pkey in prefs and prefs[pkey] is not None:
+            val = _clamp(float(prefs[pkey]))
+            for nk in native_keys:
+                base[nk] = val
+    return base
+
+
 def weights_for_cpp(
     plan: dict[str, Any],
     snap: dict[str, Any],
     *,
     xp_capped_catchup: bool = False,
+    char_profile: dict[str, Any] | None = None,
+    only_changed: bool = False,
 ) -> dict[str, float]:
-    """Translate validated Hearthcore plan into bounded 0.5-1.5 keys read by CompanionBrain.cpp."""
+    """Translate validated Hearthcore plan into bounded 0.5-1.5 keys read by CompanionBrain.cpp (Issue #60).
+
+    Starts from the companion's persona baseline (`char_profile["preferences"]`) instead of flattening
+    omitted keys to 1.0, because native CompanionBrain.cpp merges overrides by REPLACE (except manualKeys).
+    """
     mods = plan["weight_modifiers"]
     cand_type = {c["id"]: c["type"] for c in snap["candidates"]}
     primary_type = cand_type.get(plan["primary_goal_id"], "")
+    baseline = persona_baseline_weights(char_profile)
 
-    def eff(t: str, default: float = 1.0) -> float:
-        base = float(mods.get(t, default))
+    def pref_default(t: str) -> float:
+        native_keys = PROFILE_PREF_TO_NATIVE_WEIGHTS.get(t)
+        if native_keys:
+            return baseline.get(native_keys[0], 1.0)
+        return 1.0
+
+    def eff(t: str, default: float | None = None) -> float:
+        dflt = pref_default(t) if default is None else default
+        base = float(mods.get(t, dflt))
         if primary_type == t:
             base += 0.15
         return _clamp(base)
 
     q = eff("quest")
     if primary_type in ("explore", "dungeon"):
-        q = _clamp(max(q, eff(primary_type) * 0.95))
+        q = _clamp(max(q, eff(primary_type, 1.0) * 0.95))
 
     craft_val = max(
         eff("craft"),
-        eff("profession") * 0.98 if "profession" in mods or primary_type == "profession" else 0.5,
-        eff("guild_order") if "guild_order" in mods or primary_type == "guild_order" else 0.5,
+        eff("profession", baseline["craft"]) * 0.98 if "profession" in mods or primary_type == "profession" else 0.5,
+        eff("guild_order", baseline["craft"]) if "guild_order" in mods or primary_type == "guild_order" else 0.5,
     )
     craft_val = _clamp(craft_val)
     gather_val = eff("gather")
@@ -869,6 +1083,9 @@ def weights_for_cpp(
     train_val = eff("train")
     travel_val = eff("travel")
     hearth_val = eff("rest")
+    bank_val = eff("bank")
+    repair_val = eff("repair")
+    sell_val = _clamp((repair_val + bank_val) / 2.0) if ("repair" in mods or "bank" in mods) else baseline["sell"]
 
     # Issue #23: When AT XP cap with lagging primary professions, suppress 0-XP mob grinding
     # while preserving necessary travel (trainers/nodes), quest turn-ins (gear/gold/rep), and
@@ -882,21 +1099,24 @@ def weights_for_cpp(
         travel_val = _clamp(max(travel_val, 0.90))
         hearth_val = _clamp(max(hearth_val, 1.35))
 
-    return {
+    full = {
         "quest_work": q,
-        "quest_turnin": _clamp(max(q, 0.95 if xp_capped_catchup else 1.0)),
+        "quest_turnin": _clamp(max(q, 0.95 if xp_capped_catchup else max(1.0, baseline["quest_turnin"]))),
         "quest_hub": _clamp(max(q, 0.75 if xp_capped_catchup else q)),
         "quest_grind": _clamp(min(q, 0.50 if xp_capped_catchup else 1.15)),
         "craft": craft_val,
         "gather": gather_val,
         "fish": fish_val,
         "train": train_val,
-        "bank": eff("bank"),
-        "repair": eff("repair"),
-        "sell": _clamp((eff("repair") + eff("bank")) / 2.0),
+        "bank": bank_val,
+        "repair": repair_val,
+        "sell": sell_val,
         "travel": travel_val,
         "hearth": hearth_val,
     }
+    if only_changed:
+        return {k: v for k, v in full.items() if abs(v - baseline.get(k, 1.0)) >= 0.01}
+    return full
 
 
 def build_proposal_spec(plan: dict[str, Any], snap: dict[str, Any]) -> dict[str, Any]:
@@ -937,22 +1157,23 @@ def apply_plan_to_db(
     now_ts: int | None = None,
     sql_exec=None,
     xp_capped_catchup: bool = False,
+    char_profile: dict[str, Any] | None = None,
 ) -> tuple[dict[str, float], dict[str, Any]]:
     """Re-validate plan and atomically write expiring overrides + typed proposal to MySQL.
 
-    Issues #3 & #6:
+    Issues #3, #6 & #60:
     - NEVER overwrites canonical persona/manual rows in `companion_weights`.
-    - Writes expiring overrides to `companion_weight_overrides` with monotonic revision guard
-      so older/replayed plans can never supersede newer plans.
+    - Starts override weights from companion persona baseline (`char_profile["preferences"]`).
+    - Writes expiring overrides to `companion_weight_overrides` with monotonic revision guard.
     - Writes a typed, versioned proposal row to `companion_proposals` for native C++ validation.
     """
     validate(plan, snap)
     ts = int(now_ts if now_ts is not None else time.time())
     expires_at = ts + int(plan["session_minutes"]) * 60
     revision = int(plan_id) if int(plan_id) > 0 else ts
-    cpp_weights = weights_for_cpp(plan, snap, xp_capped_catchup=xp_capped_catchup)
+    cpp_weights = weights_for_cpp(plan, snap, xp_capped_catchup=xp_capped_catchup, char_profile=char_profile)
     prop = build_proposal_spec(plan, snap)
-    db_src = "hearthcore_ai" if source == "anthropic" else "hearthcore_fb"
+    db_src = "hearthcore_ai" if source == "anthropic" else ("hearthcore_holdout" if source == "fallback_holdout" else "hearthcore_fb")
 
     stmts: list[str] = ["START TRANSACTION;"]
     for k, v in sorted(cpp_weights.items()):
@@ -1462,8 +1683,215 @@ class BrainStore:
                 "outcome_skillups": int(day_row["out_sks"] or 0),
                 "outcome_orders": int(day_row["out_ords"] or 0),
             },
+            "ab_report": self.ab_outcome_report(now_ts=now_ts),
             "plans": active,
         }
+
+    def ab_outcome_report(self, *, days: int = 14, now_ts: int | None = None) -> dict[str, Any]:
+        """Compare outcomes & cost per session across AI vs deterministic fallback/holdout (Issue #65)."""
+        from .budget import estimate_cost_usd
+
+        ts = int(now_ts if now_ts is not None else time.time())
+        cutoff = ts - max(1, int(days)) * 86400
+        with self._conn() as db:
+            rows = db.execute(
+                """
+                SELECT source, model, primary_goal_id, applied, plan_state, proposal_status, advisory_only,
+                       start_level, outcome_levels, outcome_xp, outcome_skillups, outcome_orders,
+                       outcome_quests, outcome_ledger_ops, input_tokens, output_tokens
+                FROM plans
+                WHERE applied = 1 AND plan_state = 'applied' AND planned_at >= ?
+                """,
+                (cutoff,),
+            ).fetchall()
+
+        by_source: dict[str, dict[str, Any]] = {}
+        by_goal_type: dict[str, dict[str, dict[str, int]]] = {}
+        for r in rows:
+            d = dict(r)
+            src = str(d["source"] or "unknown")
+            gtype = goal_prefix(str(d["primary_goal_id"] or ""))
+            oc = classify_plan_outcome(d)
+            cost = estimate_cost_usd(str(d["model"] or ""), int(d["input_tokens"] or 0), int(d["output_tokens"] or 0))
+
+            s_entry = by_source.setdefault(
+                src,
+                {
+                    "sessions": 0,
+                    "progressed_or_completed": 0,
+                    "completed": 0,
+                    "stalled": 0,
+                    "levels": 0,
+                    "skillups": 0,
+                    "orders": 0,
+                    "quests": 0,
+                    "total_cost_usd": 0.0,
+                },
+            )
+            s_entry["sessions"] += 1
+            if oc in ("completed", "progressed"):
+                s_entry["progressed_or_completed"] += 1
+            if oc == "completed":
+                s_entry["completed"] += 1
+            if oc == "stalled":
+                s_entry["stalled"] += 1
+            s_entry["levels"] += int(d["outcome_levels"] or 0)
+            s_entry["skillups"] += int(d["outcome_skillups"] or 0)
+            s_entry["orders"] += int(d["outcome_orders"] or 0)
+            s_entry["quests"] += int(d["outcome_quests"] or 0)
+            s_entry["total_cost_usd"] += cost
+
+            gt_src = by_goal_type.setdefault(gtype, {}).setdefault(src, {"sessions": 0, "positive": 0, "stalled": 0})
+            gt_src["sessions"] += 1
+            if oc in ("completed", "progressed"):
+                gt_src["positive"] += 1
+            elif oc == "stalled":
+                gt_src["stalled"] += 1
+
+        for src, entry in by_source.items():
+            cnt = max(1, entry["sessions"])
+            entry["progress_rate"] = round(entry["progressed_or_completed"] / cnt, 3)
+            entry["avg_skillups"] = round(entry["skillups"] / cnt, 2)
+            entry["total_cost_usd"] = round(entry["total_cost_usd"], 4)
+            entry["cost_per_session_usd"] = round(entry["total_cost_usd"] / cnt, 5)
+
+        return {
+            "window_days": int(days),
+            "holdout_pct": int(os.getenv("HEARTHCORE_FALLBACK_HOLDOUT_PCT", str(DEFAULT_FALLBACK_HOLDOUT_PCT)) or 0),
+            "by_source": by_source,
+            "by_goal_type": by_goal_type,
+        }
+
+
+def is_fallback_holdout(slug: str, day_key: str, *, holdout_pct: int | None = None) -> bool:
+    """Deterministic daily-rotated fallback holdout selector for A/B measurement (Issue #65)."""
+    pct = int(
+        holdout_pct
+        if holdout_pct is not None
+        else (os.getenv("HEARTHCORE_FALLBACK_HOLDOUT_PCT", str(DEFAULT_FALLBACK_HOLDOUT_PCT)) or 0)
+    )
+    if pct <= 0:
+        return False
+    if pct >= 100:
+        return True
+    digest = hashlib.sha256(f"{day_key}:{slug.lower()}".encode("utf-8")).digest()
+    bucket = int.from_bytes(digest[:2], "big") % 100
+    return bucket < pct
+
+
+def reconcile_state(
+    *,
+    db_path: Path = BRAIN_DB_PATH,
+    sql_exec=None,
+    now_ts: int | None = None,
+) -> dict[str, Any]:
+    """Compare SQLite applied plans & journal cursor against live MySQL tables; report drift (Issue #64)."""
+    ts = int(now_ts if now_ts is not None else time.time())
+    runner = sql_exec if sql_exec is not None else run_sql
+    store = BrainStore(db_path)
+    mem = MemoryEngine(store.path)
+
+    with store._conn() as db:
+        active_rows = db.execute(
+            """
+            SELECT p.id, p.character_id, p.game_guid, p.expires_at, p.primary_goal_id
+            FROM plans p
+            INNER JOIN (
+                SELECT character_id, MAX(id) AS max_id
+                FROM plans WHERE applied = 1 AND plan_state = 'applied'
+                GROUP BY character_id
+            ) m ON m.max_id = p.id
+            WHERE p.expires_at > ?
+            """,
+            (ts,),
+        ).fetchall()
+
+    prop_rows = runner("SELECT plan_id, status FROM companion_proposals;")
+    mysql_props = {_int_or(r[0], 0): str(r[1] or "") for r in prop_rows if len(r) >= 2}
+
+    ov_rows = runner(
+        "SELECT guid, MAX(plan_id), MAX(revision), MIN(enabled), MAX(expires_at) "
+        "FROM companion_weight_overrides GROUP BY guid;"
+    )
+    mysql_ov = {
+        _int_or(r[0], 0): {
+            "plan_id": _int_or(r[1], 0),
+            "revision": _int_or(r[2], 0),
+            "enabled": _int_or(r[3], 0),
+            "expires_at": _int_or(r[4], 0),
+        }
+        for r in ov_rows
+        if len(r) >= 5
+    }
+
+    ev_rows = runner("SELECT COALESCE(MAX(id), 0) FROM companion_events;")
+    mysql_max_ev = _int_or(ev_rows[0][0], 0) if (ev_rows and ev_rows[0]) else 0
+    jstat = mem.journal_status()
+    journal_lag = max(0, mysql_max_ev - int(jstat["cursor"]))
+
+    orphan_plans: list[dict[str, Any]] = []
+    override_drift: list[dict[str, Any]] = []
+    for r in active_rows:
+        pid = int(r["id"])
+        guid = int(r["game_guid"])
+        slug = str(r["character_id"])
+        if pid not in mysql_props:
+            orphan_plans.append({"plan_id": pid, "character_id": slug, "reason": "missing_mysql_proposal"})
+        ov = mysql_ov.get(guid)
+        if not ov:
+            override_drift.append({"plan_id": pid, "character_id": slug, "reason": "missing_mysql_override"})
+        elif ov["enabled"] == 0:
+            override_drift.append({"plan_id": pid, "character_id": slug, "reason": "override_disabled"})
+        elif ov["expires_at"] <= ts:
+            override_drift.append({"plan_id": pid, "character_id": slug, "reason": "override_expired"})
+        elif ov["revision"] < pid:
+            override_drift.append({"plan_id": pid, "character_id": slug, "reason": f"override_behind:{ov['revision']}<{pid}"})
+
+    has_drift = bool(orphan_plans or override_drift or journal_lag > 500)
+    return {
+        "ok": not has_drift,
+        "checked_at": datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "active_sqlite_plans": len(active_rows),
+        "orphan_plans": orphan_plans,
+        "override_drift": override_drift,
+        "journal_cursor": int(jstat["cursor"]),
+        "mysql_max_event_id": mysql_max_ev,
+        "journal_lag": journal_lag,
+        "journal_gap_detected": bool(jstat["gap_detected"]),
+    }
+
+
+def replay_snapshot(
+    character_slug: str,
+    snap_raw: dict[str, Any],
+    *,
+    guid: int = 1001,
+    plan_id: int = 1,
+    now_ts: int = 1_800_000_000,
+) -> dict[str, Any]:
+    """Offline no-network replay harness: recorded snapshot in -> validated plan & SQL statements out (Issue #64)."""
+    char_prof = profile(character_slug)
+    snap = snapshot(snap_raw, character_slug)
+    plan = fallback(char_prof, snap)
+    sql_captured: list[str] = []
+    cpp_w, prop = apply_plan_to_db(
+        guid,
+        char_prof["name"],
+        plan,
+        snap,
+        "fallback",
+        plan_id=plan_id,
+        now_ts=now_ts,
+        sql_exec=lambda s: (sql_captured.append(s), [])[1],
+        char_profile=char_prof,
+    )
+    return {
+        "character_id": character_slug,
+        "plan": plan,
+        "cpp_weights": cpp_w,
+        "proposal": prop,
+        "sql": sql_captured[0] if sql_captured else "",
+    }
 
 
 def write_active_plans_json(
@@ -1604,6 +2032,16 @@ def run_cycle(
 
         planned: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
+        counters = {
+            "planned": 0,
+            "anthropic": 0,
+            "fallback": 0,
+            "fallback_holdout": 0,
+            "api_error": 0,
+            "sql_error": 0,
+            "skipped": max(0, len(world_ctx.get("companions") or {}) - len(targets)),
+        }
+        day_key_utc = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%d")
         try:
             for comp in targets:
                 slug = str(comp.get("slug") or comp.get("name", "")).lower()
@@ -1624,7 +2062,11 @@ def run_cycle(
                     meta: dict[str, Any] = {}
                     err_note = ""
 
-                    if provider == "anthropic":
+                    if provider == "anthropic" and is_fallback_holdout(slug, day_key_utc):
+                        source = "fallback_holdout"
+                        plan = fallback(char_prof, snap)
+                        counters["fallback_holdout"] += 1
+                    elif provider == "anthropic":
                         try:
                             plan, meta = anthropic_with_meta(
                                 char_prof,
@@ -1638,24 +2080,29 @@ def run_cycle(
                                 http_post_fn=http_post_fn,
                                 now_ts=now_ts,
                             )
+                            counters["anthropic"] += 1
                         except (BudgetExceeded, ProviderBackoffError) as exc:
                             source = "fallback"
                             err_note = str(exc)
                             plan = fallback(char_prof, snap)
+                            counters["fallback"] += 1
                         except InvalidWithUsage as exc:
                             source = "fallback_after_api"
                             err_note = str(exc)
                             meta = exc.meta
                             plan = fallback(char_prof, snap)
+                            counters["api_error"] += 1
                         except Invalid as exc:
                             source = "fallback_after_api"
                             err_note = str(exc)
                             plan = fallback(char_prof, snap)
+                            counters["api_error"] += 1
                     else:
                         plan = fallback(char_prof, snap)
+                        counters["fallback"] += 1
 
                     xp_catchup, _ = _is_xp_capped_prof_catchup(comp, world_ctx)
-                    cpp_w = weights_for_cpp(plan, snap, xp_capped_catchup=xp_catchup)
+                    cpp_w = weights_for_cpp(plan, snap, xp_capped_catchup=xp_catchup, char_profile=char_prof)
                     prop_spec = build_proposal_spec(plan, snap)
                     primary_desc = desc_by_id.get(plan["primary_goal_id"], plan["primary_goal_id"])
 
@@ -1666,7 +2113,7 @@ def run_cycle(
                         slug=slug,
                         guid=comp["guid"],
                         source=source,
-                        model=meta.get("model") or (cfg_model if source == "anthropic" else "fallback"),
+                        model=meta.get("model") or (cfg_model if source == "anthropic" else source),
                         effort=meta.get("effort") or (cfg_effort if source == "anthropic" else ""),
                         plan=plan,
                         primary_desc=primary_desc,
@@ -1697,6 +2144,7 @@ def run_cycle(
                             now_ts=now_ts,
                             sql_exec=sql_exec,
                             xp_capped_catchup=xp_catchup,
+                            char_profile=char_prof,
                         )
                         # MySQL acknowledged! Finalize previous open plan and mark this one applied.
                         store.finalize_character_open_plans(slug, comp, now_ts, exclude_plan_id=plan_id)
@@ -1707,12 +2155,13 @@ def run_cycle(
                         if picked_oid is not None:
                             reservations[picked_oid] = slug
 
+                    counters["planned"] += 1
                     planned.append({
                         "plan_id": plan_id,
                         "name": comp["name"],
                         "level": comp["level"],
                         "source": source,
-                        "model": meta.get("model") or "fallback",
+                        "model": meta.get("model") or source,
                         "applied": apply,
                         "advisory_only": bool(prop_spec["advisory_only"]),
                         "primary_goal_id": plan["primary_goal_id"],
@@ -1723,16 +2172,19 @@ def run_cycle(
                         "error": err_note,
                     })
                 except Exception as exc:
+                    counters["sql_error"] += 1
                     err_msg = f"{type(exc).__name__}: {exc}"
+                    logger.warning("Companion planning/apply failed for %s: %s", slug, err_msg)
                     if pending_plan_id is not None:
                         try:
                             store.mark_plan_failed(pending_plan_id, err_msg)
-                        except Exception:
-                            pass
+                        except Exception as mark_exc:
+                            logger.warning("Failed marking pending plan %s failed: %s", pending_plan_id, mark_exc)
                     failed.append({"character_id": slug, "name": comp.get("name", slug), "error": err_msg[:200]})
                     record_failure_alert("brain_companion_error", f"{slug}: {err_msg}", runtime_dir=runtime_dir)
                     continue
         finally:
+            logger.info("cycle_summary %s", json.dumps({"apply": apply, **counters}, sort_keys=True))
             if apply:
                 if not failed or planned:
                     store.set_meta("last_success_at", str(now_ts))
@@ -1760,6 +2212,7 @@ def run_cycle(
             "planned_count": len(planned),
             "planned": planned,
             "failed": failed,
+            "counters": counters,
             "sequence_sync": seq_info,
             "summary": summary,
         }

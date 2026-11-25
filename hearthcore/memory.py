@@ -16,6 +16,7 @@ Addresses Issues #3, #4, #5, #7:
 """
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import time
 from pathlib import Path
@@ -202,19 +203,28 @@ class MemoryEngine:
                     scope TEXT PRIMARY KEY,
                     last_source_id INTEGER NOT NULL DEFAULT 0,
                     first_source_id INTEGER NOT NULL DEFAULT 0,
+                    latest_source_id INTEGER NOT NULL DEFAULT 0,
                     gap_detected INTEGER NOT NULL DEFAULT 0,
                     gap_note TEXT NOT NULL DEFAULT '',
                     updated_at INTEGER NOT NULL
                 )
             """)
+            ec_cols = {r[1] for r in db.execute("PRAGMA table_info(event_cursors)").fetchall()}
+            if "latest_source_id" not in ec_cols:
+                db.execute("ALTER TABLE event_cursors ADD COLUMN latest_source_id INTEGER NOT NULL DEFAULT 0")
 
-    def _conn(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _conn(self):
         conn = sqlite3.connect(self.path, timeout=5.0)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     # ------------------------------------------------------------------
-    # Durable Event Journal & Cursor Checkpointing (Issue #4)
+    # Durable Event Journal & Cursor Checkpointing (Issues #4 & #57)
     # ------------------------------------------------------------------
     def get_event_cursor(self, scope: str = "companion_events") -> int:
         with self._conn() as db:
@@ -231,29 +241,46 @@ class MemoryEngine:
         now_ts: int | None = None,
         scope: str = "companion_events",
         min_available_source_id: int | None = None,
+        max_available_source_id: int | None = None,
+        scanned_max_source_id: int | None = None,
     ) -> dict[str, Any]:
         """Idempotently ingest authoritative companion_events rows and advance checkpoint cursor.
 
-        Duplicate replays are safely ignored via PRIMARY KEY (source_id).
-        If min_available_source_id > previous cursor + 1, flags gap_detected honestly without
-        fabricating missing history.
+        Issues #4 & #57:
+        - Advances persisted cursor to scanned_max_source_id even when a page holds only
+          non-companion rows (prevents infinite rescan stalls).
+        - Checks for pruning gaps AND source counter resets/truncations on EVERY run.
+        - Tracks latest_source_id so journal_lag = max(0, latest_source_id - cursor) is always visible.
         """
         ts = int(now_ts if now_ts is not None else time.time())
         inserted = 0
         gap_detected = False
         gap_note = ""
+        reset_detected = False
 
         with self._conn() as db:
             cur_row = db.execute(
-                "SELECT last_source_id, first_source_id, gap_detected, gap_note FROM event_cursors WHERE scope = ?",
+                "SELECT last_source_id, first_source_id, latest_source_id, gap_detected, gap_note "
+                "FROM event_cursors WHERE scope = ?",
                 (scope,),
             ).fetchone()
             prev_last = int(cur_row["last_source_id"]) if cur_row else 0
             first_seen = int(cur_row["first_source_id"]) if cur_row else 0
+            prev_latest = int(cur_row["latest_source_id"]) if cur_row else 0
             prev_gap = bool(cur_row["gap_detected"]) if cur_row else False
             prev_gap_note = str(cur_row["gap_note"]) if cur_row else ""
 
-            if min_available_source_id is not None and min_available_source_id > 1:
+            # Detect source table truncation / AUTO_INCREMENT counter reset on EVERY run (Issue #57)
+            if max_available_source_id is not None and prev_last > 0 and max_available_source_id < prev_last:
+                reset_detected = True
+                gap_detected = True
+                gap_note = (
+                    f"Source counter reset/truncated (max #{max_available_source_id} < cursor #{prev_last}); rewound cursor"
+                )
+                prev_last = 0
+
+            # Detect pruning gaps on EVERY run (not only on first sync!)
+            if min_available_source_id is not None and min_available_source_id > 1 and not reset_detected:
                 if prev_last == 0:
                     gap_detected = True
                     gap_note = f"History prior to event #{min_available_source_id} was already pruned before journaling"
@@ -293,25 +320,55 @@ class MemoryEngine:
                 if sid > max_id:
                     max_id = sid
 
+            # Advance cursor past scanned non-companion pages too (Issue #57)
+            if scanned_max_source_id is not None and int(scanned_max_source_id) > max_id:
+                max_id = int(scanned_max_source_id)
+
+            latest_src = max_id
+            if max_available_source_id is not None:
+                latest_src = max(max_id, int(max_available_source_id))
+            elif prev_latest > latest_src and not reset_detected:
+                latest_src = prev_latest
+
             final_gap = 1 if (prev_gap or gap_detected) else 0
             final_note = gap_note or prev_gap_note
-            db.execute(
-                """
-                INSERT INTO event_cursors (scope, last_source_id, first_source_id, gap_detected, gap_note, updated_at)
-                VALUES (?,?,?,?,?,?)
-                ON CONFLICT(scope) DO UPDATE SET
-                    last_source_id = MAX(last_source_id, excluded.last_source_id),
-                    first_source_id = CASE WHEN first_source_id = 0 THEN excluded.first_source_id ELSE MIN(first_source_id, excluded.first_source_id) END,
-                    gap_detected = MAX(gap_detected, excluded.gap_detected),
-                    gap_note = CASE WHEN excluded.gap_note != '' THEN excluded.gap_note ELSE gap_note END,
-                    updated_at = excluded.updated_at
-                """,
-                (scope, max_id, first_seen, final_gap, final_note[:180], ts),
-            )
+            if reset_detected:
+                db.execute(
+                    """
+                    INSERT INTO event_cursors (scope, last_source_id, first_source_id, latest_source_id, gap_detected, gap_note, updated_at)
+                    VALUES (?,?,?,?,?,?,?)
+                    ON CONFLICT(scope) DO UPDATE SET
+                        last_source_id = excluded.last_source_id,
+                        first_source_id = CASE WHEN first_source_id = 0 THEN excluded.first_source_id ELSE first_source_id END,
+                        latest_source_id = excluded.latest_source_id,
+                        gap_detected = 1,
+                        gap_note = excluded.gap_note,
+                        updated_at = excluded.updated_at
+                    """,
+                    (scope, max_id, first_seen, latest_src, final_gap, final_note[:180], ts),
+                )
+            else:
+                db.execute(
+                    """
+                    INSERT INTO event_cursors (scope, last_source_id, first_source_id, latest_source_id, gap_detected, gap_note, updated_at)
+                    VALUES (?,?,?,?,?,?,?)
+                    ON CONFLICT(scope) DO UPDATE SET
+                        last_source_id = MAX(last_source_id, excluded.last_source_id),
+                        first_source_id = CASE WHEN first_source_id = 0 THEN excluded.first_source_id ELSE MIN(first_source_id, excluded.first_source_id) END,
+                        latest_source_id = MAX(latest_source_id, excluded.latest_source_id),
+                        gap_detected = MAX(gap_detected, excluded.gap_detected),
+                        gap_note = CASE WHEN excluded.gap_note != '' THEN excluded.gap_note ELSE gap_note END,
+                        updated_at = excluded.updated_at
+                    """,
+                    (scope, max_id, first_seen, latest_src, final_gap, final_note[:180], ts),
+                )
 
         return {
             "inserted": inserted,
             "cursor": max_id,
+            "latest_source_id": latest_src,
+            "journal_lag": max(0, latest_src - max_id),
+            "reset_detected": reset_detected,
             "gap_detected": bool(prev_gap or gap_detected),
             "gap_note": gap_note or prev_gap_note,
         }
@@ -349,11 +406,15 @@ class MemoryEngine:
         with self._conn() as db:
             cur = db.execute("SELECT * FROM event_cursors WHERE scope = ?", (scope,)).fetchone()
             cnt = db.execute("SELECT COUNT(*), SUM(is_milestone) FROM event_journal").fetchone()
+            cursor_val = int(cur["last_source_id"]) if cur else 0
+            latest_val = int(cur["latest_source_id"]) if (cur and "latest_source_id" in cur.keys()) else cursor_val
             return {
                 "total_events": int(cnt[0] or 0),
                 "total_milestones": int(cnt[1] or 0),
-                "cursor": int(cur["last_source_id"]) if cur else 0,
+                "cursor": cursor_val,
                 "first_source_id": int(cur["first_source_id"]) if cur else 0,
+                "latest_source_id": latest_val,
+                "journal_lag": max(0, latest_val - cursor_val),
                 "gap_detected": bool(cur["gap_detected"]) if cur else False,
                 "gap_note": str(cur["gap_note"]) if cur else "",
             }

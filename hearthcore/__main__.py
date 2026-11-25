@@ -35,6 +35,13 @@ def main():
     be.add_argument("--guid", type=int, default=None, help="Optional single character GUID to re-enable in MySQL")
     be.add_argument("--skip-db", action="store_true", help="Only remove the local kill-switch flag file")
 
+    commands.add_parser("reconcile", help="Compare SQLite plans/journal against live MySQL proposals/overrides; non-zero on drift")
+    rep = commands.add_parser("replay", help="Offline no-network replay: recorded snapshot in -> validated plan & SQL out")
+    rep.add_argument("--character", required=True)
+    rep.add_argument("--snapshot", required=True)
+    rep.add_argument("--guid", type=int, default=1001)
+    rep.add_argument("--plan-id", type=int, default=1)
+
     commands.add_parser("supply-report", help="Compute 40-char Classic (1-300) profession material deficits vs Guild Bank")
 
     qm = commands.add_parser("quartermaster-tick", help="Run Claude Guild Quartermaster to plan 12+ orders & bank requests")
@@ -83,9 +90,12 @@ def main():
             return 0
 
         if args.command == "brain-status":
-            from .bridge import BrainStore, is_brain_disabled, load_env
+            from .bridge import BRAIN_DB_PATH, BrainStore, is_brain_disabled, load_env
+            from .memory import MemoryEngine
             load_env()
-            s = BrainStore().summary(int(time.time()))
+            store = BrainStore()
+            s = store.summary(int(time.time()))
+            jstat = MemoryEngine(BRAIN_DB_PATH).journal_status()
             t = s["today"]
             flags = []
             if is_brain_disabled():
@@ -99,6 +109,18 @@ def main():
                 f"cap={s['daily_cap']} tokens={t['input_tokens']}in/{t['output_tokens']}out "
                 f"avg_latency={t['avg_latency_ms']}ms"
             )
+            print(
+                f"Event Journal: events={jstat['total_events']} cursor={jstat['cursor']} "
+                f"lag={jstat['journal_lag']} gap={jstat['gap_detected']}"
+            )
+            ab = s.get("ab_report") or {}
+            by_src = ab.get("by_source") or {}
+            if by_src:
+                parts = [
+                    f"{src}: n={v['sessions']} prog={v['progress_rate']*100:.0f}% $/sess=${v['cost_per_session_usd']:.4f}"
+                    for src, v in sorted(by_src.items())
+                ]
+                print(f"A/B Outcomes ({ab.get('window_days', 14)}d, holdout={ab.get('holdout_pct', 0)}%): " + " | ".join(parts))
             active = [v for v in s["plans"].values() if v["active"]]
             print(f"Active session plans ({len(active)}):")
             for v in sorted(active, key=lambda x: x["character_id"]):
@@ -107,6 +129,20 @@ def main():
                     f"  {v['character_id']:<12} [{v['source']:<9}] {v['primary_goal_id']:<28} "
                     f"({v['reason_code']}, {rem}m left) - {v['primary_desc']}"
                 )
+            return 0
+
+        if args.command == "reconcile":
+            from .bridge import load_env, reconcile_state
+            load_env()
+            report = reconcile_state()
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 0 if report["ok"] else 1
+
+        if args.command == "replay":
+            from .bridge import replay_snapshot
+            snap_raw = json.loads(Path(args.snapshot).read_text(encoding="utf-8"))
+            out = replay_snapshot(args.character, snap_raw, guid=args.guid, plan_id=args.plan_id)
+            print(json.dumps(out, indent=2, sort_keys=True))
             return 0
 
         if args.command in ("brain-disable", "brain-enable"):

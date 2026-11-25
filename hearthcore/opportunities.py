@@ -52,7 +52,7 @@ def check_resource_headroom(
     max_managed_groups: int = DEFAULT_MAX_GROUPS,
     prev_paused: bool = False,
 ) -> dict[str, Any]:
-    """Check Acer i5-7400 hardware headroom with hysteresis before admitting a new managed group."""
+    """Check Acer i5-7400 hardware headroom with FAIL-CLOSED telemetry & hysteresis (Issue #61)."""
     reasons: list[str] = []
     if active_managed_groups >= max_managed_groups:
         reasons.append(f"group_cap_reached:{active_managed_groups}/{max_managed_groups}")
@@ -61,19 +61,67 @@ def check_resource_headroom(
     ram_thresh = 640.0 if prev_paused else MIN_AVAIL_RAM_MIB
     tick_thresh = 38.0 if prev_paused else MAX_TICK_P99_MS
 
-    if mem_avail_mib is not None and mem_avail_mib < ram_thresh:
+    # Fail closed on missing telemetry (Issue #61): missing data means DO NOT ADMIT!
+    if mem_avail_mib is None:
+        reasons.append("missing_ram_telemetry")
+    elif mem_avail_mib < ram_thresh:
         reasons.append(f"low_ram_headroom:{mem_avail_mib:.0f}MiB<{ram_thresh:.0f}MiB")
-    if tick_p99_ms is not None and tick_p99_ms > tick_thresh:
+
+    if tick_p99_ms is None:
+        reasons.append("missing_tick_telemetry")
+    elif tick_p99_ms > tick_thresh:
         reasons.append(f"high_tick_p99:{tick_p99_ms:.1f}ms>{tick_thresh:.1f}ms")
 
+    admit_ok = len(reasons) == 0
     return {
-        "admit_ok": len(reasons) == 0,
+        "admit_ok": admit_ok,
+        "paused": not admit_ok,
+        "prev_paused": bool(prev_paused),
         "reasons": reasons,
         "active_managed_groups": active_managed_groups,
         "max_managed_groups": max_managed_groups,
         "mem_avail_mib": round(mem_avail_mib, 1) if mem_avail_mib is not None else None,
         "tick_p99_ms": round(tick_p99_ms, 1) if tick_p99_ms is not None else None,
     }
+
+
+def evaluate_persisted_headroom(
+    state_path: Path,
+    *,
+    mem_avail_mib: float | None,
+    tick_p99_ms: float | None,
+    active_managed_groups: int,
+    max_managed_groups: int = DEFAULT_MAX_GROUPS,
+    now_ts: int | None = None,
+) -> dict[str, Any]:
+    """Evaluate headroom using persisted hysteresis state on disk so pause/recover survives runs (Issue #61)."""
+    ts = int(now_ts if now_ts is not None else time.time())
+    prev_paused = False
+    try:
+        if state_path.is_file():
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            prev_paused = bool(saved.get("paused", False))
+    except Exception:
+        prev_paused = True  # fail closed on corrupt state
+
+    res = check_resource_headroom(
+        mem_avail_mib=mem_avail_mib,
+        tick_p99_ms=tick_p99_ms,
+        active_managed_groups=active_managed_groups,
+        max_managed_groups=max_managed_groups,
+        prev_paused=prev_paused,
+    )
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = state_path.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps({"paused": bool(res["paused"]), "updated_at": ts, "reasons": res["reasons"]}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        tmp.replace(state_path)
+    except OSError:
+        pass
+    return res
 
 
 def adapt_work_orders_as_opportunities(work_orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -522,11 +570,13 @@ def run_shadow_match_snapshot(
     v = vitals or {}
     mem_avail_mib = float(v["mem_avail_gib"]) * 1024.0 if v.get("mem_avail_gib") is not None else None
     tick_p99 = float(v["tick_p99"]) if v.get("tick_p99") is not None else None
-    headroom = check_resource_headroom(
+    headroom = evaluate_persisted_headroom(
+        runtime_dir / "headroom_state.json",
         mem_avail_mib=mem_avail_mib,
         tick_p99_ms=tick_p99,
         active_managed_groups=0,
         max_managed_groups=DEFAULT_MAX_GROUPS,
+        now_ts=ts,
     )
 
     shadow_dungeons: list[dict[str, Any]] = []

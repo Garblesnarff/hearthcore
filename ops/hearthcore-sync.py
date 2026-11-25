@@ -14,20 +14,21 @@ import os
 import subprocess
 import sys
 
-HEARTHCORE_DIR = "/home/wonky/hearthcore"
-DB_CONTAINER = "ac-database"
+HEARTHCORE_DIR = os.getenv("HEARTHCORE_DIR", os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+DB_CONTAINER = os.getenv("HEARTHCORE_DB_CONTAINER", "ac-database")
 GUILD_ID = 6
 
-# Mapping from hearthcore profile preference keys -> companion_weights keys used by CompanionBrain/CompanionDuty.
+# Canonical profile preference -> native CompanionBrain weight key mapping (Issue #60)
 KEY_MAP = {
-    "quest": "quest",
-    "craft": "craft",
-    "gather": "gather",
-    "train": "train",
-    "bank": "bank",
-    "repair": "repair",
-    "travel": "travel",
-    "fish": "fish",
+    "quest": ("quest_work", "quest_turnin", "quest_hub", "quest_grind"),
+    "craft": ("craft",),
+    "gather": ("gather",),
+    "train": ("train",),
+    "bank": ("bank",),
+    "repair": ("repair", "sell"),
+    "travel": ("travel",),
+    "fish": ("fish",),
+    "rest": ("hearth",),
 }
 
 ALLIANCE_DEFAULT_RACE = {
@@ -83,6 +84,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="Write active companion weights to companion_weights")
     ap.add_argument("--dry-run", action="store_true", help="Preview only (default)")
+    ap.add_argument(
+        "--overwrite-manual",
+        action="store_true",
+        help="Explicitly allow overwriting manually tuned rows (source != 'hearthcore') in companion_weights",
+    )
     args = ap.parse_args()
 
     profiles = load_profiles()
@@ -101,16 +107,25 @@ def main():
             guid = info["guid"]
             prefs = p.get("preferences", {})
             mapped = []
-            for hk, ck in KEY_MAP.items():
+            for hk, ck_tuple in KEY_MAP.items():
                 if hk in prefs and prefs[hk] is not None:
                     val = float(prefs[hk])
                     val = max(0.5, min(1.5, val))
-                    mapped.append((ck, val))
-                    sql_lines.append(
-                        f"INSERT INTO acore_characters.companion_weights (`guid`, `key`, `value`, `source`) "
-                        f"VALUES ({guid}, '{ck}', {val:.2f}, 'hearthcore') "
-                        f"ON DUPLICATE KEY UPDATE `value` = VALUES(`value`), `source` = VALUES(`source`);"
-                    )
+                    for ck in ck_tuple:
+                        mapped.append((ck, val))
+                        if args.overwrite_manual:
+                            upd = "`value` = VALUES(`value`), `source` = VALUES(`source`)"
+                        else:
+                            # Issue #60: NEVER overwrite manually tuned canonical rows unless --overwrite-manual!
+                            upd = (
+                                "`value` = IF(`source` = 'hearthcore', VALUES(`value`), `value`), "
+                                "`source` = IF(`source` = 'hearthcore', VALUES(`source`), `source`)"
+                            )
+                        sql_lines.append(
+                            f"INSERT INTO acore_characters.companion_weights (`guid`, `key`, `value`, `source`) "
+                            f"VALUES ({guid}, '{ck}', {val:.2f}, 'hearthcore') "
+                            f"ON DUPLICATE KEY UPDATE {upd};"
+                        )
             pref_str = ", ".join(f"{k}={v:.2f}" for k, v in mapped if abs(v - 1.0) > 1e-6) or "all 1.0"
             print(f"  [LIVE]    {name:<12} guid={guid:<5} lv={info['level']:<2} {p.get('class')}/{p.get('primary_spec')} -> {pref_str}")
         else:

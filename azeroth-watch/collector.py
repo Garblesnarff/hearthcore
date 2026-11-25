@@ -13,9 +13,11 @@ import datetime
 import json
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -35,17 +37,20 @@ from data_maps import (
     zone_name,
 )
 
-LOG_DIR = "/home/wonky/AzerothCore/azerothcore-wotlk/env/dist/logs"
+_HOME = os.path.expanduser("~")
+_HC_ROOT = os.getenv("HEARTHCORE_ROOT", os.path.join(_HOME, "hearthcore"))
+LOG_DIR = os.getenv("AZEROTH_LOG_DIR", os.path.join(_HOME, "AzerothCore/azerothcore-wotlk/env/dist/logs"))
 SERVER_LOG = os.path.join(LOG_DIR, "Server.log")
 ERRORS_LOG = os.path.join(LOG_DIR, "Errors.log")
 PLAYERBOTS_LOG = os.path.join(LOG_DIR, "Playerbots.log")
 LIVE_POS_FILE = os.path.join(LOG_DIR, "live_positions.json")
-AI_PLANS_FILE = "/home/wonky/hearthcore/runtime/active_plans.json"
-AI_QM_FILE = "/home/wonky/hearthcore/runtime/quartermaster.json"
-AI_P2_SHADOW_FILE = "/home/wonky/hearthcore/runtime/phase2_shadow.json"
-AI_P2_READY_FILE = "/home/wonky/hearthcore/runtime/phase2_readiness.json"
-AI_BRAIN_DB = "/home/wonky/hearthcore/runtime/brain.db"
-AI_ENV_FILE = "/home/wonky/hearthcore/.env"
+AI_PLANS_FILE = os.path.join(_HC_ROOT, "runtime/active_plans.json")
+AI_QM_FILE = os.path.join(_HC_ROOT, "runtime/quartermaster.json")
+AI_P2_SHADOW_FILE = os.path.join(_HC_ROOT, "runtime/phase2_shadow.json")
+AI_P2_READY_FILE = os.path.join(_HC_ROOT, "runtime/phase2_readiness.json")
+AI_BRAIN_DB = os.path.join(_HC_ROOT, "runtime/brain.db")
+AI_ENV_FILE = os.getenv("HEARTHCORE_ENV_PATH", os.path.join(_HC_ROOT, ".env"))
+AI_OVERRIDES_FILE = os.getenv("HEARTHCORE_DASHBOARD_OVERRIDES_PATH", os.path.join(_HC_ROOT, "runtime/dashboard_overrides.env"))
 WORLDMAP_META_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "worldmap_areas.json")
 HEARTHGUARD_GUILD_ID = 6
 
@@ -81,38 +86,88 @@ AZUREMYST_ZONES = {3524, 3525, 3557}
 QUELTHALAS_ZONES = {3430, 3433, 3487, 4080}
 
 
-class PersistentMySQLPipe:
-    """Single persistent read-only mysql CLI process inside ac-database."""
+def _unescape_mysql_field(field: str) -> str:
+    """Decode mysql --batch (-B) escapes so embedded newlines/tabs never desync rows (Issue #62)."""
+    if field == "NULL":
+        return ""
+    if "\\" not in field:
+        return field
+    out: List[str] = []
+    i = 0
+    n = len(field)
+    while i < n:
+        ch = field[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = field[i + 1]
+            if nxt == "t":
+                out.append("\t")
+            elif nxt == "n":
+                out.append("\n")
+            elif nxt == "r":
+                out.append("\r")
+            elif nxt == "0":
+                out.append("\x00")
+            elif nxt == "\\":
+                out.append("\\")
+            else:
+                out.append(nxt)
+            i += 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
 
-    SENTINEL = "__AW_END_OF_QUERY__"
+
+class PersistentMySQLPipe:
+    """Single persistent read-only mysql CLI process (no --raw desync, per-query random sentinel, Issue #62)."""
 
     def __init__(self) -> None:
         self._proc: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
+        self.last_ok: bool = False
 
     def _ensure(self) -> bool:
         if self._proc is not None and self._proc.poll() is None:
             return True
         self._close()
         try:
-            self._proc = subprocess.Popen(
-                [
-                    "docker",
-                    "exec",
-                    "-i",
-                    "ac-database",
-                    "sh",
-                    "-c",
-                    'exec mysql -uroot -p"$MYSQL_ROOT_PASSWORD" --batch --raw --quick --unbuffered --skip-column-names 2>/dev/null',
-                ],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                bufsize=1,
-            )
+            db_user = os.getenv("AZEROTH_WATCH_DB_USER", "").strip()
+            db_pass = os.getenv("AZEROTH_WATCH_DB_PASSWORD", "")
+            db_host = os.getenv("AZEROTH_WATCH_DB_HOST", "127.0.0.1").strip()
+            db_port = os.getenv("AZEROTH_WATCH_DB_PORT", "3306").strip()
+            db_container = os.getenv("HEARTHCORE_DB_CONTAINER", "ac-database")
+            if db_user and db_pass and shutil.which("mysql"):
+                # Direct TCP connection as SELECT-only user (zero Docker socket access required!)
+                env = dict(os.environ, MYSQL_PWD=db_pass)
+                cmd = [
+                    "mysql", f"-h{db_host}", f"-P{db_port}", f"-u{db_user}",
+                    "--batch", "--quick", "--unbuffered", "--skip-column-names",
+                ]
+                self._proc = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True, bufsize=1, env=env,
+                )
+            elif db_user and db_pass:
+                cmd = [
+                    "docker", "exec", "-i", "-e", f"MYSQL_PWD={db_pass}", db_container,
+                    "mysql", f"-u{db_user}", "--batch", "--quick", "--unbuffered", "--skip-column-names",
+                ]
+                self._proc = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True, bufsize=1,
+                )
+            else:
+                self._proc = subprocess.Popen(
+                    [
+                        "docker", "exec", "-i", db_container, "sh", "-c",
+                        'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql -uroot --batch --quick --unbuffered --skip-column-names 2>/dev/null',
+                    ],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True, bufsize=1,
+                )
             return True
-        except Exception:
+        except Exception as exc:
+            print(f"[collector] mysql pipe start failed: {type(exc).__name__}", file=sys.stderr, flush=True)
             self._proc = None
             return False
 
@@ -129,14 +184,16 @@ class PersistentMySQLPipe:
             self._proc = None
 
     def query(self, sql: str) -> List[List[str]]:
-        """Execute a single SELECT query and return rows as list of strings."""
+        """Execute a single SELECT query with a per-query random sentinel (Issue #62)."""
         with self._lock:
             for _attempt in range(2):
                 if not self._ensure():
+                    self.last_ok = False
                     return []
                 assert self._proc and self._proc.stdin and self._proc.stdout
+                sentinel = f"__AW_END_{secrets.token_hex(8)}__"
                 clean_sql = " ".join(sql.strip().splitlines()).rstrip(";")
-                payload = f"{clean_sql};\nSELECT '{self.SENTINEL}';\n"
+                payload = f"{clean_sql};\nSELECT '{sentinel}';\n"
                 try:
                     self._proc.stdin.write(payload)
                     self._proc.stdin.flush()
@@ -146,11 +203,13 @@ class PersistentMySQLPipe:
                         if not line:
                             raise BrokenPipeError("mysql pipe EOF")
                         stripped = line.rstrip("\r\n")
-                        if stripped == self.SENTINEL:
+                        if stripped == sentinel:
+                            self.last_ok = True
                             return rows
-                        rows.append(stripped.split("\t"))
+                        rows.append([_unescape_mysql_field(f) for f in stripped.split("\t")])
                 except Exception:
                     self._close()
+            self.last_ok = False
             return []
 
 
@@ -451,6 +510,8 @@ class AzerothCollector:
         except Exception:
             self._map_meta = {"world": None, "continents": {}, "zones": {}}
         self._stop = threading.Event()
+        self._refresh_event = threading.Event()
+        self._last_db_ok_ts: float = 0.0
         self._thread = threading.Thread(target=self._run, name="collector", daemon=True)
 
     def start(self) -> None:
@@ -459,24 +520,37 @@ class AzerothCollector:
 
     def stop(self) -> None:
         self._stop.set()
+        self._refresh_event.set()
         self.db._close()
+
+    def request_refresh(self) -> None:
+        """Signal the collector thread to refresh asynchronously (never blocks HTTP threads, Issue #72)."""
+        self._refresh_event.set()
 
     def get_snapshot(self) -> Tuple[int, Dict[str, Any]]:
         with self._lock:
-            return self._version, self._state
+            snap = dict(self._state) if isinstance(self._state, dict) else {}
+            if snap:
+                age = int(max(0.0, time.time() - self._last_db_ok_ts)) if self._last_db_ok_ts > 0 else 9999
+                snap["data_age_sec"] = age
+            return self._version, snap
 
     def _run(self) -> None:
         while not self._stop.is_set():
+            self._refresh_event.clear()
             t0 = time.monotonic()
             try:
                 self.refresh_once()
             except Exception as exc:
+                # Log collector errors server-side ONLY (never leak exception strings in API JSON, Issues #71/#72)
+                print(f"[collector] refresh_once error: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
                 with self._lock:
                     if isinstance(self._state, dict):
-                        self._state["collector_error"] = str(exc)
+                        self._state["db_ok"] = False
+                        self._version += 1
             elapsed = time.monotonic() - t0
             wait_s = max(0.5, self.poll_interval_s - elapsed)
-            self._stop.wait(wait_s)
+            self._refresh_event.wait(wait_s)
 
     def refresh_once(self) -> None:
         self.logs.poll()
@@ -572,20 +646,21 @@ class AzerothCollector:
                 ir, or_ = 1.0, 5.0
             return (in_t * ir + out_t * or_) / 1_000_000.0
 
-        # Read ONLY non-secret display config from hearthcore/.env (never touches ANTHROPIC_API_KEY)
+        # Read ONLY non-secret display config from .env + dashboard_overrides.env (never touches ANTHROPIC_API_KEY)
         env_pub: Dict[str, str] = {}
         try:
-            if os.path.isfile(AI_ENV_FILE):
-                with open(AI_ENV_FILE, "r", encoding="utf-8") as ef:
-                    for raw_line in ef:
-                        ln = raw_line.strip()
-                        if not ln or ln.startswith("#") or "=" not in ln:
-                            continue
-                        ek, ev = ln.split("=", 1)
-                        ek = ek.strip()
-                        if ek in ("ANTHROPIC_MODEL", "ANTHROPIC_EFFORT", "HEARTHCORE_DAILY_CALL_CAP",
-                                  "HEARTHCORE_CREDIT_USD", "HEARTHCORE_CREDIT_RESET"):
-                            env_pub[ek] = ev.strip().strip('"').strip("'")
+            for env_f in (AI_ENV_FILE, AI_OVERRIDES_FILE):
+                if os.path.isfile(env_f):
+                    with open(env_f, "r", encoding="utf-8") as ef:
+                        for raw_line in ef:
+                            ln = raw_line.strip()
+                            if not ln or ln.startswith("#") or "=" not in ln:
+                                continue
+                            ek, ev = ln.split("=", 1)
+                            ek = ek.strip()
+                            if ek in ("ANTHROPIC_MODEL", "ANTHROPIC_EFFORT", "HEARTHCORE_DAILY_CALL_CAP",
+                                      "HEARTHCORE_CREDIT_USD", "HEARTHCORE_CREDIT_RESET"):
+                                env_pub[ek] = ev.strip().strip('"').strip("'")
         except Exception:
             pass
 
@@ -611,6 +686,8 @@ class AzerothCollector:
                     ai_brain["memory"] = raw_ai["memory"]
                 if isinstance(raw_ai.get("budget"), dict):
                     ai_brain["budget"] = raw_ai["budget"]
+                if isinstance(raw_ai.get("ab_report"), dict):
+                    ai_brain["ab_report"] = raw_ai["ab_report"]
             if os.path.isfile(AI_QM_FILE):
                 with open(AI_QM_FILE, "r", encoding="utf-8") as f:
                     ai_brain["quartermaster"] = json.load(f)
@@ -1315,11 +1392,18 @@ class AzerothCollector:
         core_logan = [c for c in companions if c["shift_group"] == "core-logan"]
         avg_core_l = round(sum(c["level"] for c in core_logan) / max(1, len(core_logan)), 1)
 
+        db_ok = bool(self.db.last_ok and realm_rows)
+        if db_ok:
+            self._last_db_ok_ts = time.time()
+        data_age_sec = int(max(0.0, time.time() - self._last_db_ok_ts)) if self._last_db_ok_ts > 0 else 9999
+
         snapshot = {
             "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
             "clock": now.strftime("%I:%M:%S %p").lstrip("0"),
             "hour": cur_hour,
             "minute": now.minute,
+            "db_ok": db_ok,
+            "data_age_sec": data_age_sec,
             "realm": realm,
             "vitals": vitals,
             "ticks": tick_stats,
