@@ -547,6 +547,7 @@ class AzerothCollector:
                 "qm_runs": 0,
             },
             "model_stats": [],
+            "budget": {},
             "memory": {
                 "open_intentions": {},
                 "completed_intentions": [],
@@ -604,6 +605,8 @@ class AzerothCollector:
                 ai_plans_by_slug = raw_ai.get("plans", {}) or {}
                 if isinstance(raw_ai.get("memory"), dict):
                     ai_brain["memory"] = raw_ai["memory"]
+                if isinstance(raw_ai.get("budget"), dict):
+                    ai_brain["budget"] = raw_ai["budget"]
             if os.path.isfile(AI_QM_FILE):
                 with open(AI_QM_FILE, "r", encoding="utf-8") as f:
                     ai_brain["quartermaster"] = json.load(f)
@@ -749,11 +752,14 @@ class AzerothCollector:
                     }
                     ai_brain["model_stats"] = list(model_map.values())
 
-                    # Latest active/recent per companion with applied cpp_weights
-                    lat_rows = conn.execute("""
+                    # Latest active/recent APPLIED live plan per companion (shadow plans excluded, Issue #7)
+                    has_pstate = "plan_state" in pcols
+                    live_where = "WHERE applied = 1 AND COALESCE(plan_state, 'applied') != 'shadow'" if has_pstate else "WHERE applied = 1"
+                    lat_rows = conn.execute(f"""
                         SELECT p.* FROM plans p
-                        INNER JOIN (SELECT character_id, MAX(id) AS max_id FROM plans GROUP BY character_id) m
-                          ON m.max_id = p.id
+                        INNER JOIN (
+                            SELECT character_id, MAX(id) AS max_id FROM plans {live_where} GROUP BY character_id
+                        ) m ON m.max_id = p.id
                         ORDER BY (p.expires_at > ?) DESC, p.planned_at DESC
                     """, (now_epoch,)).fetchall()
                     active_list = []
@@ -764,6 +770,8 @@ class AzerothCollector:
                             key=lambda kv: -abs(kv[1] - 1.0),
                         )[:5]
                         p_meta = ai_plans_by_slug.get(r["character_id"]) or {}
+                        prop_status = (r["proposal_status"] if "proposal_status" in pcols else "") or p_meta.get("proposal_status") or "proposed"
+                        advisory_only = bool(r["advisory_only"]) if "advisory_only" in pcols else bool(p_meta.get("advisory_only"))
                         active_list.append({
                             "character_id": r["character_id"],
                             "source": r["source"],
@@ -777,6 +785,10 @@ class AzerothCollector:
                             "rem_minutes": max(0, (int(r["expires_at"]) - now_epoch) // 60),
                             "active": int(r["expires_at"]) > now_epoch,
                             "applied": bool(r["applied"]),
+                            "proposal_status": prop_status,
+                            "proposal_reason": (r["proposal_reason"] if "proposal_reason" in pcols else "") or p_meta.get("proposal_reason") or "",
+                            "advisory_only": advisory_only,
+                            "outcome_class": p_meta.get("outcome_class") or "",
                             "top_weights": [{"k": k, "v": round(v, 2)} for k, v in top_w],
                             "input_tokens": int(r["input_tokens"]),
                             "output_tokens": int(r["output_tokens"]),
@@ -785,6 +797,8 @@ class AzerothCollector:
                             "outcome_levels": int(r["outcome_levels"]) if has_out else 0,
                             "outcome_skillups": int(r["outcome_skillups"]) if has_out else 0,
                             "outcome_orders": int(r["outcome_orders"]) if has_out else 0,
+                            "outcome_xp": int(r["outcome_xp"]) if "outcome_xp" in pcols else 0,
+                            "outcome_quests": int(r["outcome_quests"]) if "outcome_quests" in pcols else 0,
                             "open_intentions": p_meta.get("open_intentions") or [],
                             "fatigue_category": p_meta.get("fatigue_category") or "",
                             "fatigue_streak": int(p_meta.get("fatigue_streak") or 0),

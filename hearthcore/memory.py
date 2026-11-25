@@ -1,15 +1,18 @@
-"""Lean Persistent Memory v1 + Soft Work-Order Reservations for Hearthcore.
+"""Persistent Memory v1.5 + Durable Event Journal + Goal-Specific Outcome Classification.
 
-Design principles (aligned with docs/PERSISTENT_MEMORY.md M1-M3):
-- Single SQLite WAL store (runtime/brain.db) + authoritative MySQL facts. Zero extra services.
-- Distinct memory kinds, never blended into one opaque score:
-  1. Factual Milestones (from companion_events) — authoritative, never decay.
-  2. Open Intentions (intentions table in brain.db) — reconciled against DB state each turn.
-  3. Session Variety / Fatigue Guard — nudges variety after 2+ consecutive sessions in one category.
-  4. Scoped Stall Caution + Operational Alerts — flags 2+ consecutive 0-progress sessions on the
-     exact same primary_goal_id without globally penalizing the activity category.
-  5. Social Familiarity (from companion_relationships) — top guild bonds.
-- Soft Work-Order Reservations — prevents online crafters from colliding on the same guild order.
+Addresses Issues #3, #4, #5, #7:
+- Durable event journal (`event_journal` + `event_cursors`) keyed by authoritative
+  `companion_events.id` (`INSERT OR IGNORE`): preserves milestones beyond any short UI window,
+  prevents duplicate memories on replay/bursts, detects ID gaps honestly without fabrication,
+  and guarantees fair per-character retrieval.
+- Strict shadow isolation: all live memory/reservation/fatigue/outcome queries filter
+  `applied = 1 AND COALESCE(plan_state, 'applied') != 'shadow'`.
+- Goal-specific observed outcome classification (`classify_plan_outcome`):
+  - Recognizes XP without level-up, rewarded quests, gathering/crafting ledger activity at skill cap,
+    and native `companion_proposals` lifecycle outcomes (`completed`, `interrupted`, `rejected`, `expired`).
+  - Suppresses behavioral caution for advisory/unsupported goals (`dungeon`, `explore`, `bank`,
+    `repair`, `train`) and for unaccepted/owner-interrupted plans.
+  - Separates operational stuck alerts from scoped behavioral caution (strictly per exact `goal_id`).
 """
 from __future__ import annotations
 
@@ -21,6 +24,15 @@ from typing import Any
 from .guides import SKILL_NAMES
 
 TIER_BREAKPOINTS = (75, 150, 225, 300)
+MILESTONE_EVENT_TYPES = frozenset({
+    "level_up",
+    "skill_milestone",
+    "boss_kill",
+    "work_order",
+    "dungeon",
+    "reputation",
+})
+ADVISORY_GOAL_PREFIXES = frozenset({"dungeon", "explore", "bank", "repair", "train", "profession"})
 
 
 def goal_category(goal_id: str) -> str:
@@ -35,6 +47,15 @@ def goal_category(goal_id: str) -> str:
     if prefix in ("quest", "explore", "dungeon"):
         return "adventure"
     return "errand"
+
+
+def goal_prefix(goal_id: str) -> str:
+    return (goal_id or "").split(":", 1)[0].lower()
+
+
+def is_advisory_goal(goal_id: str) -> bool:
+    """Return True for goal types without a dedicated native C++ objective executor."""
+    return goal_prefix(goal_id) in ADVISORY_GOAL_PREFIXES
 
 
 def parse_order_id(goal_id: str) -> int | None:
@@ -54,14 +75,87 @@ def next_skill_tier(val: int, mx: int) -> int | None:
     return None
 
 
+def classify_plan_outcome(row: dict[str, Any]) -> str:
+    """Classify a finished/aged applied plan using goal-specific observed outcomes (Issue #5).
+
+    Returns one of:
+      'completed'     - native proposal or work order verified completed
+      'progressed'    - verified goal-relevant progress (XP, quests, skill-ups, ledger ops, orders)
+      'interrupted'   - owner/group priority or external interruption (NOT a failed attempt)
+      'not_attempted' - expired before acceptance, rejected as unavailable, or unapplied/shadow
+      'unknown'       - advisory-only goal or incomplete telemetry (suppresses behavioral penalty)
+      'stalled'       - attempted non-advisory goal with 0 verified goal-specific progress
+    """
+    if not int(row.get("applied") or 0) or str(row.get("plan_state") or "applied") == "shadow":
+        return "not_attempted"
+
+    gid = str(row.get("primary_goal_id") or "")
+    prefix = goal_prefix(gid)
+    prop_status = str(row.get("proposal_status") or "").lower()
+    advisory = bool(int(row.get("advisory_only") or 0)) or is_advisory_goal(gid)
+
+    if prop_status == "completed":
+        return "completed"
+    if prop_status == "interrupted":
+        return "interrupted"
+    if prop_status in ("rejected", "expired"):
+        return "not_attempted"
+
+    # Incomplete baseline telemetry -> degrade honestly to unknown
+    if int(row.get("start_level") or 0) <= 0:
+        return "unknown"
+
+    lvls = int(row.get("outcome_levels") or 0)
+    xp = int(row.get("outcome_xp") or 0)
+    sks = int(row.get("outcome_skillups") or 0)
+    ords = int(row.get("outcome_orders") or 0)
+    quests = int(row.get("outcome_quests") or 0)
+    ledger_ops = int(row.get("outcome_ledger_ops") or 0)
+
+    if prefix == "quest":
+        if lvls > 0 or xp > 0 or quests > 0:
+            return "progressed"
+        return "stalled"
+
+    if prefix in ("gather", "fish"):
+        # Gathering/fishing at skill cap still yields bag/vault ledger deposits!
+        if sks > 0 or ledger_ops > 0:
+            return "progressed"
+        return "stalled"
+
+    if prefix == "craft":
+        if sks > 0 or ords > 0 or ledger_ops > 0:
+            return "progressed"
+        return "stalled"
+
+    if prefix == "guild_order":
+        if ords > 0:
+            return "completed"
+        if sks > 0 or ledger_ops > 0:
+            return "progressed"
+        # If native executor never accepted the order (still 'proposed'), do not label as behavioral stall
+        if prop_status == "proposed":
+            return "not_attempted"
+        return "stalled"
+
+    # Unsupported / advisory goals: never apply behavioral stall penalty
+    if advisory:
+        return "progressed" if (lvls > 0 or xp > 0 or sks > 0 or ords > 0 or quests > 0 or ledger_ops > 0) else "unknown"
+
+    if lvls > 0 or xp > 0 or sks > 0 or ords > 0 or quests > 0 or ledger_ops > 0:
+        return "progressed"
+    return "unknown"
+
+
 class MemoryEngine:
-    """Persistent companion memory + soft multi-bot coordination backed by brain.db."""
+    """Persistent companion memory, durable event journal, and soft multi-bot coordination."""
 
     def __init__(self, db_path: Path) -> None:
         self.path = db_path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as db:
             db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA busy_timeout=5000")
             db.execute("""
                 CREATE TABLE IF NOT EXISTS intentions (
                     id INTEGER PRIMARY KEY,
@@ -80,6 +174,39 @@ class MemoryEngine:
                 "CREATE INDEX IF NOT EXISTS idx_intentions_char_status "
                 "ON intentions(character_id, status, updated_at DESC)"
             )
+            # Durable autobiographical event journal (Issue #4)
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS event_journal (
+                    source_id INTEGER PRIMARY KEY,
+                    guid INTEGER NOT NULL,
+                    character_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    partner_guid INTEGER NOT NULL DEFAULT 0,
+                    zone_id INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    is_milestone INTEGER NOT NULL DEFAULT 0,
+                    ingested_at INTEGER NOT NULL
+                )
+            """)
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ej_char_ms "
+                "ON event_journal(character_id, is_milestone DESC, created_at DESC, source_id DESC)"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ej_char_time "
+                "ON event_journal(character_id, created_at DESC, source_id DESC)"
+            )
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS event_cursors (
+                    scope TEXT PRIMARY KEY,
+                    last_source_id INTEGER NOT NULL DEFAULT 0,
+                    first_source_id INTEGER NOT NULL DEFAULT 0,
+                    gap_detected INTEGER NOT NULL DEFAULT 0,
+                    gap_note TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER NOT NULL
+                )
+            """)
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=5.0)
@@ -87,10 +214,155 @@ class MemoryEngine:
         return conn
 
     # ------------------------------------------------------------------
-    # Soft Work-Order Reservations (multi-bot coordination)
+    # Durable Event Journal & Cursor Checkpointing (Issue #4)
+    # ------------------------------------------------------------------
+    def get_event_cursor(self, scope: str = "companion_events") -> int:
+        with self._conn() as db:
+            row = db.execute(
+                "SELECT last_source_id FROM event_cursors WHERE scope = ?",
+                (scope,),
+            ).fetchone()
+            return int(row["last_source_id"]) if row else 0
+
+    def ingest_events(
+        self,
+        events: list[dict[str, Any]],
+        *,
+        now_ts: int | None = None,
+        scope: str = "companion_events",
+        min_available_source_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Idempotently ingest authoritative companion_events rows and advance checkpoint cursor.
+
+        Duplicate replays are safely ignored via PRIMARY KEY (source_id).
+        If min_available_source_id > previous cursor + 1, flags gap_detected honestly without
+        fabricating missing history.
+        """
+        ts = int(now_ts if now_ts is not None else time.time())
+        inserted = 0
+        gap_detected = False
+        gap_note = ""
+
+        with self._conn() as db:
+            cur_row = db.execute(
+                "SELECT last_source_id, first_source_id, gap_detected, gap_note FROM event_cursors WHERE scope = ?",
+                (scope,),
+            ).fetchone()
+            prev_last = int(cur_row["last_source_id"]) if cur_row else 0
+            first_seen = int(cur_row["first_source_id"]) if cur_row else 0
+            prev_gap = bool(cur_row["gap_detected"]) if cur_row else False
+            prev_gap_note = str(cur_row["gap_note"]) if cur_row else ""
+
+            if min_available_source_id is not None and min_available_source_id > 1:
+                if prev_last == 0:
+                    gap_detected = True
+                    gap_note = f"History prior to event #{min_available_source_id} was already pruned before journaling"
+                elif min_available_source_id > prev_last + 1:
+                    gap_detected = True
+                    gap_note = f"Source gap between #{prev_last} and #{min_available_source_id}"
+
+            max_id = prev_last
+            for ev in sorted(events, key=lambda x: int(x["source_id"])):
+                sid = int(ev["source_id"])
+                etype = str(ev.get("event_type") or "")
+                is_ms = 1 if etype in MILESTONE_EVENT_TYPES else 0
+                res = db.execute(
+                    """
+                    INSERT OR IGNORE INTO event_journal (
+                        source_id, guid, character_id, event_type, summary,
+                        partner_guid, zone_id, created_at, is_milestone, ingested_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        sid,
+                        int(ev.get("guid") or 0),
+                        str(ev.get("character_id") or "").lower(),
+                        etype[:24],
+                        str(ev.get("summary") or "")[:200],
+                        int(ev.get("partner_guid") or 0),
+                        int(ev.get("zone_id") or 0),
+                        int(ev.get("created_at") or ts),
+                        is_ms,
+                        ts,
+                    ),
+                )
+                if res.rowcount > 0:
+                    inserted += 1
+                if first_seen == 0 or sid < first_seen:
+                    first_seen = sid
+                if sid > max_id:
+                    max_id = sid
+
+            final_gap = 1 if (prev_gap or gap_detected) else 0
+            final_note = gap_note or prev_gap_note
+            db.execute(
+                """
+                INSERT INTO event_cursors (scope, last_source_id, first_source_id, gap_detected, gap_note, updated_at)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(scope) DO UPDATE SET
+                    last_source_id = MAX(last_source_id, excluded.last_source_id),
+                    first_source_id = CASE WHEN first_source_id = 0 THEN excluded.first_source_id ELSE MIN(first_source_id, excluded.first_source_id) END,
+                    gap_detected = MAX(gap_detected, excluded.gap_detected),
+                    gap_note = CASE WHEN excluded.gap_note != '' THEN excluded.gap_note ELSE gap_note END,
+                    updated_at = excluded.updated_at
+                """,
+                (scope, max_id, first_seen, final_gap, final_note[:180], ts),
+            )
+
+        return {
+            "inserted": inserted,
+            "cursor": max_id,
+            "gap_detected": bool(prev_gap or gap_detected),
+            "gap_note": gap_note or prev_gap_note,
+        }
+
+    def get_character_milestones(self, slug: str, limit: int = 5) -> list[str]:
+        """Fair per-character retrieval of durable milestones (survives >12 later events & restarts)."""
+        with self._conn() as db:
+            ms_rows = db.execute(
+                """
+                SELECT source_id, event_type, summary
+                FROM event_journal
+                WHERE character_id = ? AND is_milestone = 1
+                ORDER BY created_at DESC, source_id DESC
+                LIMIT ?
+                """,
+                (slug.lower(), limit),
+            ).fetchall()
+            out = [f"{r['event_type']}: {r['summary'][:72]} [ev#{r['source_id']}]" for r in ms_rows]
+            if len(out) < limit:
+                need = limit - len(out)
+                other_rows = db.execute(
+                    """
+                    SELECT source_id, event_type, summary
+                    FROM event_journal
+                    WHERE character_id = ? AND is_milestone = 0
+                    ORDER BY created_at DESC, source_id DESC
+                    LIMIT ?
+                    """,
+                    (slug.lower(), need),
+                ).fetchall()
+                out.extend(f"{r['event_type']}: {r['summary'][:72]} [ev#{r['source_id']}]" for r in other_rows)
+            return out
+
+    def journal_status(self, scope: str = "companion_events") -> dict[str, Any]:
+        with self._conn() as db:
+            cur = db.execute("SELECT * FROM event_cursors WHERE scope = ?", (scope,)).fetchone()
+            cnt = db.execute("SELECT COUNT(*), SUM(is_milestone) FROM event_journal").fetchone()
+            return {
+                "total_events": int(cnt[0] or 0),
+                "total_milestones": int(cnt[1] or 0),
+                "cursor": int(cur["last_source_id"]) if cur else 0,
+                "first_source_id": int(cur["first_source_id"]) if cur else 0,
+                "gap_detected": bool(cur["gap_detected"]) if cur else False,
+                "gap_note": str(cur["gap_note"]) if cur else "",
+            }
+
+    # ------------------------------------------------------------------
+    # Soft Work-Order Reservations (live applied plans ONLY — Issue #7)
     # ------------------------------------------------------------------
     def active_order_reservations(self, now_ts: int) -> dict[int, str]:
-        """Return {order_id: character_slug} for currently unexpired guild_order plans."""
+        """Return {order_id: character_slug} for unexpired APPLIED guild_order plans only."""
         reservations: dict[int, str] = {}
         with self._conn() as db:
             has_plans = db.execute(
@@ -98,14 +370,22 @@ class MemoryEngine:
             ).fetchone()[0]
             if not has_plans:
                 return reservations
+            pcols = {r[1] for r in db.execute("PRAGMA table_info(plans)").fetchall()}
+            state_clause = "AND COALESCE(p.plan_state, 'applied') != 'shadow'" if "plan_state" in pcols else ""
+            sub_state_clause = "AND COALESCE(plan_state, 'applied') != 'shadow'" if "plan_state" in pcols else ""
             rows = db.execute(
-                """
+                f"""
                 SELECT p.character_id, p.primary_goal_id
                 FROM plans p
                 INNER JOIN (
-                    SELECT character_id, MAX(id) AS max_id FROM plans GROUP BY character_id
+                    SELECT character_id, MAX(id) AS max_id
+                    FROM plans
+                    WHERE applied = 1 {sub_state_clause}
+                    GROUP BY character_id
                 ) m ON m.max_id = p.id
-                WHERE p.expires_at > ? AND p.primary_goal_id LIKE 'guild_order:%'
+                WHERE p.applied = 1 {state_clause}
+                  AND p.expires_at > ?
+                  AND p.primary_goal_id LIKE 'guild_order:%'
                 """,
                 (now_ts,),
             ).fetchall()
@@ -123,8 +403,13 @@ class MemoryEngine:
         comp: dict[str, Any],
         open_order_ids: set[int],
         now_ts: int,
+        *,
+        mutate: bool = True,
     ) -> list[dict[str, Any]]:
-        """Close fulfilled intentions against authoritative MySQL state & seed natural next tier."""
+        """Close fulfilled intentions against authoritative MySQL state & seed natural next tier.
+
+        When mutate=False (shadow mode, Issue #7), reads open intentions without mutating DB.
+        """
         slug = comp["slug"]
         skills = comp.get("skills") or {}
 
@@ -133,6 +418,11 @@ class MemoryEngine:
                 "SELECT * FROM intentions WHERE character_id = ? AND status = 'open' ORDER BY updated_at DESC",
                 (slug,),
             ).fetchall()
+            if not mutate:
+                return [
+                    {"kind": str(r["kind"]), "target_key": str(r["target_key"]), "label": str(r["label"])}
+                    for r in rows[:3]
+                ]
 
             open_items: list[dict[str, Any]] = []
             for r in rows:
@@ -140,7 +430,6 @@ class MemoryEngine:
                 tkey = r["target_key"]
                 done_reason = ""
                 if kind == "skill_tier":
-                    # target_key format: skill:<skill_id>:<target_val>
                     parts = tkey.split(":")
                     if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
                         sid, target_val = int(parts[1]), int(parts[2])
@@ -148,7 +437,6 @@ class MemoryEngine:
                         if cur_val >= target_val:
                             done_reason = f"Reached {SKILL_NAMES.get(sid, sid)} {cur_val}/{target_val}"
                 elif kind == "work_order":
-                    # target_key format: order:<order_id>
                     parts = tkey.split(":")
                     if len(parts) == 2 and parts[1].isdigit():
                         oid = int(parts[1])
@@ -167,10 +455,9 @@ class MemoryEngine:
                         "label": r["label"],
                     })
 
-            # Seed at most 1 natural profession tier intention if companion has no open skill_tier intention
             has_skill_intent = any(it["kind"] == "skill_tier" for it in open_items)
             if not has_skill_intent:
-                best_seed: tuple[int, int, int, str] | None = None  # (gap, sid, target_bp, label)
+                best_seed: tuple[int, int, int, str] | None = None
                 for sid, (val, mx) in sorted(skills.items()):
                     if sid not in (164, 165, 171, 182, 186, 197, 202, 333, 393, 755, 773):
                         continue
@@ -198,7 +485,6 @@ class MemoryEngine:
                     )
                     open_items.append({"kind": "skill_tier", "target_key": tkey, "label": lbl})
             else:
-                # Refresh current progress label for open skill_tier intentions
                 for it in open_items:
                     if it["kind"] == "skill_tier":
                         parts = it["target_key"].split(":")
@@ -222,7 +508,7 @@ class MemoryEngine:
         primary_desc: str,
         now_ts: int,
     ) -> None:
-        """If Claude chose a guild work order, persist it as an open intention until delivered."""
+        """Persist a claimed guild work order as an open intention (ONLY call for applied live plans)."""
         oid = parse_order_id(plan.get("primary_goal_id", ""))
         if oid is None:
             return
@@ -242,10 +528,10 @@ class MemoryEngine:
             )
 
     # ------------------------------------------------------------------
-    # Recent Session Analysis: Fatigue + Scoped Stall Caution
+    # Recent Session Analysis: Fatigue + Goal-Specific Observed Outcomes
     # ------------------------------------------------------------------
     def analyze_recent_plans(self, slug: str, now_ts: int) -> dict[str, Any]:
-        """Inspect recent plans in brain.db for variety fatigue and scoped goal stalls."""
+        """Inspect recent APPLIED plans for variety fatigue and verified goal-specific stalls."""
         result: dict[str, Any] = {
             "recent_goals": [],
             "fatigue_category": "",
@@ -261,49 +547,65 @@ class MemoryEngine:
             if not has_plans:
                 return result
             pcols = {r[1] for r in db.execute("PRAGMA table_info(plans)").fetchall()}
-            has_out = "outcome_levels" in pcols
-            if has_out:
-                rows = db.execute(
-                    """
-                    SELECT planned_at, expires_at, primary_goal_id, reason_code,
-                           start_level, outcome_levels, outcome_skillups, outcome_orders
-                    FROM plans
-                    WHERE character_id = ?
-                    ORDER BY id DESC LIMIT 5
-                    """,
-                    (slug,),
-                ).fetchall()
-            else:
-                rows = db.execute(
-                    """
-                    SELECT planned_at, expires_at, primary_goal_id, reason_code,
-                           0 AS start_level, 0 AS outcome_levels, 0 AS outcome_skillups, 0 AS outcome_orders
-                    FROM plans
-                    WHERE character_id = ?
-                    ORDER BY id DESC LIMIT 5
-                    """,
-                    (slug,),
-                ).fetchall()
+            state_clause = "AND COALESCE(plan_state, 'applied') != 'shadow'" if "plan_state" in pcols else ""
+
+            def col_or(name: str, default_sql: str) -> str:
+                return name if name in pcols else f"{default_sql} AS {name}"
+
+            sel = ", ".join([
+                "planned_at",
+                "expires_at",
+                "applied",
+                "primary_goal_id",
+                "reason_code",
+                col_or("plan_state", "'applied'"),
+                col_or("proposal_status", "''"),
+                col_or("advisory_only", "0"),
+                col_or("start_level", "0"),
+                col_or("outcome_levels", "0"),
+                col_or("outcome_xp", "0"),
+                col_or("outcome_skillups", "0"),
+                col_or("outcome_orders", "0"),
+                col_or("outcome_quests", "0"),
+                col_or("outcome_ledger_ops", "0"),
+            ])
+            rows = db.execute(
+                f"""
+                SELECT {sel}
+                FROM plans
+                WHERE character_id = ? AND applied = 1 {state_clause}
+                ORDER BY id DESC LIMIT 6
+                """,
+                (slug,),
+            ).fetchall()
 
         if not rows:
             return result
 
-        # Compact last-3 history for prompt
+        # Compact last-3 history for prompt with honest outcome labels
         for r in rows[:3]:
-            out_bits = []
-            if int(r["outcome_levels"] or 0) > 0:
-                out_bits.append(f"+{int(r['outcome_levels'])}lv")
-            if int(r["outcome_skillups"] or 0) > 0:
-                out_bits.append(f"+{int(r['outcome_skillups'])}sk")
-            if int(r["outcome_orders"] or 0) > 0:
-                out_bits.append(f"+{int(r['outcome_orders'])}ord")
+            rd = dict(r)
+            out_class = classify_plan_outcome(rd)
+            out_bits = [out_class]
+            if int(rd["outcome_levels"] or 0) > 0:
+                out_bits.append(f"+{int(rd['outcome_levels'])}lv")
+            if int(rd["outcome_xp"] or 0) > 0:
+                out_bits.append(f"+{int(rd['outcome_xp'])}xp")
+            if int(rd["outcome_quests"] or 0) > 0:
+                out_bits.append(f"+{int(rd['outcome_quests'])}q")
+            if int(rd["outcome_skillups"] or 0) > 0:
+                out_bits.append(f"+{int(rd['outcome_skillups'])}sk")
+            if int(rd["outcome_orders"] or 0) > 0:
+                out_bits.append(f"+{int(rd['outcome_orders'])}ord")
+            if int(rd["outcome_ledger_ops"] or 0) > 0:
+                out_bits.append(f"+{int(rd['outcome_ledger_ops'])}ops")
             result["recent_goals"].append({
-                "goal_id": r["primary_goal_id"],
-                "category": goal_category(r["primary_goal_id"]),
-                "outcome": ",".join(out_bits) if out_bits else "none",
+                "goal_id": rd["primary_goal_id"],
+                "category": goal_category(rd["primary_goal_id"]),
+                "outcome": " ".join(out_bits),
             })
 
-        # 1. Session Variety / Fatigue streak on consecutive identical category
+        # 1. Session Variety / Fatigue streak on consecutive identical category (applied plans only)
         first_cat = goal_category(rows[0]["primary_goal_id"])
         cat_streak = 0
         for r in rows:
@@ -315,36 +617,36 @@ class MemoryEngine:
             result["fatigue_category"] = first_cat
             result["fatigue_streak"] = cat_streak
 
-        # 2. Scoped Stall Caution: 2+ consecutive aged/finished plans on EXACT SAME goal_id with 0 progress
+        # 2. Goal-Specific Verified Stall Caution (Issue #5):
+        #    ONLY count finished/aged applied plans classified explicitly as 'stalled'.
+        #    Advisory goals, interrupted plans, expired/rejected/unaccepted proposals, XP gains,
+        #    capped-skill gathering ops, and quest turn-ins are NEVER counted as stalls.
         aged = [
-            r for r in rows
+            dict(r) for r in rows
             if int(r["start_level"] or 0) > 0
             and (int(r["expires_at"]) <= now_ts or (now_ts - int(r["planned_at"])) >= 900)
         ]
         if len(aged) >= 2:
             same_goal = aged[0]["primary_goal_id"]
-            stall_cnt = 0
-            for r in aged:
-                if r["primary_goal_id"] != same_goal:
-                    break
-                progress = (
-                    int(r["outcome_levels"] or 0)
-                    + int(r["outcome_skillups"] or 0)
-                    + int(r["outcome_orders"] or 0)
-                )
-                if progress == 0:
-                    stall_cnt += 1
-                else:
-                    break
-            if stall_cnt >= 2:
-                result["stalled_goal_id"] = same_goal
-                result["stall_streak"] = stall_cnt
-                result["operational_alert"] = {
-                    "character_id": slug,
-                    "goal_id": same_goal,
-                    "streak": stall_cnt,
-                    "message": f"{stall_cnt} sessions on {same_goal} with 0 levels/skill-ups/orders",
-                }
+            if not is_advisory_goal(same_goal):
+                stall_cnt = 0
+                for rd in aged:
+                    if rd["primary_goal_id"] != same_goal:
+                        break
+                    if classify_plan_outcome(rd) == "stalled":
+                        stall_cnt += 1
+                    else:
+                        break
+                if stall_cnt >= 2:
+                    result["stalled_goal_id"] = same_goal
+                    result["stall_streak"] = stall_cnt
+                    result["operational_alert"] = {
+                        "character_id": slug,
+                        "goal_id": same_goal,
+                        "streak": stall_cnt,
+                        "kind": "verified_goal_stall",
+                        "message": f"{stall_cnt} verified sessions on {same_goal} with 0 goal-specific progress",
+                    }
 
         return result
 
@@ -356,14 +658,25 @@ class MemoryEngine:
         comp: dict[str, Any],
         world_ctx: dict[str, Any],
         now_ts: int,
+        *,
+        mutate_intentions: bool = True,
     ) -> dict[str, Any]:
-        """Build the bounded, strictly grounded Memory v1 packet for one companion."""
+        """Build the bounded, strictly grounded Memory packet for one companion."""
         open_order_ids = {int(wo["id"]) for wo in world_ctx.get("work_orders", [])}
-        intentions = self.reconcile_intentions(comp, open_order_ids, now_ts)
+        intentions = self.reconcile_intentions(
+            comp, open_order_ids, now_ts, mutate=mutate_intentions
+        )
         recent = self.analyze_recent_plans(comp["slug"], now_ts)
 
+        # Prefer durable journal milestones (survives >12 events), falling back to live snapshot list
+        milestones = self.get_character_milestones(comp["slug"], limit=5)
+        if not milestones:
+            milestones = list(comp.get("recent_events") or [])[:5]
+
+        jstat = self.journal_status()
         packet: dict[str, Any] = {
-            "milestones": list(comp.get("recent_events") or [])[:5],
+            "milestones": milestones,
+            "history_coverage": "partial" if jstat["gap_detected"] else "complete",
             "open_intentions": [it["label"] for it in intentions],
             "social_bonds": list(comp.get("social_bonds") or [])[:3],
             "recent_sessions": recent["recent_goals"],
@@ -375,7 +688,7 @@ class MemoryEngine:
             )
         if recent["stalled_goal_id"]:
             packet["stall_caution"] = (
-                f"Goal '{recent['stalled_goal_id']}' showed 0 progress for {recent['stall_streak']} "
+                f"Goal '{recent['stalled_goal_id']}' had 0 verified progress for {recent['stall_streak']} "
                 f"sessions (possible missing mats or pathing snag); prefer an alternative goal."
             )
 

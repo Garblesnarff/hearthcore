@@ -1,4 +1,6 @@
-"""Optional out-of-loop API planning."""
+"""Optional out-of-loop API planning with shared budget & billable-usage accounting."""
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -6,10 +8,14 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Any
+
+from .budget import BudgetExceeded, BudgetLedger, InvalidWithUsage, extract_usage_meta
 from .core import Invalid, ROOT, validate
 
 VALID_EFFORTS = {"low", "medium", "high", "max"}
 FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*\Z", re.DOTALL)
+DEFAULT_MAX_TOKENS = 1600
 
 
 def load_env(env_path: Path | None = None) -> None:
@@ -34,18 +40,31 @@ def _strip_json_fences(text: str) -> str:
 
 
 def anthropic_with_meta(
-    p,
-    snap,
+    p: dict[str, Any],
+    snap: dict[str, Any],
     model: str | None = None,
     effort: str | None = None,
-    memory: dict | None = None,
+    memory: dict[str, Any] | None = None,
+    *,
+    budget: BudgetLedger | None = None,
+    caller: str = "planner",
+    is_shadow: bool = False,
+    http_post_fn=None,
 ):
-    """Call Anthropic Messages API for one validated session plan, returning (plan, meta)."""
+    """Call Anthropic Messages API for one validated session plan, returning (plan, meta).
+
+    Accounting invariant (Issue #8):
+    - Reserves conservative worst-case budget atomically BEFORE making the HTTP call.
+    - Extracts response usage tokens IMMEDIATELY upon HTTP 200 BEFORE JSON parsing or validate().
+    - Settles 'rejected' with exact billable usage if JSON/schema validation fails, 'error' ($0)
+      on clear pre-generation HTTP 4xx, and 'uncertain' (keeping conservative reserve) on timeout
+      or ambiguous transport failure.
+    """
     load_env()
     key = os.getenv("ANTHROPIC_API_KEY")
     use_model = model or os.getenv("ANTHROPIC_MODEL")
     use_effort = (effort or os.getenv("ANTHROPIC_EFFORT") or "medium").strip().lower()
-    if not key or not use_model:
+    if not use_model or (http_post_fn is None and not key):
         raise Invalid("Set ANTHROPIC_API_KEY and ANTHROPIC_MODEL explicitly")
 
     system = (
@@ -64,61 +83,92 @@ def anthropic_with_meta(
         "no spaces). No markdown fences, no commentary, JSON only."
     )
 
-    user_body = {"profile": p, "snapshot": snap}
+    user_body: dict[str, Any] = {"profile": p, "snapshot": snap}
     if memory:
         user_body["memory"] = memory
+    user_json = json.dumps(user_body, separators=(",", ":"))
 
-    payload = {
+    payload: dict[str, Any] = {
         "model": use_model,
-        "max_tokens": 1600,
+        "max_tokens": DEFAULT_MAX_TOKENS,
         "system": system,
-        "messages": [
-            {
-                "role": "user",
-                "content": json.dumps(user_body, separators=(",", ":")),
-            }
-        ],
+        "messages": [{"role": "user", "content": user_json}],
     }
     if use_effort in VALID_EFFORTS:
         payload["output_config"] = {"effort": use_effort}
 
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=data,
-        headers={
-            "x-api-key": key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        method="POST",
-    )
+    res_id: int | None = None
+    if budget is not None:
+        est_in = max(600, (len(system) + len(user_json)) // 3)
+        res_id = budget.reserve(
+            caller=caller,
+            model=use_model,
+            est_input_tokens=est_in,
+            max_output_tokens=DEFAULT_MAX_TOKENS,
+            character_id=str(snap.get("character_id") or ""),
+            is_shadow=is_shadow,
+        )
+
     t0 = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=45) as r:
-            result = json.load(r)
+        if http_post_fn is not None:
+            result = http_post_fn(payload)
+        else:
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=data,
+                headers={
+                    "x-api-key": key or "",
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=45) as r:
+                result = json.load(r)
         latency_ms = int((time.monotonic() - t0) * 1000)
-        raw_text = "".join(x.get("text", "") for x in result.get("content", []) if x.get("type") == "text")
+    except urllib.error.HTTPError as exc:
+        if budget is not None and res_id is not None:
+            # 4xx (400/401/403/404/429) failed before generation; 5xx may be uncertain
+            st = "error" if 400 <= exc.code < 500 else "uncertain"
+            budget.settle(res_id, status=st, error_note=f"HTTP {exc.code}")
+        raise Invalid(f"API HTTP {exc.code}") from exc
+    except BudgetExceeded:
+        raise
+    except Exception as exc:
+        if budget is not None and res_id is not None:
+            budget.settle(res_id, status="uncertain", error_note=f"transport:{type(exc).__name__}")
+        raise Invalid("API transport error: " + type(exc).__name__) from exc
+
+    # Extract billable usage BEFORE parsing/validating response content!
+    meta = extract_usage_meta(
+        result if isinstance(result, dict) else {},
+        fallback_model=use_model,
+        effort=use_effort if use_effort in VALID_EFFORTS else "",
+        latency_ms=latency_ms,
+    )
+
+    try:
+        raw_text = "".join(
+            x.get("text", "") for x in result.get("content", []) if isinstance(x, dict) and x.get("type") == "text"
+        )
         cleaned = _strip_json_fences(raw_text)
         parsed = json.loads(cleaned)
         plan = validate(parsed, snap)
-        usage = result.get("usage") or {}
-        out_details = usage.get("output_tokens_details") or {}
-        meta = {
-            "model": result.get("model") or use_model,
-            "effort": use_effort if use_effort in VALID_EFFORTS else "",
-            "input_tokens": int(usage.get("input_tokens") or 0),
-            "output_tokens": int(usage.get("output_tokens") or 0),
-            "thinking_tokens": int(out_details.get("thinking_tokens") or 0),
-            "latency_ms": latency_ms,
-        }
-        return plan, meta
-    except urllib.error.HTTPError as exc:
-        raise Invalid(f"API HTTP {exc.code}") from exc
-    except Invalid:
-        raise
+    except Invalid as exc:
+        if budget is not None and res_id is not None:
+            budget.settle(res_id, status="rejected", meta=meta, error_note=str(exc))
+        raise InvalidWithUsage(str(exc), meta=meta) from exc
     except Exception as exc:
-        raise Invalid("API failed or returned invalid data: " + type(exc).__name__) from exc
+        note = f"Invalid response payload: {type(exc).__name__}"
+        if budget is not None and res_id is not None:
+            budget.settle(res_id, status="rejected", meta=meta, error_note=note)
+        raise InvalidWithUsage(note, meta=meta) from exc
+
+    if budget is not None and res_id is not None:
+        budget.settle(res_id, status="ok", meta=meta)
+    return plan, meta
 
 
 def anthropic(p, snap):

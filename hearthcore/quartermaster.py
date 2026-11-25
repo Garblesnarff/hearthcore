@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from .bridge import BRAIN_DB_PATH, RUNTIME_DIR, run_sql
+from .budget import BudgetExceeded, BudgetLedger, InvalidWithUsage, extract_usage_meta
 from .core import Invalid
 from .guides import (
     LEVELING_ORDER_CATALOG,
@@ -36,9 +37,11 @@ from .guides import (
 from .provider import VALID_EFFORTS, _strip_json_fences, load_env
 
 QUARTERMASTER_JSON = RUNTIME_DIR / "quartermaster.json"
+QUARTERMASTER_SHADOW_JSON = RUNTIME_DIR / "quartermaster_shadow.json"
 HEARTHGUARD_GUILD_ID = 6
 TARGET_OPEN_ORDERS = 12
 MAX_BANK_REQUESTS = 20
+QM_MAX_TOKENS = 2800
 
 
 def _sql_esc(text: str) -> str:
@@ -301,12 +304,16 @@ def call_claude_quartermaster(
     slots_needed: int,
     model: str | None = None,
     effort: str | None = None,
+    *,
+    budget: BudgetLedger | None = None,
+    is_shadow: bool = False,
+    http_post_fn=None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     load_env()
     key = os.getenv("ANTHROPIC_API_KEY")
     use_model = model or os.getenv("HEARTHCORE_STRATEGIST_MODEL") or "claude-sonnet-5-5"
     use_effort = (effort or os.getenv("ANTHROPIC_EFFORT") or "medium").strip().lower()
-    if not key:
+    if http_post_fn is None and not key:
         raise Invalid("ANTHROPIC_API_KEY not set")
 
     system = (
@@ -339,49 +346,83 @@ def call_claude_quartermaster(
         "order_menu": order_menu,
         "bank_menu": bank_menu,
     }
+    user_json = json.dumps(user_payload, separators=(",", ":"))
 
     body: dict[str, Any] = {
         "model": use_model,
-        "max_tokens": 2800,
+        "max_tokens": QM_MAX_TOKENS,
         "system": system,
-        "messages": [{"role": "user", "content": json.dumps(user_payload, separators=(",", ":"))}],
+        "messages": [{"role": "user", "content": user_json}],
     }
     if use_effort in VALID_EFFORTS:
         body["output_config"] = {"effort": use_effort}
 
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=json.dumps(body).encode("utf-8"),
-        headers={
-            "x-api-key": key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        method="POST",
-    )
+    res_id: int | None = None
+    if budget is not None:
+        est_in = max(1200, (len(system) + len(user_json)) // 3)
+        res_id = budget.reserve(
+            caller="shadow_quartermaster" if is_shadow else "quartermaster",
+            model=use_model,
+            est_input_tokens=est_in,
+            max_output_tokens=QM_MAX_TOKENS,
+            is_shadow=is_shadow,
+        )
+
     t0 = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            res = json.load(r)
+        if http_post_fn is not None:
+            res = http_post_fn(body)
+        else:
+            req = urllib.request.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=json.dumps(body).encode("utf-8"),
+                headers={
+                    "x-api-key": key or "",
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=60) as r:
+                res = json.load(r)
         latency_ms = int((time.monotonic() - t0) * 1000)
-        raw_txt = "".join(b.get("text", "") for b in res.get("content", []) if b.get("type") == "text")
-        parsed = json.loads(_strip_json_fences(raw_txt))
-        validated = _validate_quartermaster_output(parsed, order_menu, bank_menu, slots_needed)
-        usage = res.get("usage") or {}
-        meta = {
-            "model": res.get("model") or use_model,
-            "effort": use_effort if use_effort in VALID_EFFORTS else "",
-            "input_tokens": int(usage.get("input_tokens") or 0),
-            "output_tokens": int(usage.get("output_tokens") or 0),
-            "latency_ms": latency_ms,
-        }
-        return validated, meta
     except urllib.error.HTTPError as exc:
+        if budget is not None and res_id is not None:
+            st = "error" if 400 <= exc.code < 500 else "uncertain"
+            budget.settle(res_id, status=st, error_note=f"HTTP {exc.code}")
         raise Invalid(f"Quartermaster API HTTP {exc.code}") from exc
-    except Invalid:
+    except BudgetExceeded:
         raise
     except Exception as exc:
+        if budget is not None and res_id is not None:
+            budget.settle(res_id, status="uncertain", error_note=f"transport:{type(exc).__name__}")
         raise Invalid(f"Quartermaster API error: {type(exc).__name__}") from exc
+
+    # Extract billable usage BEFORE parsing/validating response content! (Issue #8)
+    meta = extract_usage_meta(
+        res if isinstance(res, dict) else {},
+        fallback_model=use_model,
+        effort=use_effort if use_effort in VALID_EFFORTS else "",
+        latency_ms=latency_ms,
+    )
+
+    try:
+        raw_txt = "".join(b.get("text", "") for b in res.get("content", []) if isinstance(b, dict) and b.get("type") == "text")
+        parsed = json.loads(_strip_json_fences(raw_txt))
+        validated = _validate_quartermaster_output(parsed, order_menu, bank_menu, slots_needed)
+    except Invalid as exc:
+        if budget is not None and res_id is not None:
+            budget.settle(res_id, status="rejected", meta=meta, error_note=str(exc))
+        raise InvalidWithUsage(str(exc), meta=meta) from exc
+    except Exception as exc:
+        note = f"Quartermaster invalid payload: {type(exc).__name__}"
+        if budget is not None and res_id is not None:
+            budget.settle(res_id, status="rejected", meta=meta, error_note=note)
+        raise InvalidWithUsage(note, meta=meta) from exc
+
+    if budget is not None and res_id is not None:
+        budget.settle(res_id, status="ok", meta=meta)
+    return validated, meta
 
 
 def _pick_requester(order: dict[str, Any], chars: list[dict[str, Any]], idx: int) -> tuple[int, str]:
@@ -443,9 +484,12 @@ def _record_quartermaster_run(
     orders_added: int,
     banks_set: int,
     err_note: str,
+    *,
+    is_shadow: bool = False,
+    db_path: Path = BRAIN_DB_PATH,
 ) -> None:
-    BRAIN_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(BRAIN_DB_PATH) as db:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as db:
         db.execute("""
             CREATE TABLE IF NOT EXISTS quartermaster_runs (
                 id INTEGER PRIMARY KEY,
@@ -463,13 +507,16 @@ def _record_quartermaster_run(
                 error_note TEXT NOT NULL DEFAULT ''
             )
         """)
+        existing_cols = {r[1] for r in db.execute("PRAGMA table_info(quartermaster_runs)").fetchall()}
+        if "is_shadow" not in existing_cols:
+            db.execute("ALTER TABLE quartermaster_runs ADD COLUMN is_shadow INTEGER NOT NULL DEFAULT 0")
         now = int(time.time())
         db.execute(
             """
             INSERT INTO quartermaster_runs (
                 ran_at, ran_iso, source, model, effort, strategy_summary,
-                orders_added, banks_set, input_tokens, output_tokens, latency_ms, error_note
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                orders_added, banks_set, input_tokens, output_tokens, latency_ms, error_note, is_shadow
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 now,
@@ -484,6 +531,7 @@ def _record_quartermaster_run(
                 int(meta.get("output_tokens", 0)),
                 int(meta.get("latency_ms", 0)),
                 err_note[:200],
+                1 if is_shadow else 0,
             ),
         )
 
@@ -494,11 +542,16 @@ def run_quartermaster(
     apply: bool = True,
     model: str | None = None,
     effort: str | None = None,
+    db_path: Path = BRAIN_DB_PATH,
+    runtime_dir: Path = RUNTIME_DIR,
+    state_override: dict[str, Any] | None = None,
+    http_post_fn=None,
 ) -> dict[str, Any]:
     load_env()
-    state = fetch_40char_supply_state()
+    state = state_override if state_override is not None else fetch_40char_supply_state()
     slots_needed = max(0, TARGET_OPEN_ORDERS - len(state["open_orders"]))
     order_menu, bank_menu = build_eligible_menus(state)
+    budget = BudgetLedger(db_path)
 
     source = provider
     meta: dict[str, Any] = {}
@@ -507,8 +560,25 @@ def run_quartermaster(
     if provider == "anthropic":
         try:
             plan, meta = call_claude_quartermaster(
-                state, order_menu, bank_menu, slots_needed, model=model, effort=effort
+                state,
+                order_menu,
+                bank_menu,
+                slots_needed,
+                model=model,
+                effort=effort,
+                budget=budget,
+                is_shadow=not apply,
+                http_post_fn=http_post_fn,
             )
+        except BudgetExceeded as exc:
+            source = "fallback"
+            err_note = str(exc)
+            plan = _fallback_quartermaster(order_menu, bank_menu, slots_needed)
+        except InvalidWithUsage as exc:
+            source = "fallback_after_api"
+            err_note = str(exc)
+            meta = exc.meta
+            plan = _fallback_quartermaster(order_menu, bank_menu, slots_needed)
         except Invalid as exc:
             source = "fallback_after_api"
             err_note = str(exc)
@@ -520,11 +590,14 @@ def run_quartermaster(
     if apply:
         orders_added, banks_set = apply_quartermaster_plan(plan, state)
 
-    _record_quartermaster_run(plan, source, meta, orders_added, banks_set, err_note)
+    _record_quartermaster_run(
+        plan, source, meta, orders_added, banks_set, err_note, is_shadow=not apply, db_path=db_path
+    )
 
-    # Atomic runtime snapshot for bridge.py and Azeroth Watch
+    # Strict shadow isolation (Issue #7): shadow runs write quartermaster_shadow.json, NEVER live quartermaster.json!
     snapshot_out = {
         "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "is_shadow": not apply,
         "source": source,
         "model": meta.get("model") or source,
         "effort": meta.get("effort") or "",
@@ -537,16 +610,18 @@ def run_quartermaster(
         "bank_requests": plan["bank_requests"],
         "orders_added_last_run": orders_added,
         "target_open_orders": TARGET_OPEN_ORDERS,
+        "budget": budget.summary(),
         "supply": {
             "characters_analyzed": state["supply"]["characters_analyzed"],
             "professions": state["supply"]["professions"],
             "top_deficits": state["supply"]["materials"][:24],
         },
     }
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = QUARTERMASTER_JSON.with_suffix(".json.tmp")
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    target_path = (runtime_dir / "quartermaster.json") if apply else (runtime_dir / "quartermaster_shadow.json")
+    tmp = target_path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(snapshot_out, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(QUARTERMASTER_JSON)
+    tmp.replace(target_path)
     return {
         "source": source,
         "meta": meta,
@@ -554,5 +629,6 @@ def run_quartermaster(
         "plan": plan,
         "orders_added": orders_added,
         "banks_set": banks_set,
+        "is_shadow": not apply,
         "supply": state["supply"],
     }

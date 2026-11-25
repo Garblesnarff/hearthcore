@@ -84,7 +84,14 @@ public:
     };
     static std::vector<BankRequest> ListBankRequests();
 
-    static constexpr uint32 WEIGHT_REFRESH_MS = 600000;
+    // Native proposal binding vertical slice (Issue #3): returns true if this companion currently
+    // has a C++-validated executing guild work-order proposal.
+    static bool ActiveOrderProposal(uint32 lowGuid, uint64& outProposalId, uint64& outOrderId, uint32& outItemEntry);
+    static void MarkProposalCompleted(uint32 lowGuid, uint64 proposalId, uint32 progressDelta);
+    static void ReloadProposals();
+
+    static constexpr uint32 WEIGHT_REFRESH_MS = 300000;
+    static constexpr uint32 PROPOSAL_REFRESH_MS = 60000;
     static constexpr float WEIGHT_MIN_FACTOR = 0.5f;
     static constexpr float WEIGHT_MAX_FACTOR = 1.5f;
 
@@ -98,6 +105,7 @@ private:
     static std::unordered_map<std::string, float> _dutyDefaults;                        // duty key -> default
     // World thread only:
     static uint32 _timer;
+    static uint32 _proposalTimer;
     static bool _defaultsLoaded;
     static bool _weightsLoaded;
     static bool _missingLogged;

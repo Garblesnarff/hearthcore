@@ -1,12 +1,19 @@
 """Trusted live game-state bridge: exporter, session-boundary AI planner, and safe DB importer.
 
-Safety invariants (see docs/ARCHITECTURE.md):
+Safety & architecture invariants (Issues #3-#8, docs/ARCHITECTURE.md, docs/PERSISTENT_MEMORY.md):
 - Game server & DB remain authoritative for level, gear, items, quests, GUIDs, and actions.
 - Plans are generated strictly out-of-loop at session boundaries (never per tick).
 - Every plan (AI or fallback) passes core.validate() allowlist checks before touching DB.
-- Only bounded 0.5-1.5 numeric preference weights are written to companion_weights.
+- Temporary AI weights are written to `companion_weight_overrides` with expiry & monotonic
+  revision (NEVER overwriting canonical `companion_weights` persona/manual baselines).
+- Typed, versioned goal proposals are written to `companion_proposals` so native C++ validates
+  eligibility, executes concrete work orders, and reports accepted/executing/completed/rejected/
+  interrupted/expired outcomes; unsupported goal types are explicitly flagged `advisory_only=1`.
+- Durable event history is ingested incrementally via cursor checkpoints into `event_journal`.
+- Shadow runs (`apply=False`) are strictly isolated from live weights, proposals, intentions,
+  reservations, active_plans.json, and outcome tracking (while still accounting API spend in
+  the shared transactional `BudgetLedger`).
 - Zero LLM text is ever sent to in-game chat.
-- API failures or daily budget caps fall back cleanly to deterministic scoring.
 """
 from __future__ import annotations
 
@@ -20,9 +27,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .budget import BudgetExceeded, BudgetLedger, InvalidWithUsage
 from .core import Invalid, ROOT, fallback, profile, profiles, snapshot, validate
 from .guides import LEVELING_ORDER_CATALOG, ORDER_BY_ENTRY, SKILL_NAMES, best_farm_hint
-from .memory import MemoryEngine, goal_category, parse_order_id
+from .memory import (
+    MemoryEngine,
+    classify_plan_outcome,
+    goal_category,
+    goal_prefix,
+    is_advisory_goal,
+    parse_order_id,
+)
 from .provider import anthropic_with_meta, load_env
 
 DB_CONTAINER = "ac-database"
@@ -30,12 +45,13 @@ LIVE_POS_FILE = Path("/home/wonky/AzerothCore/azerothcore-wotlk/env/dist/logs/li
 RUNTIME_DIR = ROOT / "runtime"
 BRAIN_DB_PATH = RUNTIME_DIR / "brain.db"
 ACTIVE_PLANS_PATH = RUNTIME_DIR / "active_plans.json"
+SHADOW_PLANS_PATH = RUNTIME_DIR / "shadow_plans.json"
 QUARTERMASTER_PATH = RUNTIME_DIR / "quartermaster.json"
 
 CRAFT_SKILLS = {164, 165, 171, 197, 202, 333, 755, 773}
 GATHER_SKILLS = {182, 186, 393}
+SKILL_BY_SLUG = {re.sub(r"[^a-z0-9_]+", "_", name.lower()).strip("_"): sid for sid, name in SKILL_NAMES.items()}
 
-# All guild work-order items (Guild Life v2 + Claude Quartermaster Priority 1 & Priority 2 catalog)
 WORK_ORDER_SKILL = {t.item_entry: t.skill_id for t in LEVELING_ORDER_CATALOG}
 WORK_ORDER_SKILL.update({3470: 164, 3486: 164, 3576: 186})
 
@@ -54,6 +70,10 @@ def _clamp(val: float, lo: float = 0.5, hi: float = 1.5) -> float:
 
 def _slug_token(text: str) -> str:
     return re.sub(r"[^a-z0-9_]+", "_", text.lower()).strip("_")[:24] or "item"
+
+
+def _sql_esc(text: str) -> str:
+    return str(text).replace("\\", "\\\\").replace("'", "\\'")
 
 
 def run_sql(sql: str) -> list[list[str]]:
@@ -89,9 +109,62 @@ def read_live_context() -> dict[str, Any]:
     return ctx
 
 
-def fetch_world_context() -> dict[str, Any]:
-    """Query live MySQL for online Hearthguard companions, skills, open work orders, and recent events."""
+def sync_event_journal(mem: MemoryEngine, guid_to_slug: dict[int, str], now_ts: int) -> dict[str, Any]:
+    """Incrementally ingest companion_events into durable event_journal using checkpoint cursor (Issue #4)."""
+    cursor = mem.get_event_cursor()
+    min_rows = run_sql("SELECT COALESCE(MIN(id), 0) FROM companion_events;")
+    min_avail = int(min_rows[0][0]) if (min_rows and min_rows[0]) else 0
+
+    total_inserted = 0
+    last_info: dict[str, Any] = {"inserted": 0, "cursor": cursor, "gap_detected": False, "gap_note": ""}
+    # Paginate in bounded chunks so bursts never lose or crowd out quieter companions
+    for _ in range(10):
+        rows = run_sql(
+            f"SELECT id, guid, event_type, summary, partner_guid, zone_id, created_at "
+            f"FROM companion_events WHERE id > {int(cursor)} ORDER BY id ASC LIMIT 500;"
+        )
+        if not rows:
+            if min_avail > 0 and cursor == 0:
+                last_info = mem.ingest_events([], now_ts=now_ts, min_available_source_id=min_avail)
+            break
+        batch = []
+        for r in rows:
+            if len(r) < 7:
+                continue
+            g = int(r[1])
+            slug = guid_to_slug.get(g)
+            if not slug:
+                continue
+            batch.append({
+                "source_id": int(r[0]),
+                "guid": g,
+                "character_id": slug,
+                "event_type": r[2],
+                "summary": r[3],
+                "partner_guid": int(r[4]),
+                "zone_id": int(r[5]),
+                "created_at": int(r[6]),
+            })
+        last_info = mem.ingest_events(
+            batch,
+            now_ts=now_ts,
+            min_available_source_id=min_avail if cursor == 0 else None,
+        )
+        total_inserted += last_info["inserted"]
+        new_cursor = int(rows[-1][0])
+        if new_cursor <= cursor or len(rows) < 500:
+            cursor = new_cursor
+            break
+        cursor = new_cursor
+
+    last_info["inserted"] = total_inserted
+    return last_info
+
+
+def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = None) -> dict[str, Any]:
+    """Query live MySQL for companions, skills, quests, ledger ops, work orders, proposals, and events."""
     live = read_live_context()
+    ts = int(now_ts if now_ts is not None else time.time())
 
     comp_rows = run_sql("""
         SELECT c.guid, c.name, c.level, c.zone, c.map, c.money, c.online,
@@ -125,39 +198,74 @@ def fetch_world_context() -> dict[str, Any]:
             "shift_group": r[7],
             "skills": {},
             "orders_delivered": 0,
+            "quests_rewarded": 0,
+            "ledger_ops": 0,
             "recent_events": [],
             "social_bonds": [],
         }
         guid_to_slug[guid] = slug
 
-    # Skills for all companions (needed for both planning & outcome delta tracking)
     all_guids = [str(c["guid"]) for c in companions.values()]
     if all_guids:
         glist = ",".join(all_guids)
-        for r in run_sql(f"SELECT guid, skill, value, max FROM character_skills WHERE guid IN ({glist}) AND skill IN (164,165,171,182,186,197,202,333,393,755,773,129,185,356);"):
+        for r in run_sql(
+            f"SELECT guid, skill, value, max FROM character_skills WHERE guid IN ({glist}) "
+            f"AND skill IN (164,165,171,182,186,197,202,333,393,755,773,129,185,356);"
+        ):
             if len(r) >= 4:
                 sl = guid_to_slug.get(int(r[0]))
                 if sl:
                     companions[sl]["skills"][int(r[1])] = (int(r[2]), int(r[3]))
 
-        # Delivered work orders count per crafter
-        for r in run_sql("SELECT crafter_guid, COUNT(*) FROM companion_work_orders WHERE status = 'delivered' AND crafter_guid > 0 GROUP BY crafter_guid;"):
+        for r in run_sql(
+            "SELECT crafter_guid, COUNT(*) FROM companion_work_orders "
+            "WHERE status = 'delivered' AND crafter_guid > 0 GROUP BY crafter_guid;"
+        ):
             if len(r) >= 2:
                 sl = guid_to_slug.get(int(r[0]))
                 if sl:
                     companions[sl]["orders_delivered"] = int(r[1])
 
+        # Rewarded quest counts per companion (Issue #5: quest progress without level-up)
+        for r in run_sql(
+            f"SELECT guid, COUNT(*) FROM character_queststatus_rewarded WHERE guid IN ({glist}) GROUP BY guid;"
+        ):
+            if len(r) >= 2:
+                sl = guid_to_slug.get(int(r[0]))
+                if sl:
+                    companions[sl]["quests_rewarded"] = int(r[1])
+
+        # Productive ledger counts per companion (Issue #5: gathering/crafting/depositing at skill cap!)
+        for r in run_sql(
+            f"SELECT guid, COUNT(*) FROM companion_ledger "
+            f"WHERE guid IN ({glist}) AND action IN ('deposit','craft','withdraw','train','buy') GROUP BY guid;"
+        ):
+            if len(r) >= 2:
+                sl = guid_to_slug.get(int(r[0]))
+                if sl:
+                    companions[sl]["ledger_ops"] = int(r[1])
+
+    # Sync durable event journal with fair cursor-based pagination (Issue #4)
+    if mem is not None and guid_to_slug:
+        try:
+            sync_event_journal(mem, guid_to_slug, ts)
+        except Exception:
+            pass
+
     online_guids = [str(c["guid"]) for c in companions.values() if c["online"]]
     if online_guids:
         oglist = ",".join(online_guids)
-        # Recent 5 factual milestones per online companion (never decay)
-        for r in run_sql(f"SELECT guid, event_type, summary FROM companion_events WHERE guid IN ({oglist}) ORDER BY id DESC LIMIT 180;"):
-            if len(r) >= 3:
-                sl = guid_to_slug.get(int(r[0]))
-                if sl and len(companions[sl]["recent_events"]) < 5:
-                    companions[sl]["recent_events"].append(f"{r[1]}: {r[2][:72]}")
+        # Fallback recent events from DB if journal is empty
+        if mem is None:
+            for r in run_sql(
+                f"SELECT guid, event_type, summary FROM companion_events "
+                f"WHERE guid IN ({oglist}) ORDER BY id DESC LIMIT 180;"
+            ):
+                if len(r) >= 3:
+                    sl = guid_to_slug.get(int(r[0]))
+                    if sl and len(companions[sl]["recent_events"]) < 5:
+                        companions[sl]["recent_events"].append(f"{r[1]}: {r[2][:72]}")
 
-        # Top 3 social bonds per online companion from companion_relationships
         rel_rows = run_sql(f"""
             SELECT r.guid_a, ca.name, r.guid_b, cb.name, r.runs_together, r.help_given, r.affinity, r.last_event
             FROM companion_relationships r
@@ -180,9 +288,33 @@ def fetch_world_context() -> dict[str, Any]:
                         bond = f"{bond}: {last_ev}"
                     companions[sl]["social_bonds"].append(bond[:110])
 
+    # Native C++ proposal statuses from companion_proposals (Issue #3)
+    proposals_by_plan_id: dict[int, dict[str, Any]] = {}
+    try:
+        prop_rows = run_sql(
+            "SELECT plan_id, status, outcome_reason, started_at, ended_at, active_seconds, progress_delta, advisory_only "
+            "FROM companion_proposals ORDER BY id DESC LIMIT 200;"
+        )
+        for r in prop_rows:
+            if len(r) >= 8:
+                proposals_by_plan_id[int(r[0])] = {
+                    "status": r[1],
+                    "outcome_reason": r[2],
+                    "started_at": int(r[3]),
+                    "ended_at": int(r[4]),
+                    "active_seconds": int(r[5]),
+                    "progress_delta": int(r[6]),
+                    "advisory_only": bool(int(r[7])),
+                }
+    except Exception:
+        pass
+
     # Open guild work orders
     work_orders: list[dict[str, Any]] = []
-    for r in run_sql("SELECT id, requester_guid, requester_name, item_entry, item_name, quantity, story FROM companion_work_orders WHERE status IN ('open','claimed') ORDER BY id DESC LIMIT 16;"):
+    for r in run_sql(
+        "SELECT id, requester_guid, requester_name, item_entry, item_name, quantity, story "
+        "FROM companion_work_orders WHERE status IN ('open','claimed') ORDER BY id DESC LIMIT 16;"
+    ):
         if len(r) >= 7:
             item_entry = int(r[3])
             work_orders.append({
@@ -196,7 +328,6 @@ def fetch_world_context() -> dict[str, Any]:
                 "skill": WORK_ORDER_SKILL.get(item_entry, 0),
             })
 
-    # Online humans
     human_rows = run_sql("""
         SELECT c.name, c.level, c.zone
         FROM characters c
@@ -210,17 +341,18 @@ def fetch_world_context() -> dict[str, Any]:
         for r in human_rows if len(r) >= 3
     ]
 
-    # Optional Quartermaster guild-wide directives (so individual companions align with guild deficits!)
+    # Live Quartermaster directives (strictly reads live quartermaster.json, never shadow)
     qm_focus: set[str] = set()
     qm_mats_by_skill: dict[str, list[str]] = {}
     try:
         if QUARTERMASTER_PATH.is_file():
             qm = json.loads(QUARTERMASTER_PATH.read_text(encoding="utf-8"))
-            qm_focus = {str(s).lower() for s in (qm.get("focus_skills") or [])}
-            for br in qm.get("bank_requests") or []:
-                gsk = str(br.get("gather_skill") or "").lower()
-                if gsk:
-                    qm_mats_by_skill.setdefault(gsk, []).append(str(br.get("name") or ""))
+            if not qm.get("is_shadow"):
+                qm_focus = {str(s).lower() for s in (qm.get("focus_skills") or [])}
+                for br in qm.get("bank_requests") or []:
+                    gsk = str(br.get("gather_skill") or "").lower()
+                    if gsk:
+                        qm_mats_by_skill.setdefault(gsk, []).append(str(br.get("name") or ""))
     except Exception:
         pass
 
@@ -232,6 +364,7 @@ def fetch_world_context() -> dict[str, Any]:
         "humans": humans,
         "qm_focus": qm_focus,
         "qm_mats_by_skill": qm_mats_by_skill,
+        "proposals_by_plan_id": proposals_by_plan_id,
     }
 
 
@@ -254,7 +387,6 @@ def build_snapshot(
 
     candidates: list[dict[str, Any]] = []
 
-    # 1. Questing in current/bracket zone (always eligible)
     q_score = 78 if lvl < 20 else 72
     if comp["shift_group"] in ("core-wonky", "core-logan"):
         q_score = min(92, q_score + 8)
@@ -265,8 +397,6 @@ def build_snapshot(
         "description": f"Complete quests and turn-ins around {zone} (Lv {lvl})",
     })
 
-    # 2. Eligible open guild work orders matching a skill this companion holds AT/NEAR the required skill level
-    #    Apply soft work-order reservations so online crafters spread across distinct orders.
     eligible_wos = []
     for wo in world_ctx.get("work_orders", []):
         if wo["requester_guid"] == comp["guid"]:
@@ -282,7 +412,6 @@ def build_snapshot(
         claimed_by_other = bool(holder and holder != comp["slug"])
         eligible_wos.append((claimed_by_other, holder or "", wo, sk, comp_sk_val, tpl))
 
-    # Prefer unreserved orders first so the top-3 candidate slice naturally de-conflicts crafters
     eligible_wos.sort(key=lambda x: (1 if x[0] else 0, -(x[5].priority if x[5] else 1)))
     for claimed_by_other, holder, wo, sk, comp_sk_val, tpl in eligible_wos[:3]:
         score = 88 if is_craft_night else 82
@@ -299,7 +428,6 @@ def build_snapshot(
             "description": f"Craft {wo['quantity']}x {wo['item_name']} for {wo['requester_name']} ({SKILL_NAMES.get(sk, 'craft')} {comp_sk_val}){claim_note}"[:240],
         })
 
-    # 3. Primary crafting & gathering professions (aligned with Claude Quartermaster guild deficits!)
     qm_focus = world_ctx.get("qm_focus") or set()
     qm_mats = world_ctx.get("qm_mats_by_skill") or {}
     for sk_id, (val, mx) in sorted(skills.items()):
@@ -331,7 +459,6 @@ def build_snapshot(
                 "description": f"Gather {sk_name} ({val}/{mx}) for guild vault{need_txt}{hint_txt}"[:240],
             })
 
-    # 4. Secondary Cooking / First Aid / Fishing
     if 356 in skills:
         f_val, f_mx = skills[356]
         fish_need = qm_mats.get("fishing", [])[:2]
@@ -358,42 +485,39 @@ def build_snapshot(
             "id": "profession:secondaries",
             "type": "profession",
             "score": 56 + (10 if is_craft_night else 0),
-            "description": f"Keep secondary skills stocked ({', '.join(parts)})",
+            "description": f"Keep secondary skills stocked ({', '.join(parts)}) [Advisory]",
         })
 
-    # 5. Dungeon readiness (only eligible at level >= 15)
     if lvl >= 15:
         d_score = 84 if is_sunday else 66
         candidates.append({
             "id": "dungeon:prep",
             "type": "dungeon",
             "score": d_score,
-            "description": f"Prepare gear/consumables and stay ready for Lv {lvl} dungeons"
-                           + (" [Sunday Dungeon Day!]" if is_sunday else ""),
+            "description": (f"Prepare gear/consumables for Lv {lvl} dungeons [Advisory]"
+                            + (" [Sunday Dungeon Day!]" if is_sunday else ""))[:240],
         })
 
-    # 6. Training, Banking, Vendor/Repair, Exploration/Neighbourhood
     t_score = 70 if (lvl % 2 == 0 and lvl >= 4) else 52
     candidates.append({
         "id": "train:skills",
         "type": "train",
         "score": t_score,
-        "description": f"Visit class or profession trainer at level {lvl}",
+        "description": f"Visit class or profession trainer at level {lvl} [Advisory]",
     })
     candidates.append({
         "id": "bank:vault",
         "type": "bank",
         "score": 54,
-        "description": "Deposit spare trade goods and herbs into Hearthguard guild bank",
+        "description": "Deposit spare trade goods and herbs into Hearthguard guild bank [Advisory]",
     })
     candidates.append({
         "id": "repair:vendor",
         "type": "repair",
         "score": 55,
-        "description": "Sell gray clutter, restock essentials, and repair gear",
+        "description": "Sell gray clutter, restock essentials, and repair gear [Advisory]",
     })
 
-    # Neighbourhood presence when an owner is nearby in level
     near_owner = next(
         (h for h in world_ctx.get("humans", []) if abs(h["level"] - lvl) <= 6),
         None,
@@ -403,17 +527,16 @@ def build_snapshot(
             "id": f"explore:near_{_slug_token(near_owner['name'])}",
             "type": "explore",
             "score": 76 if not is_sunday else 84,
-            "description": f"Adventure in {near_owner['zone']} alongside {near_owner['name']} (Lv {near_owner['level']})",
+            "description": f"Adventure in {near_owner['zone']} alongside {near_owner['name']} (Lv {near_owner['level']}) [Advisory]",
         })
     else:
         candidates.append({
             "id": "explore:frontier",
             "type": "explore",
             "score": 52,
-            "description": f"Explore neighboring hubs and questing roads near {zone}",
+            "description": f"Explore neighboring hubs and questing roads near {zone} [Advisory]",
         })
 
-    # Apply bounded Memory v1 adjustments (variety fatigue + scoped stall caution only)
     if memory_ctx:
         fat_cat = str(memory_ctx.get("fatigue_category") or "")
         stalled_id = str(memory_ctx.get("stalled_goal_id") or "")
@@ -425,7 +548,7 @@ def build_snapshot(
                     sc -= 4 if cand["type"] == "guild_order" else 8
                 elif cand["type"] in ("quest", "gather", "craft", "fish"):
                     sc += 6
-            if stalled_id and cand["id"] == stalled_id:
+            if stalled_id and cand["id"] == stalled_id and not is_advisory_goal(cand["id"]):
                 sc -= 15
                 cand["description"] = f"{cand['description']} [Stalled: 0 progress]"[:240]
             cand["score"] = max(1, min(100, sc))
@@ -461,11 +584,11 @@ def weights_for_cpp(plan: dict[str, Any], snap: dict[str, Any]) -> dict[str, flo
     )
     craft_val = _clamp(craft_val)
 
-    out = {
+    return {
         "quest_work": q,
         "quest_turnin": _clamp(max(q, 1.0)),
         "quest_hub": q,
-        "quest_grind": _clamp(min(q, 1.15)),  # prefer real quests over pure mob grinding
+        "quest_grind": _clamp(min(q, 1.15)),
         "craft": craft_val,
         "gather": eff("gather"),
         "fish": eff("fish"),
@@ -476,32 +599,120 @@ def weights_for_cpp(plan: dict[str, Any], snap: dict[str, Any]) -> dict[str, flo
         "travel": eff("travel"),
         "hearth": eff("rest"),
     }
-    return out
 
 
-def apply_plan_to_db(guid: int, plan: dict[str, Any], snap: dict[str, Any], source: str) -> dict[str, float]:
-    """Re-validate plan and upsert bounded weights into acore_characters.companion_weights."""
+def build_proposal_spec(plan: dict[str, Any], snap: dict[str, Any]) -> dict[str, Any]:
+    """Extract typed, versioned native objective metadata for companion_proposals (Issue #3)."""
+    gid = str(plan["primary_goal_id"])
+    gtype = goal_prefix(gid)
+    advisory = is_advisory_goal(gid)
+    target_id = 0
+    if gtype == "guild_order":
+        target_id = int(parse_order_id(gid) or 0)
+        advisory = target_id <= 0
+    elif gtype in ("craft", "gather"):
+        parts = gid.split(":", 1)
+        if len(parts) == 2:
+            target_id = int(SKILL_BY_SLUG.get(parts[1], 0))
+    elif gtype == "fish":
+        target_id = 356
+    elif gtype == "quest":
+        parts = gid.split("zone_")
+        if len(parts) == 2 and parts[1].isdigit():
+            target_id = int(parts[1])
+    return {
+        "goal_id": gid[:96],
+        "goal_type": gtype[:24],
+        "target_id": target_id,
+        "advisory_only": 1 if advisory else 0,
+    }
+
+
+def apply_plan_to_db(
+    guid: int,
+    character_name: str,
+    plan: dict[str, Any],
+    snap: dict[str, Any],
+    source: str,
+    *,
+    plan_id: int = 0,
+    now_ts: int | None = None,
+    sql_exec=None,
+) -> tuple[dict[str, float], dict[str, Any]]:
+    """Re-validate plan and atomically write expiring overrides + typed proposal to MySQL.
+
+    Issues #3 & #6:
+    - NEVER overwrites canonical persona/manual rows in `companion_weights`.
+    - Writes expiring overrides to `companion_weight_overrides` with monotonic revision guard
+      so older/replayed plans can never supersede newer plans.
+    - Writes a typed, versioned proposal row to `companion_proposals` for native C++ validation.
+    """
     validate(plan, snap)
+    ts = int(now_ts if now_ts is not None else time.time())
+    expires_at = ts + int(plan["session_minutes"]) * 60
+    revision = int(plan_id) if int(plan_id) > 0 else ts
     cpp_weights = weights_for_cpp(plan, snap)
+    prop = build_proposal_spec(plan, snap)
     db_src = "hearthcore_ai" if source == "anthropic" else "hearthcore_fb"
-    stmts = []
+
+    stmts: list[str] = ["START TRANSACTION;"]
     for k, v in sorted(cpp_weights.items()):
         stmts.append(
-            f"INSERT INTO companion_weights (`guid`, `key`, `value`, `source`) "
-            f"VALUES ({int(guid)}, '{k}', {v:.3f}, '{db_src}') "
-            f"ON DUPLICATE KEY UPDATE `value` = VALUES(`value`), `source` = VALUES(`source`);"
+            "INSERT INTO companion_weight_overrides "
+            "(`guid`, `key`, `value`, `plan_id`, `revision`, `source`, `enabled`, `created_at`, `expires_at`) "
+            f"VALUES ({int(guid)}, '{_sql_esc(k)}', {v:.3f}, {int(plan_id)}, {revision}, '{db_src}', 1, {ts}, {expires_at}) "
+            "ON DUPLICATE KEY UPDATE "
+            "`value` = IF(VALUES(`revision`) >= `revision`, VALUES(`value`), `value`), "
+            "`plan_id` = IF(VALUES(`revision`) >= `revision`, VALUES(`plan_id`), `plan_id`), "
+            "`source` = IF(VALUES(`revision`) >= `revision`, VALUES(`source`), `source`), "
+            "`created_at` = IF(VALUES(`revision`) >= `revision`, VALUES(`created_at`), `created_at`), "
+            "`expires_at` = IF(VALUES(`revision`) >= `revision`, VALUES(`expires_at`), `expires_at`), "
+            "`revision` = GREATEST(`revision`, VALUES(`revision`));"
         )
-    run_sql("\n".join(stmts) + "\n")
-    return cpp_weights
+
+    # Supersede older open proposals for this character, then insert this versioned proposal
+    stmts.append(
+        f"UPDATE companion_proposals SET status = 'expired', outcome_reason = 'superseded', ended_at = {ts} "
+        f"WHERE guid = {int(guid)} AND status IN ('proposed', 'accepted') AND plan_id < {int(plan_id)};"
+    )
+    init_status = "proposed"
+    init_reason = "advisory_soft_weights" if prop["advisory_only"] else ""
+    stmts.append(
+        "INSERT INTO companion_proposals "
+        "(`plan_id`, `guid`, `character_name`, `goal_id`, `goal_type`, `target_id`, `advisory_only`, "
+        "`snapshot_rev`, `status`, `outcome_reason`, `created_at`, `expires_at`) "
+        f"VALUES ({int(plan_id)}, {int(guid)}, '{_sql_esc(character_name)}', '{_sql_esc(prop['goal_id'])}', "
+        f"'{_sql_esc(prop['goal_type'])}', {int(prop['target_id'])}, {int(prop['advisory_only'])}, "
+        f"{revision}, '{init_status}', '{_sql_esc(init_reason)}', {ts}, {expires_at}) "
+        "ON DUPLICATE KEY UPDATE "
+        "`expires_at` = IF(VALUES(`snapshot_rev`) >= `snapshot_rev`, VALUES(`expires_at`), `expires_at`);"
+    )
+    stmts.append("COMMIT;")
+    runner = sql_exec if sql_exec is not None else run_sql
+    runner("\n".join(stmts) + "\n")
+    return cpp_weights, prop
+
+
+def set_override_enabled(guid: int | None, enabled: bool, *, sql_exec=None) -> None:
+    """Global (guid=None) or per-character toggle for temporary AI weight overrides (Issue #6)."""
+    flag = 1 if enabled else 0
+    if guid is None:
+        sql = f"UPDATE companion_weight_overrides SET enabled = {flag};"
+    else:
+        sql = f"UPDATE companion_weight_overrides SET enabled = {flag} WHERE guid = {int(guid)};"
+    runner = sql_exec if sql_exec is not None else run_sql
+    runner(sql + "\n")
 
 
 class BrainStore:
-    """SQLite audit, session-expiry tracker, and daily API budget guard."""
+    """SQLite audit, session-expiry tracker, and non-overlapping outcome store."""
 
     def __init__(self, path: Path = BRAIN_DB_PATH) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as db:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA busy_timeout=5000")
             db.execute("""
                 CREATE TABLE IF NOT EXISTS plans (
                     id INTEGER PRIMARY KEY,
@@ -532,65 +743,170 @@ class BrainStore:
             """)
             db.execute("CREATE INDEX IF NOT EXISTS idx_plans_char_exp ON plans(character_id, expires_at DESC)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_plans_day ON plans(day_key, source)")
-            # Safe additive outcome-tracking columns for existing brain.db files
             existing_cols = {r[1] for r in db.execute("PRAGMA table_info(plans)").fetchall()}
             for col, typ in [
                 ("start_level", "INTEGER NOT NULL DEFAULT 0"),
                 ("start_xp", "INTEGER NOT NULL DEFAULT 0"),
                 ("start_skill_sum", "INTEGER NOT NULL DEFAULT 0"),
                 ("start_orders_done", "INTEGER NOT NULL DEFAULT 0"),
+                ("start_quests_done", "INTEGER NOT NULL DEFAULT 0"),
+                ("start_ledger_ops", "INTEGER NOT NULL DEFAULT 0"),
                 ("outcome_levels", "INTEGER NOT NULL DEFAULT 0"),
                 ("outcome_xp", "INTEGER NOT NULL DEFAULT 0"),
                 ("outcome_skillups", "INTEGER NOT NULL DEFAULT 0"),
                 ("outcome_orders", "INTEGER NOT NULL DEFAULT 0"),
+                ("outcome_quests", "INTEGER NOT NULL DEFAULT 0"),
+                ("outcome_ledger_ops", "INTEGER NOT NULL DEFAULT 0"),
                 ("outcome_checked_at", "INTEGER NOT NULL DEFAULT 0"),
+                ("outcome_finalized", "INTEGER NOT NULL DEFAULT 0"),
+                ("plan_state", "TEXT NOT NULL DEFAULT 'applied'"),
+                ("proposal_status", "TEXT NOT NULL DEFAULT ''"),
+                ("proposal_reason", "TEXT NOT NULL DEFAULT ''"),
+                ("advisory_only", "INTEGER NOT NULL DEFAULT 0"),
             ]:
                 if col not in existing_cols:
                     db.execute(f"ALTER TABLE plans ADD COLUMN {col} {typ}")
+            # Mark any historical unapplied rows explicitly as 'shadow' (Issue #7 provenance)
+            db.execute("UPDATE plans SET plan_state = 'shadow' WHERE applied = 0 AND plan_state = 'applied'")
 
     def _conn(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        return conn
 
-    def refresh_outcomes(self, companions: dict[str, dict[str, Any]], now_ts: int) -> None:
-        """Update real in-game outcome deltas (levels, XP, skill-ups, work orders) for recent plans."""
-        cutoff = now_ts - 86400
+    def refresh_outcomes(
+        self,
+        companions: dict[str, dict[str, Any]],
+        now_ts: int,
+        proposals_by_plan_id: dict[int, dict[str, Any]] | None = None,
+    ) -> None:
+        """Update goal-specific outcome deltas ONCE per applied plan window (no overlapping double-credit, Issue #5)."""
+        props = proposals_by_plan_id or {}
         with self._conn() as db:
-            db.row_factory = sqlite3.Row
+            # Determine latest applied plan id per character so superseded plans finalize immediately
+            latest_applied: dict[str, int] = {}
+            for lr in db.execute(
+                "SELECT character_id, MAX(id) AS max_id FROM plans WHERE applied = 1 AND plan_state != 'shadow' GROUP BY character_id"
+            ).fetchall():
+                latest_applied[str(lr["character_id"])] = int(lr["max_id"])
+
             rows = db.execute(
                 """
-                SELECT id, character_id, start_level, start_xp, start_skill_sum, start_orders_done
+                SELECT id, character_id, expires_at, start_level, start_xp, start_skill_sum,
+                       start_orders_done, start_quests_done, start_ledger_ops,
+                       outcome_finalized, proposal_status, proposal_reason
                 FROM plans
-                WHERE planned_at >= ? AND start_level > 0
-                  AND (expires_at > ? OR outcome_checked_at < expires_at)
-                ORDER BY id DESC LIMIT 120
-                """,
-                (cutoff, now_ts - 1800),
+                WHERE applied = 1
+                  AND plan_state != 'shadow'
+                  AND outcome_finalized = 0
+                  AND start_level > 0
+                ORDER BY id DESC LIMIT 200
+                """
             ).fetchall()
+
             updates = []
             for r in rows:
-                comp = companions.get(r["character_id"])
+                pid = int(r["id"])
+                slug = str(r["character_id"])
+                comp = companions.get(slug)
                 if not comp:
                     continue
+                is_superseded = latest_applied.get(slug, pid) > pid
+                is_expired = int(r["expires_at"]) <= now_ts
+                p_info = props.get(pid)
+                p_status = str(p_info["status"]) if p_info else str(r["proposal_status"] or "")
+                p_reason = str(p_info["outcome_reason"]) if p_info else str(r["proposal_reason"] or "")
+
+                # Do NOT overwrite already-superseded older plans with fresh deltas from later plans
+                if is_superseded and int(r["outcome_finalized"]) == 0:
+                    updates.append((
+                        None, None, None, None, None, None,
+                        p_status, p_reason, 1, now_ts, pid,
+                    ))
+                    continue
+
                 cur_lvl = int(comp["level"])
                 cur_xp = int(comp.get("xp", 0))
                 cur_sk = sum(v for v, _ in comp["skills"].values())
                 cur_ord = int(comp.get("orders_delivered", 0))
+                cur_q = int(comp.get("quests_rewarded", 0))
+                cur_led = int(comp.get("ledger_ops", 0))
+
                 d_lvl = max(0, cur_lvl - int(r["start_level"]))
-                d_xp = max(0, cur_xp - int(r["start_xp"])) if d_lvl == 0 else cur_xp
+                d_xp = max(0, cur_xp - int(r["start_xp"])) if d_lvl == 0 else max(1, cur_xp)
                 d_sk = max(0, cur_sk - int(r["start_skill_sum"]))
                 d_ord = max(0, cur_ord - int(r["start_orders_done"]))
-                updates.append((d_lvl, d_xp, d_sk, d_ord, now_ts, int(r["id"])))
-            if updates:
-                db.executemany(
-                    "UPDATE plans SET outcome_levels=?, outcome_xp=?, outcome_skillups=?, outcome_orders=?, outcome_checked_at=? WHERE id=?",
-                    updates,
+                d_q = max(0, cur_q - int(r["start_quests_done"]))
+                d_led = max(0, cur_led - int(r["start_ledger_ops"]))
+
+                finalize = 1 if (is_expired or p_status in ("completed", "rejected", "interrupted", "expired")) else 0
+                updates.append((d_lvl, d_xp, d_sk, d_ord, d_q, d_led, p_status, p_reason, finalize, now_ts, pid))
+
+            for u in updates:
+                if u[0] is None:
+                    db.execute(
+                        "UPDATE plans SET proposal_status=?, proposal_reason=?, outcome_finalized=?, outcome_checked_at=? WHERE id=?",
+                        (u[6], u[7], u[8], u[9], u[10]),
+                    )
+                else:
+                    db.execute(
+                        """
+                        UPDATE plans
+                        SET outcome_levels=?, outcome_xp=?, outcome_skillups=?, outcome_orders=?,
+                            outcome_quests=?, outcome_ledger_ops=?,
+                            proposal_status=?, proposal_reason=?, outcome_finalized=?, outcome_checked_at=?
+                        WHERE id=?
+                        """,
+                        u,
+                    )
+
+    def finalize_character_open_plans(self, slug: str, comp: dict[str, Any], now_ts: int) -> None:
+        """Finalize any unfinalized active applied plan for slug right BEFORE recording a new applied plan."""
+        with self._conn() as db:
+            rows = db.execute(
+                """
+                SELECT id, start_level, start_xp, start_skill_sum, start_orders_done,
+                       start_quests_done, start_ledger_ops
+                FROM plans
+                WHERE character_id = ? AND applied = 1 AND plan_state != 'shadow' AND outcome_finalized = 0
+                """,
+                (slug,),
+            ).fetchall()
+            if not rows:
+                return
+            cur_lvl = int(comp["level"])
+            cur_xp = int(comp.get("xp", 0))
+            cur_sk = sum(v for v, _ in comp["skills"].values())
+            cur_ord = int(comp.get("orders_delivered", 0))
+            cur_q = int(comp.get("quests_rewarded", 0))
+            cur_led = int(comp.get("ledger_ops", 0))
+            for r in rows:
+                d_lvl = max(0, cur_lvl - int(r["start_level"])) if int(r["start_level"]) > 0 else 0
+                d_xp = (max(0, cur_xp - int(r["start_xp"])) if d_lvl == 0 else max(1, cur_xp)) if int(r["start_level"]) > 0 else 0
+                d_sk = max(0, cur_sk - int(r["start_skill_sum"])) if int(r["start_level"]) > 0 else 0
+                d_ord = max(0, cur_ord - int(r["start_orders_done"])) if int(r["start_level"]) > 0 else 0
+                d_q = max(0, cur_q - int(r["start_quests_done"])) if int(r["start_level"]) > 0 else 0
+                d_led = max(0, cur_led - int(r["start_ledger_ops"])) if int(r["start_level"]) > 0 else 0
+                db.execute(
+                    """
+                    UPDATE plans
+                    SET outcome_levels=?, outcome_xp=?, outcome_skillups=?, outcome_orders=?,
+                        outcome_quests=?, outcome_ledger_ops=?,
+                        outcome_finalized=1, outcome_checked_at=?
+                    WHERE id=?
+                    """,
+                    (d_lvl, d_xp, d_sk, d_ord, d_q, d_led, now_ts, int(r["id"])),
                 )
 
     def active_plan(self, slug: str, now_ts: int) -> dict[str, Any] | None:
+        """Return unexpired APPLIED live plan for slug (shadow plans never suppress live planning, Issue #7)."""
         with self._conn() as db:
-            db.row_factory = sqlite3.Row
             row = db.execute(
-                "SELECT * FROM plans WHERE character_id = ? AND expires_at > ? ORDER BY id DESC LIMIT 1",
+                """
+                SELECT * FROM plans
+                WHERE character_id = ? AND applied = 1 AND plan_state != 'shadow' AND expires_at > ?
+                ORDER BY id DESC LIMIT 1
+                """,
                 (slug, now_ts),
             ).fetchone()
             return dict(row) if row else None
@@ -623,12 +939,18 @@ class BrainStore:
         start_xp: int = 0,
         start_skill_sum: int = 0,
         start_orders_done: int = 0,
-    ) -> None:
+        start_quests_done: int = 0,
+        start_ledger_ops: int = 0,
+        advisory_only: bool = False,
+        proposal_status: str = "",
+    ) -> int:
         dt = datetime.fromtimestamp(now_ts, tz=timezone.utc)
-        day_key = datetime.now().strftime("%Y-%m-%d")
+        day_key = datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d")
         expires_at = now_ts + int(plan["session_minutes"]) * 60
+        p_state = "applied" if applied else "shadow"
+        p_status = proposal_status or ("proposed" if applied else "shadow")
         with self._conn() as db:
-            db.execute(
+            cur = db.execute(
                 """
                 INSERT INTO plans (
                     planned_at, planned_iso, day_key, expires_at, character_id, game_guid,
@@ -636,8 +958,10 @@ class BrainStore:
                     reason_code, session_minutes, weight_modifiers, cpp_weights,
                     input_tokens, output_tokens, thinking_tokens, latency_ms,
                     applied, error_note, observed_at,
-                    start_level, start_xp, start_skill_sum, start_orders_done
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    start_level, start_xp, start_skill_sum, start_orders_done,
+                    start_quests_done, start_ledger_ops,
+                    plan_state, proposal_status, advisory_only
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     now_ts,
@@ -667,18 +991,26 @@ class BrainStore:
                     int(start_xp),
                     int(start_skill_sum),
                     int(start_orders_done),
+                    int(start_quests_done),
+                    int(start_ledger_ops),
+                    p_state,
+                    p_status,
+                    1 if advisory_only else 0,
                 ),
             )
+            return int(cur.lastrowid)
 
     def summary(self, now_ts: int) -> dict[str, Any]:
-        day_key = datetime.now().strftime("%Y-%m-%d")
+        day_key = datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d")
         with self._conn() as db:
-            db.row_factory = sqlite3.Row
-            # Latest plan per character
+            # Latest APPLIED live plan per character (shadow runs excluded, Issue #7)
             latest_rows = db.execute("""
                 SELECT p.* FROM plans p
                 INNER JOIN (
-                    SELECT character_id, MAX(id) AS max_id FROM plans GROUP BY character_id
+                    SELECT character_id, MAX(id) AS max_id
+                    FROM plans
+                    WHERE applied = 1 AND plan_state != 'shadow'
+                    GROUP BY character_id
                 ) m ON m.max_id = p.id
                 ORDER BY p.planned_at DESC
             """).fetchall()
@@ -691,9 +1023,9 @@ class BrainStore:
                     COALESCE(SUM(input_tokens), 0) AS in_tok,
                     COALESCE(SUM(output_tokens), 0) AS out_tok,
                     COALESCE(AVG(CASE WHEN source='anthropic' THEN latency_ms END), 0) AS avg_ms,
-                    COALESCE(SUM(outcome_levels), 0) AS out_lvls,
-                    COALESCE(SUM(outcome_skillups), 0) AS out_sks,
-                    COALESCE(SUM(outcome_orders), 0) AS out_ords
+                    COALESCE(SUM(CASE WHEN applied=1 THEN outcome_levels ELSE 0 END), 0) AS out_lvls,
+                    COALESCE(SUM(CASE WHEN applied=1 THEN outcome_skillups ELSE 0 END), 0) AS out_sks,
+                    COALESCE(SUM(CASE WHEN applied=1 THEN outcome_orders ELSE 0 END), 0) AS out_ords
                 FROM plans WHERE day_key = ?
             """, (day_key,)).fetchone()
 
@@ -701,6 +1033,7 @@ class BrainStore:
         for r in latest_rows:
             d = dict(r)
             active[d["character_id"]] = {
+                "plan_id": int(d["id"]),
                 "character_id": d["character_id"],
                 "source": d["source"],
                 "model": d["model"],
@@ -715,15 +1048,20 @@ class BrainStore:
                 "expires_at": d["expires_at"],
                 "active": d["expires_at"] > now_ts,
                 "applied": bool(d["applied"]),
+                "plan_state": d.get("plan_state") or "applied",
+                "proposal_status": d.get("proposal_status") or ("advisory" if d.get("advisory_only") else "proposed"),
+                "proposal_reason": d.get("proposal_reason") or "",
+                "advisory_only": bool(d.get("advisory_only") or is_advisory_goal(d["primary_goal_id"])),
+                "outcome_class": classify_plan_outcome(d),
                 "error_note": d["error_note"],
             }
 
         return {
             "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "day": day_key,
-            "model": os.getenv("ANTHROPIC_MODEL", "claude-haiku-5-5"),
+            "model": os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5"),
             "effort": os.getenv("ANTHROPIC_EFFORT", "medium"),
-            "daily_cap": int(os.getenv("HEARTHCORE_DAILY_CALL_CAP", "100")),
+            "daily_cap": int(os.getenv("HEARTHCORE_DAILY_CALL_CAP", "500")),
             "today": {
                 "total": int(day_row["total_today"] or 0),
                 "ai_ok": int(day_row["ai_ok"] or 0),
@@ -744,8 +1082,13 @@ def write_active_plans_json(
     store: BrainStore,
     now_ts: int,
     mem: MemoryEngine | None = None,
+    budget: BudgetLedger | None = None,
+    *,
+    runtime_dir: Path = RUNTIME_DIR,
 ) -> dict[str, Any]:
     data = store.summary(now_ts)
+    if budget is not None:
+        data["budget"] = budget.summary(now_ts)
     if mem is not None:
         intentions_map = mem.all_open_intentions()
         alerts: list[dict[str, Any]] = []
@@ -769,11 +1112,13 @@ def write_active_plans_json(
             "operational_alerts": alerts,
             "active_reservations": {str(k): v for k, v in mem.active_order_reservations(now_ts).items()},
             "fatigue_count": len(fatigue_map),
+            "journal": mem.journal_status(),
         }
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = ACTIVE_PLANS_PATH.with_suffix(".json.tmp")
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    out_path = runtime_dir / "active_plans.json"
+    tmp = out_path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(ACTIVE_PLANS_PATH)
+    tmp.replace(out_path)
     return data
 
 
@@ -784,20 +1129,35 @@ def run_cycle(
     force: bool = False,
     limit: int = 0,
     character: str | None = None,
+    db_path: Path = BRAIN_DB_PATH,
+    runtime_dir: Path = RUNTIME_DIR,
+    world_ctx_override: dict[str, Any] | None = None,
+    http_post_fn=None,
+    sql_exec=None,
+    now_ts_override: int | None = None,
 ) -> dict[str, Any]:
     """Run one session-boundary planning cycle for online Hearthguard companions."""
     load_env()
-    now_ts = int(time.time())
-    day_key = datetime.now().strftime("%Y-%m-%d")
-    daily_cap = int(os.getenv("HEARTHCORE_DAILY_CALL_CAP", "100"))
+    now_ts = int(now_ts_override if now_ts_override is not None else time.time())
     cfg_model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
     cfg_effort = os.getenv("ANTHROPIC_EFFORT", "medium")
 
-    store = BrainStore()
+    store = BrainStore(db_path)
     mem = MemoryEngine(store.path)
-    world_ctx = fetch_world_context()
-    store.refresh_outcomes(world_ctx["companions"], now_ts)
-    reservations = mem.active_order_reservations(now_ts)
+    budget = BudgetLedger(store.path)
+    world_ctx = (
+        world_ctx_override
+        if world_ctx_override is not None
+        else fetch_world_context(mem=mem, now_ts=now_ts)
+    )
+    if apply:
+        store.refresh_outcomes(
+            world_ctx["companions"],
+            now_ts,
+            proposals_by_plan_id=world_ctx.get("proposals_by_plan_id"),
+        )
+    # Shadow runs read a snapshot copy of reservations and NEVER mutate live reservations (Issue #7)
+    reservations = dict(mem.active_order_reservations(now_ts))
     known_slugs = set(profiles())
 
     targets = []
@@ -816,12 +1176,10 @@ def run_cycle(
         targets = targets[:limit]
 
     planned = []
-    api_calls_used = store.daily_api_calls(day_key)
-
     for comp in targets:
         slug = comp["slug"]
         char_prof = profile(slug)
-        mem_ctx = mem.build_packet(comp, world_ctx, now_ts)
+        mem_ctx = mem.build_packet(comp, world_ctx, now_ts, mutate_intentions=apply)
         snap = build_snapshot(
             comp,
             world_ctx,
@@ -835,34 +1193,43 @@ def run_cycle(
         err_note = ""
 
         if provider == "anthropic":
-            if api_calls_used >= daily_cap:
+            try:
+                plan, meta = anthropic_with_meta(
+                    char_prof,
+                    snap,
+                    model=cfg_model,
+                    effort=cfg_effort,
+                    memory=mem_ctx["packet"],
+                    budget=budget,
+                    caller="shadow_planner" if not apply else "planner",
+                    is_shadow=not apply,
+                    http_post_fn=http_post_fn,
+                )
+            except BudgetExceeded as exc:
                 source = "fallback"
-                err_note = f"daily_cap_reached:{daily_cap}"
+                err_note = str(exc)
                 plan = fallback(char_prof, snap)
-            else:
-                try:
-                    plan, meta = anthropic_with_meta(
-                        char_prof,
-                        snap,
-                        model=cfg_model,
-                        effort=cfg_effort,
-                        memory=mem_ctx["packet"],
-                    )
-                    api_calls_used += 1
-                except Invalid as exc:
-                    source = "fallback_after_api"
-                    err_note = str(exc)
-                    api_calls_used += 1
-                    plan = fallback(char_prof, snap)
+            except InvalidWithUsage as exc:
+                source = "fallback_after_api"
+                err_note = str(exc)
+                meta = exc.meta
+                plan = fallback(char_prof, snap)
+            except Invalid as exc:
+                source = "fallback_after_api"
+                err_note = str(exc)
+                plan = fallback(char_prof, snap)
         else:
             plan = fallback(char_prof, snap)
 
         cpp_w = weights_for_cpp(plan, snap)
-        if apply:
-            cpp_w = apply_plan_to_db(comp["guid"], plan, snap, source)
-
+        prop_spec = build_proposal_spec(plan, snap)
         primary_desc = desc_by_id.get(plan["primary_goal_id"], plan["primary_goal_id"])
-        store.record_plan(
+
+        if apply:
+            # Finalize any previous open plan for this character BEFORE inserting the new one (Issue #5)
+            store.finalize_character_open_plans(slug, comp, now_ts)
+
+        plan_id = store.record_plan(
             now_ts=now_ts,
             slug=slug,
             guid=comp["guid"],
@@ -880,17 +1247,36 @@ def run_cycle(
             start_xp=int(comp.get("xp", 0)),
             start_skill_sum=sum(v for v, _ in comp["skills"].values()),
             start_orders_done=int(comp.get("orders_delivered", 0)),
+            start_quests_done=int(comp.get("quests_rewarded", 0)),
+            start_ledger_ops=int(comp.get("ledger_ops", 0)),
+            advisory_only=bool(prop_spec["advisory_only"]),
+            proposal_status=("advisory" if prop_spec["advisory_only"] else "proposed") if apply else "shadow",
         )
-        mem.record_plan_intention(slug, plan, primary_desc, now_ts)
-        # Immediately update in-memory soft reservations so subsequent bots in this same tick don't collide
-        picked_oid = parse_order_id(plan["primary_goal_id"])
-        if picked_oid is not None:
-            reservations[picked_oid] = slug
+
+        if apply:
+            cpp_w, prop_spec = apply_plan_to_db(
+                comp["guid"],
+                comp["name"],
+                plan,
+                snap,
+                source,
+                plan_id=plan_id,
+                now_ts=now_ts,
+                sql_exec=sql_exec,
+            )
+            mem.record_plan_intention(slug, plan, primary_desc, now_ts)
+            picked_oid = parse_order_id(plan["primary_goal_id"])
+            if picked_oid is not None:
+                reservations[picked_oid] = slug
+
         planned.append({
+            "plan_id": plan_id,
             "name": comp["name"],
             "level": comp["level"],
             "source": source,
             "model": meta.get("model") or "fallback",
+            "applied": apply,
+            "advisory_only": bool(prop_spec["advisory_only"]),
             "primary_goal_id": plan["primary_goal_id"],
             "reason_code": plan["reason_code"],
             "session_minutes": plan["session_minutes"],
@@ -899,7 +1285,25 @@ def run_cycle(
             "error": err_note,
         })
 
-    summary = write_active_plans_json(store, now_ts, mem=mem)
+    if apply:
+        summary = write_active_plans_json(store, now_ts, mem=mem, budget=budget, runtime_dir=runtime_dir)
+    else:
+        # Strict shadow isolation (Issue #7): never overwrite active_plans.json!
+        summary = store.summary(now_ts)
+        summary["budget"] = budget.summary(now_ts)
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        sh_path = runtime_dir / "shadow_plans.json"
+        sh_out = {
+            "generated_at": datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "is_shadow": True,
+            "planned_count": len(planned),
+            "planned": planned,
+            "budget": summary["budget"],
+        }
+        tmp = sh_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(sh_out, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(sh_path)
+
     return {
         "planned_count": len(planned),
         "planned": planned,

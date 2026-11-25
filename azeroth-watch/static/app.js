@@ -971,6 +971,62 @@
     }
   }
 
+  let adminUnlocked = false;
+  function updateAdminBtn() {
+    const b = $("btn-admin-auth");
+    if (!b) return;
+    b.textContent = adminUnlocked ? "🔓 Admin Unlocked" : "🔒 Unlock Admin";
+    b.classList.toggle("unlocked", adminUnlocked);
+  }
+  async function checkAdminAuth() {
+    try {
+      const r = await fetch("/api/brain/auth-status", { cache: "no-store" });
+      if (r.ok) {
+        const j = await r.json();
+        adminUnlocked = Boolean(j.authenticated);
+        updateAdminBtn();
+      }
+    } catch (_) {}
+  }
+  if ($("btn-admin-auth")) {
+    $("btn-admin-auth").addEventListener("click", async () => {
+      if (adminUnlocked) {
+        await postBrainApi("/api/brain/logout", {}, "Admin controls locked");
+        adminUnlocked = false;
+        updateAdminBtn();
+        return;
+      }
+      const tok = window.prompt("Enter AZEROTH_WATCH_ADMIN_TOKEN (from hearthcore/.env):");
+      if (!tok || !tok.trim()) return;
+      const res = await fetch("/api/brain/auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: tok.trim() }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.ok) {
+        adminUnlocked = true;
+        updateAdminBtn();
+        showBrainToast("Admin controls unlocked for this browser");
+      } else {
+        showBrainToast(data.error || "Invalid admin token", true);
+      }
+    });
+  }
+  checkAdminAuth();
+
+  function fmtProposalBadge(status, advisory) {
+    const st = String(status || "").toLowerCase();
+    if (advisory || st === "advisory") return `<span class="prop-badge prop-adv" title="Advisory soft weights only (no dedicated native executor)">Advisory</span>`;
+    if (st === "completed") return `<span class="prop-badge prop-ok">✓ Completed</span>`;
+    if (st === "executing") return `<span class="prop-badge prop-exec">▶ Executing</span>`;
+    if (st === "accepted") return `<span class="prop-badge prop-acc">● Accepted</span>`;
+    if (st === "rejected") return `<span class="prop-badge prop-rej">✕ Rejected</span>`;
+    if (st === "interrupted") return `<span class="prop-badge prop-int">⏸ Interrupted</span>`;
+    if (st === "expired") return `<span class="prop-badge prop-exp">Expired</span>`;
+    return `<span class="prop-badge prop-prop">Proposed</span>`;
+  }
+
   document.querySelectorAll("#model-switch .ms-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
       const m = btn.dataset.model;
@@ -1039,10 +1095,10 @@
 
     const kpiHtml = `
       <div class="brain-kpi kpi-balance">
-        <div class="brain-kpi-label">API Credit Remaining</div>
+        <div class="brain-kpi-label">API Credit Baseline vs Budget</div>
         <div class="brain-kpi-val mono" style="color:var(--green)">~$${credRem.toFixed(2)} <span class="muted">/ $${credTot.toFixed(0)}</span></div>
         <div class="bar-bg" style="margin-top:4px"><div class="bar-fill" style="width:${credPct}%;background:var(--green)"></div></div>
-        <div class="brain-kpi-sub">~$${credSpent.toFixed(2)} used · resets ${esc(resetLbl)} (${daysLeft}d left)</div>
+        <div class="brain-kpi-sub">~$${credSpent.toFixed(2)} est · Cap $${Number((ab.budget && ab.budget.monthly_cap_usd) || 85).toFixed(0)}/mo · resets ${esc(resetLbl)} (${daysLeft}d)</div>
       </div>
       <div class="brain-kpi">
         <div class="brain-kpi-label">Daily Safety Cap</div>
@@ -1130,10 +1186,13 @@
               const outParts = [];
               if (p.outcome_skillups > 0) outParts.push(`+${p.outcome_skillups} skills`);
               if (p.outcome_levels > 0) outParts.push(`+${p.outcome_levels} lv`);
+              if (p.outcome_quests > 0) outParts.push(`+${p.outcome_quests} q`);
+              if (p.outcome_xp > 0 && !p.outcome_levels) outParts.push(`+${p.outcome_xp} xp`);
               if (p.outcome_orders > 0) outParts.push(`+${p.outcome_orders} order`);
               const outHtml = outParts.length
                 ? `<div style="color:var(--green);font-size:10px;margin-top:2px">${outParts.join(" · ")}</div>`
                 : "";
+              const propBadge = fmtProposalBadge(p.proposal_status, p.advisory_only);
               const memBits = [];
               if (p.open_intentions && p.open_intentions.length) {
                 memBits.push(`<span class="mem-chip mem-intent">🎯 ${esc(p.open_intentions[0])}</span>`);
@@ -1142,7 +1201,7 @@
                 memBits.push(`<span class="mem-chip mem-variety">↻ ${p.fatigue_streak}× ${esc(p.fatigue_category)}</span>`);
               }
               if (p.stalled_goal_id) {
-                memBits.push(`<span class="mem-chip mem-stall" title="2+ sessions with 0 measurable progress on ${esc(p.stalled_goal_id)}">⚠ Stall caution</span>`);
+                memBits.push(`<span class="mem-chip mem-stall" title="2+ verified sessions with 0 goal-specific progress on ${esc(p.stalled_goal_id)}">⚠ Stall caution</span>`);
               }
               const memHtml = memBits.length ? `<div class="chip-wrap" style="margin-top:3px">${memBits.join("")}</div>` : "";
               return `
@@ -1152,8 +1211,8 @@
                     <div class="muted" style="font-size:10px;margin-top:2px"><span class="act-badge ${srcCls}">${esc(fmtModelShort(p.model || p.source))}</span> ${comp.archetype ? esc(comp.archetype) : ""}</div>
                   </td>
                   <td>
-                    <div class="goal-headline"><span class="goal-cat ${cat.cls}">${cat.icon} ${esc(cat.label)}</span> <span>${esc(p.primary_desc)}</span></div>
-                    <div class="muted" style="font-size:11px;margin-top:2px">Why: ${esc(fmtReason(p.reason_code))}</div>
+                    <div class="goal-headline"><span class="goal-cat ${cat.cls}">${cat.icon} ${esc(cat.label)}</span> ${propBadge} <span>${esc(p.primary_desc)}</span></div>
+                    <div class="muted" style="font-size:11px;margin-top:2px">Why: ${esc(fmtReason(p.reason_code))}${p.proposal_reason ? ` · Native: ${esc(fmtReason(p.proposal_reason))}` : ""}</div>
                     ${memHtml}
                   </td>
                   <td><div class="chip-wrap">${secs || '<span class="muted">—</span>'}</div></td>

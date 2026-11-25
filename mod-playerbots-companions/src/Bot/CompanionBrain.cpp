@@ -8,18 +8,24 @@
 #include "CompanionClassStrategy.h"
 #include "CompanionDuty.h"
 #include "CompanionCraft.h"
+#include "CompanionLife.h"
 
 #include <algorithm>
 #include <cmath>
+#include <ctime>
 #include <unordered_set>
 
 #include "Bag.h"
 #include "Config.h"
 #include "DatabaseEnv.h"
+#include "GameTime.h"
+#include "Group.h"
 #include "Item.h"
 #include "ItemTemplate.h"
 #include "ItemUsageValue.h"
 #include "Log.h"
+#include "ObjectAccessor.h"
+#include "Player.h"
 #include "Playerbots.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotAIConfig.h"
@@ -32,6 +38,18 @@ constexpr uint32 ITEM_HEARTHSTONE_ENTRY = CompanionBrain::ITEM_HEARTHSTONE;
 std::mutex gBankReqMutex;
 std::unordered_map<uint32, CompanionBrain::BankRequest> gBankRequests;
 bool gBankReqMissingLogged = false;
+
+struct ActiveOrderProp
+{
+    uint64 proposalId = 0;
+    uint64 orderId = 0;
+    uint32 itemEntry = 0;
+    uint32 expiresAt = 0;
+};
+std::mutex gPropMutex;
+std::unordered_map<uint32, ActiveOrderProp> gActiveOrderProps;  // lowGuid -> active validated work-order proposal
+bool gPropMissingLogged = false;
+bool gOverrideMissingLogged = false;
 
 // WotLK 3.3.5a (1-450) profession leveling-guide materials whitelist (Mining/BS, Eng, JC, Herb/Alch, Inscription,
 // Skinning/LW, Tailoring, Enchanting, First Aid, and guide-standard Cooking meats/fish).
@@ -105,6 +123,7 @@ std::unordered_map<std::string, float> CompanionBrain::_dutyDefaults = {
     {"activity", 30.0f},
 };
 uint32 CompanionBrain::_timer = 0;
+uint32 CompanionBrain::_proposalTimer = 0;
 bool CompanionBrain::_defaultsLoaded = false;
 bool CompanionBrain::_weightsLoaded = false;
 bool CompanionBrain::_missingLogged = false;
@@ -289,12 +308,22 @@ void CompanionBrain::Update(uint32 elapsed)
         LoadDefaults();
 
     _timer += elapsed;
-    if (_weightsLoaded && _timer < WEIGHT_REFRESH_MS)
+    _proposalTimer += elapsed;
+    if (!_weightsLoaded || _timer >= WEIGHT_REFRESH_MS)
+    {
+        _timer = 0;
+        _weightsLoaded = true;
+        ReloadWeights();
+        ReloadBankRequests();
+        _proposalTimer = 0;
+        ReloadProposals();
         return;
-    _timer = 0;
-    _weightsLoaded = true;
-    ReloadWeights();
-    ReloadBankRequests();
+    }
+    if (_proposalTimer >= PROPOSAL_REFRESH_MS)
+    {
+        _proposalTimer = 0;
+        ReloadProposals();
+    }
 }
 
 bool CompanionBrain::IsLevelingGuideMat(uint32 entry)
@@ -463,8 +492,10 @@ void CompanionBrain::ReloadWeights()
         return;
     }
 
+    // 1. Load canonical persona & manual baseline weights from companion_weights (never overwritten by AI).
     std::unordered_map<uint32, std::unordered_map<std::string, float>> rows;
-    QueryResult result = CharacterDatabase.Query("SELECT `guid`, `key`, `value` FROM `companion_weights`");
+    std::unordered_map<uint32, std::unordered_set<std::string>> manualKeys;
+    QueryResult result = CharacterDatabase.Query("SELECT `guid`, `key`, `value`, COALESCE(`source`, '') FROM `companion_weights`");
     if (result)
     {
         do
@@ -473,12 +504,190 @@ void CompanionBrain::ReloadWeights()
             float const value = fields[2].Get<float>();
             if (!std::isfinite(value))
                 continue;
-            rows[fields[0].Get<uint32>()][fields[1].Get<std::string>()] = value;
+            uint32 const guid = fields[0].Get<uint32>();
+            std::string const key = fields[1].Get<std::string>();
+            std::string const src = fields[3].Get<std::string>();
+            rows[guid][key] = value;
+            if (src == "manual")
+                manualKeys[guid].insert(key);
         } while (result->NextRow());
+    }
+
+    // 2. Layer active, non-expired temporary AI overrides from companion_weight_overrides (Issue #6).
+    //    Expired/disabled overrides are ignored automatically -> bot falls back to canonical baseline
+    //    within WEIGHT_REFRESH_MS even if Python planner stops. Manual baseline edits take precedence.
+    bool const overridesEnabled = sConfigMgr->GetOption<bool>("AiPlayerbot.Companion.Brain.OverridesEnabled", true, false);
+    if (overridesEnabled)
+    {
+        QueryResult ovProbe = CharacterDatabase.Query(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() "
+            "AND table_name = 'companion_weight_overrides'");
+        if (ovProbe && ovProbe->Fetch()[0].Get<uint64>() > 0)
+        {
+            QueryResult ovRes = CharacterDatabase.Query(
+                "SELECT `guid`, `key`, `value` FROM `companion_weight_overrides` "
+                "WHERE `enabled` = 1 AND `expires_at` > UNIX_TIMESTAMP()");
+            if (ovRes)
+            {
+                do
+                {
+                    Field* f = ovRes->Fetch();
+                    float const val = f[2].Get<float>();
+                    if (!std::isfinite(val))
+                        continue;
+                    uint32 const guid = f[0].Get<uint32>();
+                    std::string const key = f[1].Get<std::string>();
+                    auto mit = manualKeys.find(guid);
+                    if (mit != manualKeys.end() && mit->second.count(key) > 0)
+                        continue;  // Preserve manual configuration precedence
+                    rows[guid][key] = std::clamp(val, WEIGHT_MIN_FACTOR, WEIGHT_MAX_FACTOR);
+                } while (ovRes->NextRow());
+            }
+        }
+        else if (!gOverrideMissingLogged)
+        {
+            gOverrideMissingLogged = true;
+            LOG_INFO("playerbots", "Companion weights: companion_weight_overrides table absent, using baseline only");
+        }
     }
 
     std::lock_guard<std::mutex> lock(_weightMutex);
     _weights.swap(rows);
+}
+
+void CompanionBrain::ReloadProposals()
+{
+    QueryResult probe = CharacterDatabase.Query(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() "
+        "AND table_name = 'companion_proposals'");
+    if (!probe || probe->Fetch()[0].Get<uint64>() == 0)
+    {
+        if (!gPropMissingLogged)
+        {
+            gPropMissingLogged = true;
+            LOG_INFO("playerbots", "Companion proposals: table companion_proposals absent");
+        }
+        std::lock_guard<std::mutex> lock(gPropMutex);
+        gActiveOrderProps.clear();
+        return;
+    }
+
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    std::unordered_map<uint32, ActiveOrderProp> nextOrders;
+
+    QueryResult res = CharacterDatabase.Query(
+        "SELECT `id`, `guid`, `goal_type`, `target_id`, `advisory_only`, `status`, `expires_at` "
+        "FROM `companion_proposals` "
+        "WHERE `status` IN ('proposed', 'accepted', 'executing') "
+        "ORDER BY `id` DESC LIMIT 80");
+    if (res)
+    {
+        std::unordered_set<uint32> seenGuid;
+        do
+        {
+            Field* f = res->Fetch();
+            uint64 const propId = f[0].Get<uint64>();
+            uint32 const guid = f[1].Get<uint32>();
+            std::string const goalType = f[2].Get<std::string>();
+            uint32 const targetId = f[3].Get<uint32>();
+            bool const advisory = f[4].Get<uint8>() != 0;
+            std::string const status = f[5].Get<std::string>();
+            uint32 const expiresAt = f[6].Get<uint32>();
+
+            // Expire past-TTL proposals natively (even if Python planner is stopped)
+            if (expiresAt <= now)
+            {
+                CharacterDatabase.Execute(
+                    "UPDATE companion_proposals SET status = 'expired', outcome_reason = 'ttl_expired', "
+                    "ended_at = {} WHERE id = {} AND status IN ('proposed', 'accepted', 'executing')",
+                    now, propId);
+                continue;
+            }
+            if (!seenGuid.insert(guid).second)
+                continue;  // Only latest active proposal per companion
+
+            if (advisory)
+                continue;  // Advisory goals stay soft-weight only, never falsely marked executing
+
+            Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(guid));
+            if (bot && bot->GetGroup())
+            {
+                // Native group/owner commitment ALWAYS takes precedence (Issue #3)
+                if (status == "accepted" || status == "executing")
+                {
+                    CharacterDatabase.Execute(
+                        "UPDATE companion_proposals SET status = 'interrupted', outcome_reason = 'owner_group_priority', "
+                        "ended_at = {} WHERE id = {}",
+                        now, propId);
+                }
+                continue;
+            }
+
+            if (goalType == "guild_order")
+            {
+                uint32 itemEntry = 0;
+                if (!CompanionLife::HasOpenWorkOrderById(targetId, guid, itemEntry) || itemEntry == 0)
+                {
+                    CharacterDatabase.Execute(
+                        "UPDATE companion_proposals SET status = 'rejected', outcome_reason = 'order_unavailable', "
+                        "ended_at = {} WHERE id = {}",
+                        now, propId);
+                    continue;
+                }
+                if (status == "proposed")
+                {
+                    CharacterDatabase.Execute(
+                        "UPDATE companion_proposals SET status = 'executing', outcome_reason = 'native_order_bound', "
+                        "started_at = IF(started_at = 0, {}, started_at) WHERE id = {}",
+                        now, propId);
+                }
+                nextOrders[guid] = ActiveOrderProp{propId, targetId, itemEntry, expiresAt};
+            }
+            else if (bot && status == "proposed")
+            {
+                CharacterDatabase.Execute(
+                    "UPDATE companion_proposals SET status = 'accepted', outcome_reason = 'native_weight_bound', "
+                    "started_at = IF(started_at = 0, {}, started_at) WHERE id = {}",
+                    now, propId);
+            }
+        } while (res->NextRow());
+    }
+
+    std::lock_guard<std::mutex> lock(gPropMutex);
+    gActiveOrderProps.swap(nextOrders);
+}
+
+bool CompanionBrain::ActiveOrderProposal(uint32 lowGuid, uint64& outProposalId, uint64& outOrderId, uint32& outItemEntry)
+{
+    outProposalId = 0;
+    outOrderId = 0;
+    outItemEntry = 0;
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    std::lock_guard<std::mutex> lock(gPropMutex);
+    auto it = gActiveOrderProps.find(lowGuid);
+    if (it == gActiveOrderProps.end() || it->second.expiresAt <= now)
+        return false;
+    outProposalId = it->second.proposalId;
+    outOrderId = it->second.orderId;
+    outItemEntry = it->second.itemEntry;
+    return true;
+}
+
+void CompanionBrain::MarkProposalCompleted(uint32 lowGuid, uint64 proposalId, uint32 progressDelta)
+{
+    if (!proposalId)
+        return;
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    {
+        std::lock_guard<std::mutex> lock(gPropMutex);
+        auto it = gActiveOrderProps.find(lowGuid);
+        if (it != gActiveOrderProps.end() && it->second.proposalId == proposalId)
+            gActiveOrderProps.erase(it);
+    }
+    CharacterDatabase.Execute(
+        "UPDATE companion_proposals SET status = 'completed', outcome_reason = 'order_delivered', "
+        "ended_at = {}, progress_delta = {} WHERE id = {}",
+        now, progressDelta, proposalId);
 }
 
 float CompanionBrain::Weight(uint32 lowGuid, std::string const& key, float defaultValue)

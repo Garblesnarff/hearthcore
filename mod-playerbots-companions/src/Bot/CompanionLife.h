@@ -112,6 +112,7 @@ public:
 
     // Guild Life v2: autonomous work-order priority, neighbourhood presence, and weekly guild events.
     static bool HasOpenWorkOrderFor(uint32 itemEntry, uint32 crafterGuid);
+    static bool HasOpenWorkOrderById(uint64 orderId, uint32 crafterGuid, uint32& outItemEntry);
     static float NeighborhoodHubBonus(Player* bot, uint32 hubZoneId);
     static float WeeklyFishingBonus();
     static float WeeklyCraftBonus();

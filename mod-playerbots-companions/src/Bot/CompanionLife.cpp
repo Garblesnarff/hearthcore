@@ -9,6 +9,7 @@
 #include "CharacterCache.h"
 #include "Chat.h"
 #include "CompanionBotMgr.h"
+#include "CompanionBrain.h"
 #include "CompanionDuty.h"
 #include "CompanionLease.h"
 #include "Config.h"
@@ -168,15 +169,37 @@ void RecordEventInternal(uint32 guid, std::string const& type, std::string const
             q.pop_back();
     }
 
-    // Async insert + prune old rows beyond 15 in DB (zero map-thread stall).
+    // Async insert (zero map-thread stall). Decouple durable autobiographical history from the
+    // 12-event UI window (Issue #4): NEVER prune milestones; retain up to 250 routine events per
+    // character and prune asynchronously only every 25 inserts.
     CharacterDatabase.Execute(
         "INSERT INTO companion_events (`guid`, `event_type`, `summary`, `partner_guid`, `zone_id`, `created_at`) "
         "VALUES ({}, '{}', '{}', {}, {}, {})",
         guid, SqlEsc(type), SqlEsc(summary), partnerGuid, zoneId, now);
-    CharacterDatabase.Execute(
-        "DELETE FROM companion_events WHERE `guid` = {} AND `id` NOT IN "
-        "(SELECT id FROM (SELECT id FROM companion_events WHERE `guid` = {} ORDER BY `created_at` DESC, `id` DESC LIMIT 12) t)",
-        guid, guid);
+
+    static std::mutex sPruneMutex;
+    static std::unordered_map<uint32, uint32> sInsertCounts;
+    bool shouldPrune = false;
+    {
+        std::lock_guard<std::mutex> plock(sPruneMutex);
+        uint32& cnt = sInsertCounts[guid];
+        ++cnt;
+        if (cnt >= 25)
+        {
+            cnt = 0;
+            shouldPrune = true;
+        }
+    }
+    if (shouldPrune)
+    {
+        CharacterDatabase.Execute(
+            "DELETE FROM companion_events WHERE `guid` = {} "
+            "AND `event_type` NOT IN ('level_up', 'skill_milestone', 'boss_kill', 'work_order', 'dungeon', 'reputation') "
+            "AND `id` NOT IN (SELECT id FROM (SELECT id FROM companion_events WHERE `guid` = {} "
+            "AND `event_type` NOT IN ('level_up', 'skill_milestone', 'boss_kill', 'work_order', 'dungeon', 'reputation') "
+            "ORDER BY `created_at` DESC, `id` DESC LIMIT 250) t)",
+            guid, guid);
+    }
 }
 
 void BumpRelationInternal(uint32 guidA, uint32 guidB, uint32 addRuns, uint32 addWipes, uint32 addHelp,
@@ -781,24 +804,50 @@ void CompanionLife::OnCraftMade(Player* bot, uint32 itemEntry, std::string const
                             bot->GetZoneId());
 
     // Check if this craft satisfies an open/claimed guild work order!
+    // Prefer an active AI-proposed & C++-validated work order ID first (Issue #3).
     if (!sPlayerbotAIConfig.companionGuildLifeWorkOrders)
         return;
+    uint64 propId = 0;
+    uint64 preferredOrderId = 0;
+    uint32 propItemEntry = 0;
+    bool const hasPropOrder = CompanionBrain::ActiveOrderProposal(low, propId, preferredOrderId, propItemEntry) &&
+                              propItemEntry == itemEntry;
     WorkOrder matched;
     bool found = false;
     {
         std::lock_guard<std::mutex> lock(gLifeMutex);
-        for (WorkOrder& wo : gOrders)
+        if (hasPropOrder && preferredOrderId > 0)
         {
-            if ((wo.status == "open" || wo.status == "claimed") && wo.itemEntry == itemEntry &&
-                wo.requesterGuid != low)
+            for (WorkOrder& wo : gOrders)
             {
-                wo.crafterGuid = low;
-                wo.crafterName = bot->GetName();
-                wo.status = "delivered";
-                wo.updatedAt = now;
-                matched = wo;
-                found = true;
-                break;
+                if (wo.id == preferredOrderId && (wo.status == "open" || wo.status == "claimed") &&
+                    wo.itemEntry == itemEntry && wo.requesterGuid != low)
+                {
+                    wo.crafterGuid = low;
+                    wo.crafterName = bot->GetName();
+                    wo.status = "delivered";
+                    wo.updatedAt = now;
+                    matched = wo;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (!found)
+        {
+            for (WorkOrder& wo : gOrders)
+            {
+                if ((wo.status == "open" || wo.status == "claimed") && wo.itemEntry == itemEntry &&
+                    wo.requesterGuid != low)
+                {
+                    wo.crafterGuid = low;
+                    wo.crafterName = bot->GetName();
+                    wo.status = "delivered";
+                    wo.updatedAt = now;
+                    matched = wo;
+                    found = true;
+                    break;
+                }
             }
         }
     }
@@ -815,6 +864,8 @@ void CompanionLife::OnCraftMade(Player* bot, uint32 itemEntry, std::string const
                 "updated_at = {} WHERE requester_guid = {} AND item_entry = {} AND status IN ('open', 'claimed') "
                 "ORDER BY id DESC LIMIT 1",
                 low, SqlEsc(bot->GetName()), now, matched.requesterGuid, matched.itemEntry);
+        if (hasPropOrder && propId > 0 && (matched.id == preferredOrderId || preferredOrderId == 0))
+            CompanionBrain::MarkProposalCompleted(low, propId, matched.quantity);
         RecordEventInternal(low, "work_order",
                             "Made " + name + " for " + matched.requesterName + " (guild work order)",
                             matched.requesterGuid, bot->GetZoneId());
@@ -1077,6 +1128,24 @@ bool CompanionLife::HasOpenWorkOrderFor(uint32 itemEntry, uint32 crafterGuid)
         if ((wo.status == "open" || wo.status == "claimed") && wo.itemEntry == itemEntry &&
             wo.requesterGuid != crafterGuid)
             return true;
+    return false;
+}
+
+bool CompanionLife::HasOpenWorkOrderById(uint64 orderId, uint32 crafterGuid, uint32& outItemEntry)
+{
+    outItemEntry = 0;
+    if (!sPlayerbotAIConfig.companionGuildLifeEnabled || !sPlayerbotAIConfig.companionGuildLifeWorkOrders || !orderId)
+        return false;
+    std::lock_guard<std::mutex> lock(gLifeMutex);
+    for (WorkOrder const& wo : gOrders)
+    {
+        if (wo.id == orderId && (wo.status == "open" || wo.status == "claimed") &&
+            wo.requesterGuid != crafterGuid && (wo.crafterGuid == 0 || wo.crafterGuid == crafterGuid))
+        {
+            outItemEntry = wo.itemEntry;
+            return true;
+        }
+    }
     return false;
 }
 

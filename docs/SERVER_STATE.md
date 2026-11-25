@@ -75,10 +75,12 @@ flowchart LR
 |---|---|---|
 | `companion_schedule` | 38-companion roster & shift windows | `name, shift_group, start_hour, end_hour, days_mask, always_online, note` |
 | `companion_profiles` | In-game lore / archetype metadata | `guid, name, archetype, culture, flaw, bio, updated_at` |
-| `companion_weights` | Bounded `0.5–1.5` activity weights read by `CompanionBrain` every 5m | `guid, key, value, updated_at, source` |
+| `companion_weights` | Canonical persona & manual baseline weights (NEVER overwritten by temporary AI plans) | `guid, key, value, updated_at, source` |
+| `companion_weight_overrides` | Expiring temporary AI session overrides with monotonic `revision` & `enabled` toggle (auto-expires back to baseline in C++) | `guid, key, value, plan_id, revision, source, enabled, created_at, expires_at` |
+| `companion_proposals` | Typed, versioned AI goal proposals validated & reported by native C++ (`proposed`/`accepted`/`executing`/`completed`/`rejected`/`interrupted`/`expired`, plus `advisory_only`) | `id, plan_id, guid, character_name, goal_id, goal_type, target_id, advisory_only, snapshot_rev, status, outcome_reason, created_at, expires_at, started_at, ended_at, active_seconds, progress_delta` |
 | `companion_bank_requests` | Guild vault target minimums farmed by `CompanionCraft::EvaluateGatherFarm` & `EvaluateFish` | `item_entry, requested_by, min_count, note, created_at` |
 | `companion_work_orders` | Guild crafting commissions (`open`/`claimed`/`delivered`) | `id, requester_guid, requester_name, crafter_guid, crafter_name, item_entry, item_name, quantity, story, status, created_at, updated_at` |
-| `companion_events` | Authoritative factual chronicle (`level_up`, `skill_milestone`, `boss_kill`, `work_order`, etc.) | `id, guid, event_type, summary, partner_guid, zone_id, created_at` |
+| `companion_events` | Authoritative factual chronicle (milestones retained permanently; routine events bounded at 250/char) | `id, guid, event_type, summary, partner_guid, zone_id, created_at` |
 | `companion_relationships` | Guild bonds & shared activity counters | `guid_a, guid_b, runs_together, wipes, help_given, loot_contests, affinity, last_event, updated_at` |
 | `companion_ledger` | Trade/bank/craft/train audit log | `id, time, guid, action, item, count, tab, note` |
 | `companion_rep_goals` | Long-term faction reputation targets | `guid, faction, target_rank, note` |
@@ -88,9 +90,11 @@ flowchart LR
 
 | Table | Purpose |
 |---|---|
-| `plans` | Full audit of every companion session plan, token usage, latency, applied C++ weights, and real in-game outcome deltas (`outcome_levels`, `outcome_xp`, `outcome_skillups`, `outcome_orders`). |
-| `quartermaster_runs` | Hourly Guild Quartermaster run logs, strategies, token usage, and applied order/bank-request counts. |
-| `intentions` | **Memory v1** open/completed character intentions (`skill_tier` breakpoints `75/150/225/300` and claimed `work_order` IDs), automatically reconciled against authoritative MySQL state each turn. |
+| `plans` | Audit of companion session plans (`plan_state='applied'|'shadow'`), token usage, latency, applied C++ weights, native `proposal_status`, and non-overlapping finalized goal-specific outcomes (`outcome_levels`, `outcome_xp`, `outcome_quests`, `outcome_skillups`, `outcome_orders`, `outcome_ledger_ops`). |
+| `api_ledger` | Shared transactional API budget ledger (`BEGIN IMMEDIATE`) across individual planner, Quartermaster, manual, and shadow runs (`reserved`/`ok`/`rejected`/`uncertain`/`error`), monthly USD ceiling + daily call cap. |
+| `quartermaster_runs` | Hourly Guild Quartermaster run logs (`is_shadow` isolated from live `quartermaster.json`). |
+| `intentions` | Open/completed character intentions (`skill_tier` breakpoints `75/150/225/300` and claimed `work_order` IDs), reconciled against authoritative MySQL state each turn. |
+| `event_journal` & `event_cursors` | Durable autobiographical event journal keyed by `companion_events.id` (`INSERT OR IGNORE`) with cursor checkpoints and honest gap detection. |
 
 ---
 

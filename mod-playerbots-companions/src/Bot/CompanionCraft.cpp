@@ -1362,8 +1362,15 @@ CompanionCraft::Recipe CompanionCraft::ChooseRecipe(Player* bot, std::string& re
                 allGuideMats = false;
         }
         r.rank = colorScore * 100.0f + (r.partyUse ? 20.0f : 0.0f) + r.gap * 0.1f + std::min(crafts, 10u) * 0.5f;
-        // Guild Life v2: prioritize crafting items that fulfill an open guildmate work order (+Craft Night bonus).
-        if (CompanionLife::HasOpenWorkOrderFor(product, bot->GetGUID().GetCounter()))
+        // Guild Life v2 + Native AI Proposal binding (Issue #3):
+        // Strongly prioritize an exact C++-validated guild work-order proposal, else generic open work order.
+        uint64 propId = 0;
+        uint64 propOrderId = 0;
+        uint32 propItemEntry = 0;
+        if (CompanionBrain::ActiveOrderProposal(bot->GetGUID().GetCounter(), propId, propOrderId, propItemEntry) &&
+            propItemEntry == product)
+            r.rank += 280.0f;
+        else if (CompanionLife::HasOpenWorkOrderFor(product, bot->GetGUID().GetCounter()))
             r.rank += 180.0f;
         r.rank += CompanionLife::WeeklyCraftBonus();
         if (sPlayerbotAIConfig.companionCraftGuideAligned)
