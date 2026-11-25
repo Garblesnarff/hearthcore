@@ -342,7 +342,7 @@ def call_claude_quartermaster(
 
     body: dict[str, Any] = {
         "model": use_model,
-        "max_tokens": 1800,
+        "max_tokens": 2800,
         "system": system,
         "messages": [{"role": "user", "content": json.dumps(user_payload, separators=(",", ":"))}],
     }

@@ -57,7 +57,7 @@ def anthropic_with_meta(p, snap, model: str | None = None, effort: str | None = 
 
     payload = {
         "model": use_model,
-        "max_tokens": 900,
+        "max_tokens": 1600,
         "system": system,
         "messages": [
             {
