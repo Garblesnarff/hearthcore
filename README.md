@@ -51,3 +51,9 @@ python3 -m hearthcore quartermaster-tick --provider anthropic
 ## Roadmap — Phase II (proposed)
 
 See [The Living Guild technical specification](docs/PHASE_II_LIVING_GUILD.md) and [implementation cards and verification](docs/PHASE_II_IMPLEMENTATION.md). Cooperative stock dungeon gameplay, opportunity admission, readiness, persona identity and performance testing are proposed; live rollout depends on verified Phase I issues #3–9 and explicit owner approval.
+
+### Phase II follow-up proposals
+
+- [Native Dungeon Finder-first amendment](docs/PHASE_II_RDF_AMENDMENT.md)
+- [Bracketed gear ambition engine](docs/GEAR_AMBITION_ENGINE.md)
+- [Measurement-first performance review](docs/PERFORMANCE_REVIEW.md)
