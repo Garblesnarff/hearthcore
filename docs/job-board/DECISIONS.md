@@ -63,3 +63,9 @@ The owner's decisions, copied from the board's "Decisions log" card and from the
 - Performance work is config first, measured, one group of changes at a time.
 - Two agents work on the server PC. Only one restarts the server at a time. Each agent records its config changes so that the other's rollback does not undo them.
 - The router port-forward is closed (card done 2026-11-22).
+
+**2026-11-25**
+- The tram move is approved as an instant platform-to-platform move, on the same terms as the boat move (issue #80).
+- The three fallback teleports that fire when a portal or area trigger refuses a companion are to be removed (issue #80). A companion walks to the trigger, and the leg fails if the game does not accept it.
+- The character name Logan may stay in the public repository.
+- A code audit added issues #52 to #86. See the issue list for the findings.
