@@ -2,7 +2,7 @@
   "slug": "inhedoka",
   "name": "Inhedoka",
   "game_guid": null,
-  "status": "planned",
+  "status": "active_companion",
   "race": "dwarf",
   "gender": "male",
   "class": "hunter",
@@ -30,5 +30,12 @@
     "dungeon"
   ],
   "session_minutes": 90,
-  "notes": "Initial preferences are proposals; verify in-game character details."
+  "notes": "Outdoorsy dwarf hunter who knows every path in Dun Morogh.",
+  "shift_group": "afternoon-crew",
+  "archetype": "Wayfinder",
+  "culture": "social",
+  "professions": [
+    "Engineering",
+    "Skinning"
+  ]
 }

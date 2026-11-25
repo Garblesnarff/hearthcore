@@ -2,7 +2,7 @@
   "slug": "giggle",
   "name": "Giggle",
   "game_guid": null,
-  "status": "planned",
+  "status": "active_companion",
   "race": "dwarf",
   "gender": "female",
   "class": "paladin",
@@ -30,5 +30,12 @@
     "quest"
   ],
   "session_minutes": 90,
-  "notes": "Initial preferences are proposals; verify in-game character details."
+  "notes": "Bright-spirited paladin who cheers up the whole guild.",
+  "shift_group": "midday-crew",
+  "archetype": "Helpful Neighbor",
+  "culture": "social",
+  "professions": [
+    "Blacksmithing",
+    "Mining"
+  ]
 }

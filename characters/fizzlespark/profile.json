@@ -1,0 +1,41 @@
+{
+  "slug": "fizzlespark",
+  "name": "Fizzlespark",
+  "game_guid": null,
+  "status": "active_companion",
+  "race": "gnome",
+  "gender": "female",
+  "class": "mage",
+  "primary_spec": "Arcane",
+  "primary_role": "damage",
+  "shift_group": "night-owls",
+  "archetype": "Artisan",
+  "culture": "social",
+  "professions": [
+    "Tailoring",
+    "Enchanting"
+  ],
+  "preferences": {
+    "quest": 1.0,
+    "dungeon": 1.0,
+    "gear": 1.0,
+    "profession": 1.3,
+    "gather": 1.15,
+    "craft": 1.3,
+    "train": 1.0,
+    "bank": 1.0,
+    "repair": 1.0,
+    "travel": 1.0,
+    "fish": 1.0,
+    "explore": 1.0,
+    "rest": 1.0,
+    "guild_order": 1.25
+  },
+  "motivations": [
+    "craft",
+    "profession",
+    "guild_order"
+  ],
+  "session_minutes": 120,
+  "notes": "Inventive gnome mage who builds fun contraptions."
+}

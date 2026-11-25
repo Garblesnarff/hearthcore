@@ -1,0 +1,41 @@
+{
+  "slug": "kraghammer",
+  "name": "Kraghammer",
+  "game_guid": null,
+  "status": "active_companion",
+  "race": "dwarf",
+  "gender": "male",
+  "class": "warrior",
+  "primary_spec": "Protection",
+  "primary_role": "tank",
+  "shift_group": "prime-time",
+  "archetype": "Artisan",
+  "culture": "progression",
+  "professions": [
+    "Blacksmithing",
+    "Mining"
+  ],
+  "preferences": {
+    "quest": 1.0,
+    "dungeon": 1.0,
+    "gear": 1.0,
+    "profession": 1.3,
+    "gather": 1.15,
+    "craft": 1.3,
+    "train": 1.0,
+    "bank": 1.0,
+    "repair": 1.0,
+    "travel": 1.0,
+    "fish": 1.0,
+    "explore": 1.0,
+    "rest": 1.0,
+    "guild_order": 1.25
+  },
+  "motivations": [
+    "craft",
+    "profession",
+    "guild_order"
+  ],
+  "session_minutes": 120,
+  "notes": "Hardworking dwarf blacksmith who loves forging weapons."
+}

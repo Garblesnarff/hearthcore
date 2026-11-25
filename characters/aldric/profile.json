@@ -4,10 +4,10 @@
   "game_guid": null,
   "status": "active_companion",
   "race": "draenei",
-  "gender": null,
+  "gender": "male",
   "class": "paladin",
-  "primary_spec": "Retribution",
-  "primary_role": "damage",
+  "primary_spec": "Holy",
+  "primary_role": "healer",
   "preferences": {
     "quest": 1,
     "dungeon": 1.1,
@@ -30,5 +30,12 @@
     "dungeon"
   ],
   "session_minutes": 90,
-  "notes": "Initial preferences are proposals; verify in-game character details."
+  "notes": "Calm paladin healer who always keeps potions stocked.",
+  "shift_group": "core-wonky",
+  "archetype": "Ritualist",
+  "culture": "progression",
+  "professions": [
+    "Alchemy",
+    "Herbalism"
+  ]
 }

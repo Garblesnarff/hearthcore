@@ -2,8 +2,8 @@
   "slug": "zodax",
   "name": "Zodax",
   "game_guid": null,
-  "status": "planned",
-  "race": null,
+  "status": "active_companion",
+  "race": "night elf",
   "gender": "male",
   "class": "druid",
   "primary_spec": "Feral",
@@ -30,5 +30,12 @@
     "explore"
   ],
   "session_minutes": 90,
-  "notes": "Initial preferences are proposals; verify in-game character details."
+  "notes": "Quiet night elf druid who loves long forest journeys.",
+  "shift_group": "midday-crew",
+  "archetype": "Wayfinder",
+  "culture": "social",
+  "professions": [
+    "Leatherworking",
+    "Skinning"
+  ]
 }

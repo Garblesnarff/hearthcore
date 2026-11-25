@@ -1,0 +1,41 @@
+{
+  "slug": "nightstep",
+  "name": "Nightstep",
+  "game_guid": null,
+  "status": "active_companion",
+  "race": "night elf",
+  "gender": "female",
+  "class": "rogue",
+  "primary_spec": "Assassination",
+  "primary_role": "damage",
+  "shift_group": "prime-time",
+  "archetype": "Frugal",
+  "culture": "pvp",
+  "professions": [
+    "Leatherworking",
+    "Skinning"
+  ],
+  "preferences": {
+    "quest": 1.1,
+    "dungeon": 1.0,
+    "gear": 1.0,
+    "profession": 1.0,
+    "gather": 1.15,
+    "craft": 1.1,
+    "train": 1.0,
+    "bank": 1.25,
+    "repair": 1.25,
+    "travel": 1.0,
+    "fish": 1.0,
+    "explore": 1.0,
+    "rest": 1.0,
+    "guild_order": 1.0
+  },
+  "motivations": [
+    "bank",
+    "repair",
+    "gather"
+  ],
+  "session_minutes": 105,
+  "notes": "Thrifty night elf rogue who saves every copper."
+}

@@ -1,0 +1,41 @@
+{
+  "slug": "bramblepaw",
+  "name": "Bramblepaw",
+  "game_guid": null,
+  "status": "active_companion",
+  "race": "night elf",
+  "gender": "male",
+  "class": "druid",
+  "primary_spec": "Feral",
+  "primary_role": "tank",
+  "shift_group": "core-logan",
+  "archetype": "Helpful Neighbor",
+  "culture": "social",
+  "professions": [
+    "Leatherworking",
+    "Skinning"
+  ],
+  "preferences": {
+    "quest": 1.15,
+    "dungeon": 1.15,
+    "gear": 1.0,
+    "profession": 1.0,
+    "gather": 1.1,
+    "craft": 1.1,
+    "train": 1.0,
+    "bank": 1.0,
+    "repair": 1.0,
+    "travel": 1.0,
+    "fish": 1.15,
+    "explore": 1.0,
+    "rest": 1.0,
+    "guild_order": 1.25
+  },
+  "motivations": [
+    "guild_order",
+    "quest",
+    "dungeon"
+  ],
+  "session_minutes": 150,
+  "notes": "Gentle bear tank watching out for Logan on every road."
+}

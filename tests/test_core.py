@@ -4,10 +4,13 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from hearthcore.bridge import weights_for_cpp
 from hearthcore.core import Invalid, fallback, profile, profiles, snapshot, validate
+from hearthcore.provider import _strip_json_fences
 from hearthcore.store import record
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "brannoc.json"
+
 
 class CoreTests(unittest.TestCase):
     def setUp(self):
@@ -15,8 +18,9 @@ class CoreTests(unittest.TestCase):
         self.s = snapshot(json.loads(EXAMPLE.read_text()), "brannoc")
 
     def test_profiles(self):
-        self.assertEqual(len(profiles()), 11)
-        for slug in profiles():
+        all_slugs = profiles()
+        self.assertEqual(len(all_slugs), 38)
+        for slug in all_slugs:
             profile(slug)
 
     def test_fallback(self):
@@ -56,3 +60,36 @@ class CoreTests(unittest.TestCase):
             record(path, fallback(self.p, self.s), "fallback", self.s["observed_at"])
             with sqlite3.connect(path) as db:
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM proposals").fetchone()[0], 1)
+
+    def test_cpp_weights_bounds(self):
+        plan = fallback(self.p, self.s)
+        w = weights_for_cpp(plan, self.s)
+        self.assertIn("quest_work", w)
+        self.assertIn("craft", w)
+        for k, v in w.items():
+            self.assertTrue(0.5 <= v <= 1.5, f"{k}={v}")
+
+    def test_strip_json_fences(self):
+        self.assertEqual(_strip_json_fences('```json\n{"a":1}\n```'), '{"a":1}')
+
+    def test_supply_report_and_quartermaster_fallback(self):
+        from hearthcore.guides import compute_supply_report
+        from hearthcore.quartermaster import _fallback_quartermaster, build_eligible_menus
+
+        chars = [
+            {"guid": 1, "name": "Wonky", "level": 30, "online": True, "skills": {333: (100, 150), 185: (138, 150)}},
+            {"guid": 2, "name": "Logan", "level": 10, "online": False, "skills": {164: (5, 75), 186: (10, 75)}},
+        ]
+        sup = compute_supply_report(chars, {2840: 20})
+        self.assertEqual(sup["characters_analyzed"], 2)
+        copper = next(m for m in sup["materials"] if m["item_entry"] == 2840)
+        self.assertEqual(copper["vault_have"], 20)
+        self.assertGreater(copper["active_deficit"], 0)
+
+        st = {"characters": chars, "vault_counts": {2840: 20}, "open_orders": [], "supply": sup}
+        om, bm = build_eligible_menus(st)
+        self.assertTrue(any(o["item_entry"] == 21072 for o in om))  # Smoked Sagefish
+        self.assertTrue(any(o["item_entry"] == 20744 for o in om))  # Minor Wizard Oil
+        fb = _fallback_quartermaster(om, bm, 6)
+        self.assertEqual(len(fb["work_orders"]), 6)
+        self.assertGreater(len(fb["bank_requests"]), 0)

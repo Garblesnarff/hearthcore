@@ -2,7 +2,7 @@
   "slug": "quis",
   "name": "Quis",
   "game_guid": null,
-  "status": "planned",
+  "status": "active_companion",
   "race": "human",
   "gender": "female",
   "class": "paladin",
@@ -30,5 +30,12 @@
     "train"
   ],
   "session_minutes": 90,
-  "notes": "Initial preferences are proposals; verify in-game character details."
+  "notes": "Organized paladin who keeps guild supplies neat.",
+  "shift_group": "midday-crew",
+  "archetype": "Quartermaster",
+  "culture": "progression",
+  "professions": [
+    "Alchemy",
+    "Herbalism"
+  ]
 }

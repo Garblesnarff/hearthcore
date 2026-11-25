@@ -1,0 +1,41 @@
+{
+  "slug": "mirella",
+  "name": "Mirella",
+  "game_guid": null,
+  "status": "active_companion",
+  "race": "human",
+  "gender": "female",
+  "class": "priest",
+  "primary_spec": "Holy",
+  "primary_role": "healer",
+  "shift_group": "night-owls",
+  "archetype": "Helpful Neighbor",
+  "culture": "social",
+  "professions": [
+    "Tailoring",
+    "Enchanting"
+  ],
+  "preferences": {
+    "quest": 1.15,
+    "dungeon": 1.15,
+    "gear": 1.0,
+    "profession": 1.0,
+    "gather": 1.0,
+    "craft": 1.1,
+    "train": 1.0,
+    "bank": 1.0,
+    "repair": 1.0,
+    "travel": 1.0,
+    "fish": 1.15,
+    "explore": 1.0,
+    "rest": 1.0,
+    "guild_order": 1.25
+  },
+  "motivations": [
+    "guild_order",
+    "quest",
+    "dungeon"
+  ],
+  "session_minutes": 120,
+  "notes": "Warm human priest who loves helping low-level adventurers."
+}

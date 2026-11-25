@@ -2,11 +2,11 @@
   "slug": "roehl",
   "name": "Roehl",
   "game_guid": null,
-  "status": "planned",
-  "race": null,
-  "gender": null,
+  "status": "active_companion",
+  "race": "draenei",
+  "gender": "male",
   "class": "shaman",
-  "primary_spec": null,
+  "primary_spec": "Enhancement",
   "primary_role": "damage",
   "preferences": {
     "quest": 1.1,
@@ -30,5 +30,12 @@
     "quest"
   ],
   "session_minutes": 90,
-  "notes": "Initial preferences are proposals; verify in-game character details."
+  "notes": "Sturdy enhancement shaman who guards the flank.",
+  "shift_group": "afternoon-crew",
+  "archetype": "Sentinel",
+  "culture": "pvp",
+  "professions": [
+    "Leatherworking",
+    "Skinning"
+  ]
 }

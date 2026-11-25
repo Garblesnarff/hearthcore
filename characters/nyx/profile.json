@@ -1,0 +1,41 @@
+{
+  "slug": "nyx",
+  "name": "Nyx",
+  "game_guid": null,
+  "status": "active_companion",
+  "race": "night elf",
+  "gender": "female",
+  "class": "priest",
+  "primary_spec": "Shadow",
+  "primary_role": "damage",
+  "shift_group": "weekend-raiders",
+  "archetype": "Ritualist",
+  "culture": "social",
+  "professions": [
+    "Tailoring",
+    "Enchanting"
+  ],
+  "preferences": {
+    "quest": 1.0,
+    "dungeon": 1.15,
+    "gear": 1.0,
+    "profession": 1.2,
+    "gather": 1.0,
+    "craft": 1.1,
+    "train": 1.0,
+    "bank": 1.0,
+    "repair": 1.15,
+    "travel": 1.0,
+    "fish": 1.2,
+    "explore": 1.0,
+    "rest": 1.0,
+    "guild_order": 1.0
+  },
+  "motivations": [
+    "profession",
+    "fish",
+    "dungeon"
+  ],
+  "session_minutes": 120,
+  "notes": "Calm night elf priest who keeps a steady rhythm."
+}
