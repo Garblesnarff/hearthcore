@@ -333,10 +333,42 @@ class Batch3And4P2Tests(unittest.TestCase):
                 db.execute("UPDATE plans SET outcome_skillups = 0 WHERE id = ?", (pid_ho,))
 
             report = store.ab_outcome_report(days=14, now_ts=1_800_000_100)
+            self.assertEqual(report["holdout_pct"], 0)
             self.assertIn("anthropic", report["by_source"])
             self.assertIn("fallback_holdout", report["by_source"])
             self.assertGreater(report["by_source"]["anthropic"]["cost_per_session_usd"], 0.0)
             self.assertEqual(report["by_source"]["fallback_holdout"]["cost_per_session_usd"], 0.0)
+            self.assertEqual(report["recommendation"]["status"], "insufficient_data")
+
+            # Verify recommend_planner_tuning covers all 4 decision regimes
+            from hearthcore.bridge import recommend_planner_tuning
+            r_strong = recommend_planner_tuning({
+                "holdout_pct": 10,
+                "by_source": {
+                    "anthropic": {"sessions": 20, "progress_rate": 0.80, "cost_per_session_usd": 0.005},
+                    "fallback_holdout": {"sessions": 15, "progress_rate": 0.60, "cost_per_session_usd": 0.0},
+                },
+            })
+            self.assertEqual(r_strong["status"], "strong_ai_lift")
+            self.assertEqual(r_strong["lift_pp"], 20.0)
+
+            r_marg = recommend_planner_tuning({
+                "holdout_pct": 10,
+                "by_source": {
+                    "anthropic": {"sessions": 20, "progress_rate": 0.65, "cost_per_session_usd": 0.01},
+                    "fallback_holdout": {"sessions": 15, "progress_rate": 0.60, "cost_per_session_usd": 0.0},
+                },
+            })
+            self.assertEqual(r_marg["status"], "marginal_lift_optimize_cost")
+
+            r_none = recommend_planner_tuning({
+                "holdout_pct": 10,
+                "by_source": {
+                    "anthropic": {"sessions": 20, "progress_rate": 0.50, "cost_per_session_usd": 0.01},
+                    "fallback_holdout": {"sessions": 15, "progress_rate": 0.55, "cost_per_session_usd": 0.0},
+                },
+            })
+            self.assertEqual(r_none["status"], "no_measured_lift")
 
     # ------------------------------------------------------------------
     # Issue #72: Dashboard non-ASCII token safety, session revocation, CSP, separate 0600 overrides & collector signaling

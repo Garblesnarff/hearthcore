@@ -1784,12 +1784,77 @@ class BrainStore:
             entry["total_cost_usd"] = round(entry["total_cost_usd"], 4)
             entry["cost_per_session_usd"] = round(entry["total_cost_usd"] / cnt, 5)
 
-        return {
+        report = {
             "window_days": int(days),
             "holdout_pct": int(os.getenv("HEARTHCORE_FALLBACK_HOLDOUT_PCT", str(DEFAULT_FALLBACK_HOLDOUT_PCT)) or 0),
             "by_source": by_source,
             "by_goal_type": by_goal_type,
         }
+        report["recommendation"] = recommend_planner_tuning(report)
+        return report
+
+
+def recommend_planner_tuning(ab_report: dict[str, Any], *, min_samples: int = 10) -> dict[str, Any]:
+    """Turn measured AI-vs-fallback A/B outcomes into concrete model/effort/holdout tuning advice (Issue #65)."""
+    by_source = ab_report.get("by_source") or {}
+    holdout_pct = int(ab_report.get("holdout_pct") or 0)
+    ai = by_source.get("anthropic")
+    base = by_source.get("fallback_holdout") or by_source.get("fallback")
+
+    ai_n = int((ai or {}).get("sessions") or 0)
+    base_n = int((base or {}).get("sessions") or 0)
+    if ai_n < min_samples or base_n < min_samples:
+        if holdout_pct <= 0 and base_n < min_samples:
+            action = (
+                "Holdout is currently OFF (0%). Opt in with HEARTHCORE_FALLBACK_HOLDOUT_PCT=10 "
+                "for 7 days to collect a comparable fallback baseline before tuning."
+            )
+        else:
+            action = (
+                f"Collect at least {min_samples} sessions per arm "
+                f"(currently ai={ai_n}, baseline={base_n}) before changing model or effort."
+            )
+        return {
+            "status": "insufficient_data",
+            "lift_pp": None,
+            "ai_cost_per_session_usd": float((ai or {}).get("cost_per_session_usd") or 0.0),
+            "action": action,
+        }
+
+    ai_rate = float(ai.get("progress_rate") or 0.0)
+    base_rate = float(base.get("progress_rate") or 0.0)
+    lift = round((ai_rate - base_rate) * 100.0, 1)
+    cost_per_sess = float(ai.get("cost_per_session_usd") or 0.0)
+
+    if lift >= 10.0:
+        return {
+            "status": "strong_ai_lift",
+            "lift_pp": lift,
+            "ai_cost_per_session_usd": cost_per_sess,
+            "action": (
+                f"Keep current AI model/effort: AI outperforms fallback by +{lift:.1f} pp "
+                f"at ${cost_per_sess:.4f}/session."
+            ),
+        }
+    if lift >= 2.0:
+        return {
+            "status": "marginal_lift_optimize_cost",
+            "lift_pp": lift,
+            "ai_cost_per_session_usd": cost_per_sess,
+            "action": (
+                f"Modest +{lift:.1f} pp AI lift at ${cost_per_sess:.4f}/session: "
+                "test claude-haiku-5-5 or ANTHROPIC_EFFORT=low / longer session intervals to improve ROI."
+            ),
+        }
+    return {
+        "status": "no_measured_lift",
+        "lift_pp": lift,
+        "ai_cost_per_session_usd": cost_per_sess,
+        "action": (
+            f"No positive AI lift measured ({lift:+.1f} pp vs fallback at ${cost_per_sess:.4f}/session): "
+            "audit prompt/candidate quality, lower ANTHROPIC_EFFORT=low, or widen deterministic fallback."
+        ),
+    }
 
 
 def is_fallback_holdout(slug: str, day_key: str, *, holdout_pct: int | None = None) -> bool:

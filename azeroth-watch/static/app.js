@@ -1237,6 +1237,36 @@
       qmPanel.style.display = "none";
     }
 
+    // Issue #65: AI vs Fallback A/B outcome & cost panel
+    const abPanel = $("ab-panel");
+    const abRep = ab.ab_report;
+    if (abPanel && abRep && abRep.by_source && Object.keys(abRep.by_source).length > 0) {
+      abPanel.style.display = "";
+      const hoPct = Number(abRep.holdout_pct || 0);
+      $("ab-holdout-badge").textContent = `Holdout ${hoPct}% · ${abRep.window_days || 14}d`;
+      const rec = abRep.recommendation || {};
+      $("ab-tuning-advice").textContent = rec.action || "";
+      const abRows = Object.entries(abRep.by_source)
+        .sort((a, b) => (b[1].sessions || 0) - (a[1].sessions || 0))
+        .map(([src, m]) => {
+          const pct = Math.round(Number(m.progress_rate || 0) * 100);
+          return `
+            <tr>
+              <td><b>${esc(src)}</b></td>
+              <td class="num mono">${Number(m.sessions || 0)}</td>
+              <td class="num mono" style="color:${pct >= 50 ? "var(--green)" : "var(--amber)"}">${pct}%</td>
+              <td class="num mono">${Number(m.stalled || 0)}</td>
+              <td class="num mono">${Number(m.avg_skillups || 0).toFixed(2)}</td>
+              <td class="num mono">$${Number(m.total_cost_usd || 0).toFixed(4)}</td>
+              <td class="num mono">$${Number(m.cost_per_session_usd || 0).toFixed(5)}</td>
+            </tr>`;
+        })
+        .join("");
+      setHtmlIfChanged($("ab-tbody"), abRows);
+    } else if (abPanel) {
+      abPanel.style.display = "none";
+    }
+
     const bySlug = {};
     for (const c of d.companions || []) bySlug[c.name.toLowerCase()] = c;
     const mem = ab.memory || {};
