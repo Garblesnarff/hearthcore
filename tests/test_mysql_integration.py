@@ -96,6 +96,89 @@ class MySQLIntegrationTests(unittest.TestCase):
         self.assertEqual(rows[0][1], "a\tb\nc\rd\u2028e")
         self.assertIsNone(rows[0][2])
 
+    def test_least_privilege_users_enforce_grants_and_deny_forbidden_ops(self):
+        import subprocess
+
+        host = os.environ["HEARTHCORE_DB_HOST"]
+        port = os.environ.get("HEARTHCORE_DB_PORT", "3306")
+        root_pw = os.environ["HEARTHCORE_DB_PASSWORD"]
+        env_root = dict(os.environ, MYSQL_PWD=root_pw)
+
+        # Create minimal stub acore_characters/acore_auth/acore_world schemas on the throwaway CI MySQL
+        stub_ddl = """
+        CREATE DATABASE IF NOT EXISTS acore_characters;
+        CREATE DATABASE IF NOT EXISTS acore_auth;
+        CREATE DATABASE IF NOT EXISTS acore_world;
+        CREATE TABLE IF NOT EXISTS acore_characters.characters (guid INT PRIMARY KEY, name VARCHAR(32));
+        CREATE TABLE IF NOT EXISTS acore_characters.character_skills (guid INT, skill INT, value INT, max INT);
+        CREATE TABLE IF NOT EXISTS acore_characters.character_queststatus_rewarded (guid INT, quest INT);
+        CREATE TABLE IF NOT EXISTS acore_characters.guild_bank_item (guildid INT, item_guid INT);
+        CREATE TABLE IF NOT EXISTS acore_characters.guild_member (guildid INT, guid INT);
+        CREATE TABLE IF NOT EXISTS acore_characters.item_instance (guid INT, itemEntry INT, count INT);
+        CREATE TABLE IF NOT EXISTS acore_auth.account (id INT PRIMARY KEY, username VARCHAR(32), verifier VARBINARY(32));
+        CREATE TABLE IF NOT EXISTS acore_auth.realmlist (id INT PRIMARY KEY, name VARCHAR(32), address VARCHAR(32), port INT, flag INT);
+        CREATE TABLE IF NOT EXISTS acore_world.item_template (entry INT PRIMARY KEY, name VARCHAR(64));
+        CREATE TABLE IF NOT EXISTS acore_world.player_xp_for_level (level INT PRIMARY KEY, Experience INT);
+        INSERT IGNORE INTO acore_auth.account (id, username, verifier) VALUES (1, 'Tester', UNHEX('AABBCC'));
+        """
+        schema_sql = (ROOT / "ops" / "sql" / "companion_schema.sql").read_text(encoding="utf-8")
+        users_sql = (ROOT / "ops" / "sql" / "create_least_priv_users.sql").read_text(encoding="utf-8")
+        brain_pw = "BrainTestPass1234567890!"
+        watch_pw = "WatchTestPass1234567890!"
+
+        # Discover exact client host IP seen by MySQL container (e.g. 172.18.0.1 in CI Docker bridge)
+        client_host_res = subprocess.run(
+            ["mysql", f"-h{host}", f"-P{port}", "-uroot", "-N", "-B", "-e", "SELECT SUBSTRING_INDEX(USER(), '@', -1);"],
+            check=True,
+            capture_output=True,
+            env=env_root,
+        )
+        client_host = client_host_res.stdout.decode("utf-8").strip() or "127.0.0.1"
+
+        subprocess.run(
+            ["mysql", f"-h{host}", f"-P{port}", "-uroot"],
+            input=(
+                stub_ddl
+                + "\nUSE acore_characters;\n"
+                + schema_sql
+                + f"\nSET @client_host='{client_host}'; SET @brain_pw='{brain_pw}'; SET @watch_pw='{watch_pw}';\n"
+                + users_sql
+            ).encode("utf-8"),
+            check=True,
+            capture_output=True,
+            env=env_root,
+        )
+
+        def run_as(user: str, pw: str, sql: str):
+            return subprocess.run(
+                ["mysql", f"-h{host}", f"-P{port}", f"-u{user}", "-N", "-B"],
+                input=sql.encode("utf-8"),
+                capture_output=True,
+                env=dict(os.environ, MYSQL_PWD=pw),
+            )
+
+        # 1. azeroth_watch CAN read allowed columns and CANNOT read account.verifier or write anything!
+        r_ok = run_as("azeroth_watch", watch_pw, "SELECT id, username FROM acore_auth.account;")
+        self.assertEqual(r_ok.returncode, 0, r_ok.stderr.decode())
+        r_col = run_as("azeroth_watch", watch_pw, "SELECT verifier FROM acore_auth.account;")
+        self.assertNotEqual(r_col.returncode, 0, "azeroth_watch MUST NOT read account.verifier!")
+        r_wr = run_as("azeroth_watch", watch_pw, "INSERT INTO acore_characters.companion_bank_requests (item_entry, requested_by, min_count, note) VALUES (1, 'x', 1, 'x');")
+        self.assertNotEqual(r_wr.returncode, 0, "azeroth_watch MUST be strictly SELECT-only!")
+
+        # 2. hearthcore_brain CAN write companion_weight_overrides and CANNOT write characters or companion_weights!
+        r_b_ok = run_as(
+            "hearthcore_brain", brain_pw,
+            "INSERT INTO acore_characters.companion_weight_overrides (guid, `key`, value, plan_id, revision, source, enabled, created_at, expires_at) "
+            "VALUES (101, 'craft', 1.2, 1, 1, 'hearthcore_ai', 1, 1, 1900000000) ON DUPLICATE KEY UPDATE value=1.2;",
+        )
+        self.assertEqual(r_b_ok.returncode, 0, r_b_ok.stderr.decode())
+        r_b_deny_chars = run_as("hearthcore_brain", brain_pw, "INSERT INTO acore_characters.characters (guid, name) VALUES (999, 'Hack');")
+        self.assertNotEqual(r_b_deny_chars.returncode, 0, "hearthcore_brain MUST NOT write characters!")
+        r_b_deny_canon = run_as("hearthcore_brain", brain_pw, "INSERT INTO acore_characters.companion_weights (guid, `key`, value, source) VALUES (101, 'craft', 1.5, 'manual');")
+        self.assertNotEqual(r_b_deny_canon.returncode, 0, "hearthcore_brain MUST NOT write canonical companion_weights!")
+        r_b_deny_ver = run_as("hearthcore_brain", brain_pw, "SELECT verifier FROM acore_auth.account;")
+        self.assertNotEqual(r_b_deny_ver.returncode, 0, "hearthcore_brain MUST NOT read account.verifier!")
+
 
 if __name__ == "__main__":
     unittest.main()

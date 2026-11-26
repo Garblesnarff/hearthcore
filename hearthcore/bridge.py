@@ -289,13 +289,21 @@ def run_sql(sql: str, *, timeout: float | None = None, expected_cols: int | None
     db_user = os.getenv("HEARTHCORE_DB_USER", "").strip()
     db_pass = os.getenv("HEARTHCORE_DB_PASSWORD", "")
     defaults_file = os.getenv("HEARTHCORE_DB_DEFAULTS_FILE", "").strip()
+    container_defaults = os.getenv("HEARTHCORE_DB_CONTAINER_DEFAULTS_FILE", "").strip()
 
     # Use raw bytes (NOT text=True universal newlines!) so lone '\r' in MySQL text columns
     # is NEVER translated into '\n' and cannot split a row (Issue #62).
     sql_bytes = sql.encode("utf-8")
     if defaults_file:
-        # Safest path: chmod-600 MySQL option file (zero password in env or argv)
+        # Safest host-TCP path: chmod-600 MySQL option file (zero password in env or argv)
         cmd = ["mysql", f"--defaults-extra-file={defaults_file}", "-N", "-B", db_name]
+        res = subprocess.run(cmd, input=sql_bytes, capture_output=True, check=True, timeout=max(1.0, use_timeout))
+    elif container_defaults:
+        # Least-privilege user inside DB container via chmod-600 option file (zero root, zero password on argv!)
+        cmd = [
+            "docker", "exec", "-i", DB_CONTAINER,
+            "mysql", f"--defaults-extra-file={container_defaults}", "-N", "-B", db_name,
+        ]
         res = subprocess.run(cmd, input=sql_bytes, capture_output=True, check=True, timeout=max(1.0, use_timeout))
     elif db_host:
         # Direct TCP mysql client with MYSQL_PWD in child env ONLY (never on argv)
