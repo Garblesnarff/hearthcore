@@ -573,7 +573,7 @@ class AzerothCollector:
         )
         realm = {
             "name": realm_rows[0][0] if realm_rows else "AzerothCore",
-            "address": realm_rows[0][1] if realm_rows else "192.168.1.3",
+            "address": realm_rows[0][1] if realm_rows else os.getenv("AZEROTH_REALM_FALLBACK_HOST", "127.0.0.1"),
             "port": int(realm_rows[0][2]) if realm_rows else 8085,
             "flag": int(realm_rows[0][3]) if realm_rows else 2,
         }

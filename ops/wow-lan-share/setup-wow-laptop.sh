@@ -8,12 +8,16 @@
 #        SERVER_IP=<SERVER_IP> SHARE_TOKEN="<TOKEN>" bash setup-wow-laptop.sh
 set -euo pipefail
 
-SERVER_IP="${SERVER_IP:-192.168.1.3}"
+SERVER_IP="${SERVER_IP:-}"
 SHARE_PORT="${SHARE_PORT:-8788}"
 SHARE_TOKEN="${SHARE_TOKEN:-}"
 WOW_DIR="${HOME}/WoW335a"
 WINE_DIR="${HOME}/wine-wotlk"
 
+if [[ -z "${SERVER_IP}" ]]; then
+  echo "ERROR: SERVER_IP is required (e.g., SERVER_IP=192.168.1.3)." >&2
+  exit 1
+fi
 if [[ -z "${SHARE_TOKEN}" ]]; then
   echo "ERROR: SHARE_TOKEN is required (printed by on-demand serve.py)." >&2
   exit 1
