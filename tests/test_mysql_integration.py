@@ -331,6 +331,43 @@ class MySQLIntegrationTests(unittest.TestCase):
         self.assertEqual(rows2["craft"], (1.15, "hearthcore"))
         self.assertEqual(rows2["gather"], (1.30, "hearthcore"))
 
+    def test_issue75_restore_drill_actually_restores_into_throwaway_mysql_db(self):
+        import gzip
+        import subprocess
+        import tarfile
+
+        schema_sql = (ROOT / "ops" / "sql" / "companion_schema.sql").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            tp = Path(tmp)
+            stage = tp / "stage"
+            stage.mkdir()
+            (stage / "env").write_text("DRILL=1\n", encoding="utf-8")
+            with gzip.open(stage / "database.sql.gz", "wb") as gz:
+                gz.write(
+                    (
+                        "CREATE DATABASE IF NOT EXISTS `acore_characters`;\n"
+                        "USE `acore_characters`;\n"
+                        + schema_sql
+                        + "\n-- Dump completed on 2026-11-25 04:00:00\n"
+                    ).encode("utf-8")
+                )
+            bundle = tp / "acore-20261125-drill.tar"
+            with tarfile.open(bundle, "w") as tf:
+                tf.add(stage / "database.sql.gz", arcname="database.sql.gz")
+                tf.add(stage / "env", arcname="env")
+
+            res = subprocess.run(
+                ["bash", str(ROOT / "ops" / "restore-drill.sh"), "--mysql-restore-test", str(bundle)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(res.returncode, 0, f"stderr={res.stderr}\nstdout={res.stdout}")
+            self.assertIn("MySQL restore drill verified:", res.stdout)
+            self.assertIn("PASS:", res.stdout)
+
+            # Verify throwaway drill DB was cleanly dropped!
+            leftover = run_sql("SHOW DATABASES LIKE 'hearthcore_restore_drill_%';")
+            self.assertEqual(leftover, [], f"Throwaway drill DB was not cleaned up: {leftover}")
+
 
 if __name__ == "__main__":
     unittest.main()

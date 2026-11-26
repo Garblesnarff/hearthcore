@@ -486,17 +486,69 @@ class Batch3And4P2Tests(unittest.TestCase):
             self.assertEqual(r_heal.returncode, 0)
             self.assertIn("Maintenance flag present", r_heal.stdout)
 
-        # 3. Backup & restore-drill scripts present and valid bash syntax
-        for script in ("backup.sh", "restore-drill.sh", "sync-monorepo.sh", "heal-realmlist.sh"):
-            chk = subprocess.run(["bash", "-n", str(ROOT / "ops" / script)], capture_output=True, text=True)
-            self.assertEqual(chk.returncode, 0, f"Syntax error in {script}: {chk.stderr}")
+        # 3. REAL behavioral restore-drill test (replaces hollow bash -n check!):
+        #    Build a real .tar bundle with gzipped SQL + SQLite brain.db + env, verify PASS on valid
+        #    bundle and FAIL on corrupted/truncated SQL archive!
+        import gzip
+        import sqlite3
+        import tarfile
 
-        # 4. Systemd hardening directives present
-        for unit in ("azeroth-watch.service", "hearthcore-brain.service", "hearthcore-quartermaster.service", "hearthcore-perf-check.service"):
+        with tempfile.TemporaryDirectory() as tmp:
+            tp = Path(tmp)
+            stage = tp / "stage"
+            stage.mkdir()
+            (stage / "env").write_text("EXAMPLE=1\n", encoding="utf-8")
+            with gzip.open(stage / "database.sql.gz", "wb") as gz:
+                gz.write(b"CREATE TABLE t1 (id INT PRIMARY KEY);\n-- Dump completed on 2026-11-25\n")
+            bdb = stage / "brain.db"
+            conn = sqlite3.connect(bdb)
+            conn.execute("CREATE TABLE plans (id INTEGER PRIMARY KEY, slug TEXT);")
+            conn.execute("INSERT INTO plans (id, slug) VALUES (1, 'brannoc');")
+            conn.commit()
+            conn.close()
+
+            good_tar = tp / "acore-20261125-040000.tar"
+            with tarfile.open(good_tar, "w") as tf:
+                for fn in ("database.sql.gz", "env", "brain.db"):
+                    tf.add(stage / fn, arcname=fn)
+
+            r_ok = subprocess.run(
+                ["bash", str(ROOT / "ops" / "restore-drill.sh"), str(good_tar)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(r_ok.returncode, 0, f"stderr={r_ok.stderr}\nstdout={r_ok.stdout}")
+            self.assertIn("plans=1", r_ok.stdout)
+            self.assertIn("PASS:", r_ok.stdout)
+
+            # Truncated SQL without 'Dump completed' footer MUST FAIL!
+            with gzip.open(stage / "database.sql.gz", "wb") as gz:
+                gz.write(b"CREATE TABLE t1 (id INT PRIMARY KEY);\n-- TRUNCATED!\n")
+            bad_tar = tp / "acore-20261125-corrupt.tar"
+            with tarfile.open(bad_tar, "w") as tf:
+                for fn in ("database.sql.gz", "env"):
+                    tf.add(stage / fn, arcname=fn)
+            r_bad = subprocess.run(
+                ["bash", str(ROOT / "ops" / "restore-drill.sh"), str(bad_tar)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(r_bad.returncode, 0)
+            self.assertIn("Dump completed", r_bad.stderr)
+
+        # 4. Systemd hardening directives & backup/restore-drill timers present
+        for unit in (
+            "azeroth-watch.service",
+            "hearthcore-brain.service",
+            "hearthcore-quartermaster.service",
+            "hearthcore-perf-check.service",
+            "hearthcore-backup.service",
+            "hearthcore-restore-drill.service",
+        ):
             utxt = (ROOT / "ops" / "systemd" / unit).read_text(encoding="utf-8")
             self.assertIn("NoNewPrivileges=yes", utxt, unit)
+            self.assertIn("UMask=0077", utxt, unit)
             self.assertIn("OnFailure=hearthcore-failure@%n.service", utxt, unit)
-        self.assertTrue((ROOT / "ops" / "systemd" / "hearthcore-perf-check.timer").is_file())
+        for timer in ("hearthcore-perf-check.timer", "hearthcore-backup.timer", "hearthcore-restore-drill.timer"):
+            self.assertTrue((ROOT / "ops" / "systemd" / timer).is_file(), timer)
 
 
 if __name__ == "__main__":
