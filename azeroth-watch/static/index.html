@@ -273,6 +273,29 @@
         <div class="qm-deficits-grid" id="qm-deficits-grid"></div>
       </section>
 
+      <section class="card ab-panel" id="ab-panel" style="display:none">
+        <div class="card-head">
+          <h2>AI vs Fallback Outcomes &amp; Tuning <span class="badge mono" id="ab-holdout-badge">Holdout 0%</span></h2>
+          <span class="muted" id="ab-tuning-advice"></span>
+        </div>
+        <div class="roster-table-wrap">
+          <table class="roster-table">
+            <thead>
+              <tr>
+                <th>Planner Source</th>
+                <th class="num">Sessions</th>
+                <th class="num">Progress %</th>
+                <th class="num">Stalled</th>
+                <th class="num">Avg Skillups</th>
+                <th class="num">Total Cost</th>
+                <th class="num">$/Session</th>
+              </tr>
+            </thead>
+            <tbody id="ab-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+
       <div class="brain-grid">
         <section class="card brain-plans-panel">
           <div class="card-head">
