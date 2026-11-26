@@ -1076,6 +1076,7 @@
         await postBrainApi("/api/brain/logout", {}, "Admin controls locked");
         adminUnlocked = false;
         updateAdminBtn();
+        connectStream();
         return;
       }
       const tok = window.prompt("Enter AZEROTH_WATCH_ADMIN_TOKEN (from hearthcore/.env):");
@@ -1090,6 +1091,15 @@
         adminUnlocked = true;
         updateAdminBtn();
         showBrainToast("Admin controls unlocked for this browser");
+        // Immediately fetch full admin snapshot & reconnect SSE with the new session cookie!
+        try {
+          const stRes = await fetch("/api/state", { cache: "no-store" });
+          if (stRes.ok) {
+            state.data = await stRes.json();
+            render(state.data);
+          }
+        } catch (_) {}
+        connectStream();
       } else {
         showBrainToast(data.error || "Invalid admin token", true);
       }
@@ -1374,16 +1384,14 @@
     else if (state.view === "brain") renderBrainView(d);
   }
 
-  async function init() {
-    try {
-      const res = await fetch("/api/state", { cache: "no-store" });
-      if (res.ok) {
-        state.data = await res.json();
-        render(state.data);
-      }
-    } catch (_) {}
-
+  let sseSource = null;
+  function connectStream() {
+    if (sseSource) {
+      try { sseSource.close(); } catch (_) {}
+      sseSource = null;
+    }
     const es = new EventSource("/api/stream");
+    sseSource = es;
     es.addEventListener("state", (ev) => {
       try {
         state.data = JSON.parse(ev.data);
@@ -1394,6 +1402,18 @@
     es.onerror = () => {
       $("sse-dot").classList.add("stale");
     };
+  }
+
+  async function init() {
+    try {
+      const res = await fetch("/api/state", { cache: "no-store" });
+      if (res.ok) {
+        state.data = await res.json();
+        render(state.data);
+      }
+    } catch (_) {}
+
+    connectStream();
   }
 
   init();
