@@ -1,0 +1,16 @@
+[Unit]
+Description=Hearthcore Health & Staleness Watchdog (Issue #59)
+OnFailure=hearthcore-failure@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/hearthcore
+EnvironmentFile=-%h/hearthcore/.env
+ExecStart=/usr/bin/python3 -m hearthcore.alerts check --dashboard-url http://127.0.0.1:8787/api/state
+Nice=15
+CPUQuota=15%
+TimeoutStartSec=30
+NoNewPrivileges=yes
+UMask=0077
+StandardOutput=journal
+StandardError=journal

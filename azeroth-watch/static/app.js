@@ -175,6 +175,34 @@
       if (ev) $("event-val").textContent = ev;
     }
 
+    // Issue #59: Visible operator alert banner for DB outage, stale data, brain staleness, or recent failure alerts
+    const alertBanner = $("operator-alert-banner");
+    if (alertBanner) {
+      const ab = d.ai_brain || {};
+      const msgs = [];
+      if (!d.db_ok) msgs.push("MySQL disconnected (db_ok=false)");
+      if ((d.data_age_sec || 0) > 120) msgs.push(`Telemetry stale (${d.data_age_sec}s old)`);
+      if (ab.stale_alarm) msgs.push("AI Brain stale alarm: no recent applied companion plan");
+      const nowEpoch = Math.floor(Date.now() / 1000);
+      const rawAlerts = Array.isArray(ab.failure_alerts) ? ab.failure_alerts : [];
+      const recentRaw = rawAlerts.filter((a) => !a.epoch || nowEpoch - Number(a.epoch) <= 7200);
+      if (recentRaw.length > 0) {
+        const last = recentRaw[recentRaw.length - 1];
+        msgs.push(`Alert (${last.source || "system"} @ ${last.ts || ""}): ${last.detail || "failure recorded"}`);
+      } else if (ab.recent_alert_count > 0 && ab.latest_alert) {
+        msgs.push(`Alert (${ab.latest_alert.source || "system"} @ ${ab.latest_alert.ts || ""}) — unlock admin for details`);
+      }
+      if (msgs.length > 0) {
+        alertBanner.style.display = "flex";
+        setHtmlIfChanged(
+          alertBanner,
+          `<span class="alert-badge">ALERT</span><span>${msgs.map((m) => esc(m)).join(" · ")}</span>`
+        );
+      } else {
+        alertBanner.style.display = "none";
+      }
+    }
+
     const hb = $("humans-banner");
     const hbHtml =
       d.humans.length > 0

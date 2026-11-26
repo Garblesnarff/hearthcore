@@ -216,10 +216,24 @@ def project_snapshot(snap: dict | None, *, authenticated: bool) -> dict:
     else:
         ab = snap.get("ai_brain") if isinstance(snap.get("ai_brain"), dict) else {}
         active_list = ab.get("active_list") if isinstance(ab.get("active_list"), list) else []
+        alerts = ab.get("failure_alerts") if isinstance(ab.get("failure_alerts"), list) else []
+        recent_cutoff = int(time.time()) - 7200
+        recent_alerts = [
+            a for a in alerts
+            if isinstance(a, dict) and (int(a.get("epoch") or 0) >= recent_cutoff or not a.get("epoch"))
+        ]
+        latest = recent_alerts[-1] if recent_alerts else None
         out["ai_brain"] = {
             "auth_required": True,
             "redacted": True,
             "active_plans_count": sum(1 for item in active_list if isinstance(item, dict) and item.get("active")),
+            "stale_alarm": bool(ab.get("stale_alarm")),
+            "recent_alert_count": len(recent_alerts),
+            "latest_alert": {
+                "ts": str(latest.get("ts") or ""),
+                "source": str(latest.get("source") or ""),
+                "severity": str(latest.get("severity") or "warning"),
+            } if latest else None,
         }
         out["view_mode"] = "kiosk"
     return out
