@@ -1474,11 +1474,15 @@ std::vector<std::string> CompanionDuty::WhyLines(uint32 lowGuid)
 void CompanionDuty::RecordLedger(uint32 lowGuid, char const* action, uint32 item, uint32 count, int tab,
                                  char const* note)
 {
-    // Asynchronous write: safe on map threads. Every value is a literal or an integer, so nothing needs escaping.
+    // Asynchronous write: safe on map threads. Text fields are escaped so a quote in a note cannot alter the SQL.
     std::string tabText = tab < 0 ? std::string("NULL") : std::to_string(tab);
+    std::string actionText(action);
+    std::string noteText(note);
+    CharacterDatabase.EscapeString(actionText);
+    CharacterDatabase.EscapeString(noteText);
     CharacterDatabase.Execute(
         "INSERT INTO companion_ledger (guid, action, item, count, tab, note) VALUES ({}, '{}', {}, {}, {}, '{}')",
-        lowGuid, action, item, count, tabText, note);
+        lowGuid, actionText, item, count, tabText, noteText);
 }
 
 void CompanionDuty::ReplyToOwner(PlayerbotAI* botAI, std::vector<std::string> const& lines)

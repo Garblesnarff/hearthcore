@@ -71,7 +71,7 @@ public:
         };
 
         static ChatCommandTable companionCommandTable = {
-            {"status", HandleCompanionStatusCommand, SEC_PLAYER, Console::Yes},
+            {"status", HandleCompanionStatusCommand, SEC_GAMEMASTER, Console::Yes},
             {"repair", HandleCompanionRepairCommand, SEC_GAMEMASTER, Console::Yes},
             {"why", HandleCompanionWhyCommand, SEC_GAMEMASTER, Console::Yes},
             {"wear", HandleCompanionWearCommand, SEC_GAMEMASTER, Console::Yes},
@@ -719,14 +719,22 @@ public:
                 std::string by = handler->GetSession() && handler->GetSession()->GetPlayer()
                                      ? handler->GetSession()->GetPlayer()->GetName()
                                      : "console";
-                CharacterDatabase.EscapeString(by);
-                CharacterDatabase.EscapeString(note);
+                CompanionBrain::BankRequest req;
+                req.itemEntry = itemId;
+                req.requestedBy = by;
+                req.minCount = minCount;
+                req.note = note;
+                std::string byEscaped = by;
+                std::string noteEscaped = note;
+                CharacterDatabase.EscapeString(byEscaped);
+                CharacterDatabase.EscapeString(noteEscaped);
                 CharacterDatabase.Execute(
                     "INSERT INTO companion_bank_requests (item_entry, requested_by, min_count, note) "
                     "VALUES ({}, '{}', {}, '{}') "
                     "ON DUPLICATE KEY UPDATE requested_by=VALUES(requested_by), min_count=VALUES(min_count), note=VALUES(note)",
-                    itemId, by, minCount, note);
-                CompanionBrain::ReloadBankRequests();
+                    itemId, byEscaped, minCount, noteEscaped);
+                // The write is async, so update the cache directly instead of reloading before the write lands.
+                CompanionBrain::UpsertBankRequest(req);
                 ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
                 handler->PSendSysMessage("Added bank request: item={} ({}) min={}", itemId,
                                          proto ? proto->Name1 : "unknown", minCount);
@@ -742,7 +750,7 @@ public:
                     return true;
                 }
                 CharacterDatabase.Execute("DELETE FROM companion_bank_requests WHERE item_entry = {}", itemId);
-                CompanionBrain::ReloadBankRequests();
+                CompanionBrain::RemoveBankRequest(itemId);
                 handler->PSendSysMessage("Removed bank request for item={}", itemId);
                 return true;
             }

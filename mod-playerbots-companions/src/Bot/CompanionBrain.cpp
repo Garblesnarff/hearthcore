@@ -444,6 +444,18 @@ std::vector<CompanionBrain::BankRequest> CompanionBrain::ListBankRequests()
     return out;
 }
 
+void CompanionBrain::UpsertBankRequest(BankRequest const& req)
+{
+    std::lock_guard<std::mutex> lock(gBankReqMutex);
+    gBankRequests[req.itemEntry] = req;
+}
+
+void CompanionBrain::RemoveBankRequest(uint32 itemEntry)
+{
+    std::lock_guard<std::mutex> lock(gBankReqMutex);
+    gBankRequests.erase(itemEntry);
+}
+
 void CompanionBrain::LoadDefaults()
 {
     _defaultsLoaded = true;
