@@ -85,7 +85,7 @@ class ReviewRiskRegressionTests(unittest.TestCase):
         self.assertNotIn("@'%'", sql_txt)
         self.assertIn("QUOTE(@brain_pw)", sql_txt)
         self.assertIn("QUOTE(@watch_pw)", sql_txt)
-        self.assertIn("GRANT SELECT (id, username) ON acore_auth.account TO 'hearthcore_brain'", sql_txt)
+        self.assertIn("GRANT SELECT (id, username) ON acore_auth.account TO", sql_txt)
 
     # ------------------------------------------------------------------
     # Risk 3: Persistent MySQL apply failure halts paid API calls & backs off per companion

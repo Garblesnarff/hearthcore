@@ -126,13 +126,22 @@ class MySQLIntegrationTests(unittest.TestCase):
         brain_pw = "BrainTestPass1234567890!"
         watch_pw = "WatchTestPass1234567890!"
 
+        # Discover exact client host IP seen by MySQL container (e.g. 172.18.0.1 in CI Docker bridge)
+        client_host_res = subprocess.run(
+            ["mysql", f"-h{host}", f"-P{port}", "-uroot", "-N", "-B", "-e", "SELECT SUBSTRING_INDEX(USER(), '@', -1);"],
+            check=True,
+            capture_output=True,
+            env=env_root,
+        )
+        client_host = client_host_res.stdout.decode("utf-8").strip() or "127.0.0.1"
+
         subprocess.run(
             ["mysql", f"-h{host}", f"-P{port}", "-uroot"],
             input=(
                 stub_ddl
                 + "\nUSE acore_characters;\n"
                 + schema_sql
-                + f"\nSET @brain_pw='{brain_pw}'; SET @watch_pw='{watch_pw}';\n"
+                + f"\nSET @client_host='{client_host}'; SET @brain_pw='{brain_pw}'; SET @watch_pw='{watch_pw}';\n"
                 + users_sql
             ).encode("utf-8"),
             check=True,
