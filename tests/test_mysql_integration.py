@@ -212,12 +212,15 @@ class MySQLIntegrationTests(unittest.TestCase):
         # 2. Populate realistic AzerothCore character/skill/bank/auth fixtures in the throwaway test DB
         seed_sql = f"""
         CREATE DATABASE IF NOT EXISTS acore_auth;
-        CREATE TABLE IF NOT EXISTS acore_auth.account (id INT PRIMARY KEY, username VARCHAR(32), verifier VARBINARY(32));
-        CREATE TABLE IF NOT EXISTS `{db_name}`.characters (
+        CREATE TABLE IF NOT EXISTS acore_auth.account (
+            id INT PRIMARY KEY, username VARCHAR(32), verifier VARBINARY(32)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        DROP TABLE IF EXISTS `{db_name}`.characters;
+        CREATE TABLE `{db_name}`.characters (
             guid INT PRIMARY KEY, account INT NOT NULL, name VARCHAR(32) NOT NULL,
             level TINYINT UNSIGNED NOT NULL, zone INT NOT NULL, map INT NOT NULL,
             money INT NOT NULL, online TINYINT NOT NULL, xp INT NOT NULL
-        );
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
         CREATE TABLE IF NOT EXISTS `{db_name}`.character_skills (
             guid INT NOT NULL, skill SMALLINT NOT NULL, value SMALLINT NOT NULL, max SMALLINT NOT NULL
         );
