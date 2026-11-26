@@ -1,25 +1,32 @@
 #!/usr/bin/env bash
 # Verified WoW 3.3.5a (Hearthguard / AzerothCore) setup for Ubuntu / Xubuntu laptops (Issue #70).
-# Safe download & verify workflow (NEVER pipe unverified curl into bash):
+# Safe download & out-of-band verify workflow (NEVER pipe unverified curl into bash):
 #   1. Start the on-demand share on the server: python3 ops/wow-lan-share/serve.py
-#   2. Copy the printed one-time SHARE_TOKEN and SHA-256 digest onto the laptop:
+#   2. Copy the printed one-time SHARE_TOKEN, setup SHA-256, and EXPECTED_CHECKSUMS_SHA256 onto the laptop:
 #        curl -fsSL "http://<SERVER_IP>:8788/${SHARE_TOKEN}/setup" -o setup-wow-laptop.sh
-#        echo "<PRINTED_SHA256>  setup-wow-laptop.sh" | sha256sum -c -
-#        SERVER_IP=<SERVER_IP> SHARE_TOKEN="<TOKEN>" bash setup-wow-laptop.sh
+#        echo "<PRINTED_SETUP_SHA256>  setup-wow-laptop.sh" | sha256sum -c -
+#        SERVER_IP=<SERVER_IP> SHARE_TOKEN="<TOKEN>" EXPECTED_CHECKSUMS_SHA256="<CHECKSUMS_SHA256>" bash setup-wow-laptop.sh
 set -euo pipefail
 
 SERVER_IP="${SERVER_IP:-}"
 SHARE_PORT="${SHARE_PORT:-8788}"
 SHARE_TOKEN="${SHARE_TOKEN:-}"
-WOW_DIR="${HOME}/WoW335a"
-WINE_DIR="${HOME}/wine-wotlk"
+EXPECTED_CHECKSUMS_SHA256="${EXPECTED_CHECKSUMS_SHA256:-}"
+WOW_DIR="${WOW_DIR:-${HOME}/WoW335a}"
+WINE_DIR="${WINE_DIR:-${HOME}/wine-wotlk}"
+SKIP_SYSTEM_PACKAGES="${SKIP_SYSTEM_PACKAGES:-0}"
+SKIP_WINE_INIT="${SKIP_WINE_INIT:-0}"
 
 if [[ -z "${SERVER_IP}" ]]; then
-  echo "ERROR: SERVER_IP is required (e.g., SERVER_IP=192.168.1.3)." >&2
+  echo "ERROR: SERVER_IP is required (e.g., SERVER_IP=<SERVER_LAN_IP>)." >&2
   exit 1
 fi
 if [[ -z "${SHARE_TOKEN}" ]]; then
   echo "ERROR: SHARE_TOKEN is required (printed by on-demand serve.py)." >&2
+  exit 1
+fi
+if [[ -z "${EXPECTED_CHECKSUMS_SHA256}" ]]; then
+  echo "ERROR: EXPECTED_CHECKSUMS_SHA256 is required (printed out-of-band by serve.py so plain-HTTP checksums cannot be tampered with)." >&2
   exit 1
 fi
 
@@ -29,12 +36,20 @@ echo "============================================================"
 echo "  Hearthguard WoW 3.3.5a Laptop Setup (Server: ${SERVER_IP})"
 echo "============================================================"
 
-# 0. Fetch published SHA-256 checksums before downloading binaries
+# 0. Fetch AND verify checksums.sha256 against the out-of-band EXPECTED_CHECKSUMS_SHA256
+#    BEFORE running sudo apt-get or downloading any binaries!
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "${TMP_DIR}"' EXIT
 CHECKSUM_FILE="${TMP_DIR}/checksums.sha256"
-echo "[0/5] Fetching published SHA-256 checksums from ${SHARE_URL}/checksums.sha256..."
+echo "[0/5] Fetching & verifying out-of-band checksums.sha256..."
 curl -fsSL "${SHARE_URL}/checksums.sha256" -o "${CHECKSUM_FILE}"
+
+ACTUAL_CHECKSUMS_SHA256="$(sha256sum "${CHECKSUM_FILE}" | awk '{print $1}')"
+if [[ "${ACTUAL_CHECKSUMS_SHA256}" != "${EXPECTED_CHECKSUMS_SHA256}" ]]; then
+  echo "ERROR: Out-of-band SHA-256 mismatch for checksums.sha256! expected=${EXPECTED_CHECKSUMS_SHA256} actual=${ACTUAL_CHECKSUMS_SHA256}" >&2
+  exit 1
+fi
+echo "      Verified out-of-band checksums.sha256 (${ACTUAL_CHECKSUMS_SHA256:0:16}...)"
 
 verify_checksum() {
   local filename="$1"
@@ -54,28 +69,47 @@ verify_checksum() {
   echo "      Verified SHA-256 for ${filename} (${actual:0:16}...)"
 }
 
-# 1. Install 32-bit Wine + OpenGL/Vulkan runtime + CLI prereqs
-echo ""
-echo "[1/5] Installing Wine, 32-bit graphics libraries, and prereqs (sudo password may be requested)..."
-sudo dpkg --add-architecture i386
-sudo apt-get update -qq
-sudo apt-get install -y \
-  wine wine32:i386 \
-  libgl1-mesa-dri:i386 libgl1:i386 \
-  mesa-vulkan-drivers mesa-vulkan-drivers:i386 \
-  libvulkan1 libvulkan1:i386 \
-  vulkan-tools curl wget git jq ripgrep ca-certificates tar
+verify_extracted_wow_binaries() {
+  verify_checksum "Wow.exe" "${WOW_DIR}/Wow.exe"
+  while read -r expected_hash label; do
+    [[ -z "${expected_hash}" ]] && continue
+    if [[ "${label}" == wow/* ]]; then
+      local rel="${label#wow/}"
+      if [[ ! -f "${WOW_DIR}/${rel}" ]]; then
+        echo "ERROR: Missing expected extracted file ${WOW_DIR}/${rel}" >&2
+        exit 1
+      fi
+      verify_checksum "${label}" "${WOW_DIR}/${rel}"
+    fi
+  done < "${CHECKSUM_FILE}"
+}
 
-# 2. Stream WoW 3.3.5a client over LAN (~17 GB, skips Cache/Logs/Account) and verify Wow.exe SHA-256
+# 1. Install 32-bit Wine + OpenGL/Vulkan runtime + CLI prereqs (ONLY after out-of-band checksum verification succeeded)
+echo ""
+if [[ "${SKIP_SYSTEM_PACKAGES}" == "1" ]]; then
+  echo "[1/5] Skipping apt package installation (SKIP_SYSTEM_PACKAGES=1)."
+else
+  echo "[1/5] Installing Wine, 32-bit graphics libraries, and prereqs (sudo password may be requested)..."
+  sudo dpkg --add-architecture i386
+  sudo apt-get update -qq
+  sudo apt-get install -y \
+    wine wine32:i386 \
+    libgl1-mesa-dri:i386 libgl1:i386 \
+    mesa-vulkan-drivers mesa-vulkan-drivers:i386 \
+    libvulkan1 libvulkan1:i386 \
+    vulkan-tools curl wget git jq ripgrep ca-certificates tar
+fi
+
+# 2. Stream WoW 3.3.5a client over LAN (~17 GB, skips Cache/Logs/Account) and verify extracted binary SHA-256s
 echo ""
 if [[ -f "${WOW_DIR}/Wow.exe" ]]; then
-  echo "[2/5] Found existing WoW client at ${WOW_DIR}/Wow.exe — verifying checksum..."
-  verify_checksum "Wow.exe" "${WOW_DIR}/Wow.exe"
+  echo "[2/5] Found existing WoW client at ${WOW_DIR}/Wow.exe — verifying checksums..."
+  verify_extracted_wow_binaries
 else
-  echo "[2/5] Copying WoW 3.3.5a client (~17 GB) over LAN from ${SHARE_URL}/wow.tar..."
+  echo "[2/5] Copying WoW 3.3.5a client (~17 GB) over LAN..."
   mkdir -p "${WOW_DIR}"
   curl -fL --progress-bar "${SHARE_URL}/wow.tar" | tar --no-same-owner --no-same-permissions -xf - -C "${WOW_DIR}"
-  verify_checksum "Wow.exe" "${WOW_DIR}/Wow.exe"
+  verify_extracted_wow_binaries
 fi
 
 # 3. Point realmlist.wtf at SERVER_IP and ensure clean laptop Config.wtf
@@ -109,17 +143,23 @@ EOF
 
 # 4. Initialize 32-bit Wine prefix + smart Vulkan/DXVK auto-detection (SHA-256 verified before install)
 echo ""
-echo "[4/5] Initializing 32-bit Wine prefix at ${WINE_DIR}..."
-export WINEPREFIX="${WINE_DIR}"
-export WINEARCH=win32
-export WINEDLLOVERRIDES="mscoree,mshtml="
-wineboot -u >/dev/null 2>&1 || true
-wineserver -w >/dev/null 2>&1 || true
+mkdir -p "${WINE_DIR}/drive_c/windows/system32"
+if [[ "${SKIP_WINE_INIT}" == "1" ]]; then
+  echo "[4/5] Skipping wineboot initialization (SKIP_WINE_INIT=1)."
+  USE_DXVK=0
+else
+  echo "[4/5] Initializing 32-bit Wine prefix at ${WINE_DIR}..."
+  export WINEPREFIX="${WINE_DIR}"
+  export WINEARCH=win32
+  export WINEDLLOVERRIDES="mscoree,mshtml="
+  wineboot -u >/dev/null 2>&1 || true
+  wineserver -w >/dev/null 2>&1 || true
 
-USE_DXVK=0
-if command -v vulkaninfo >/dev/null 2>&1; then
-  if vulkaninfo --summary 2>/dev/null | grep -i "deviceName" | grep -viE "llvmpipe|softpipe|lavapipe" >/dev/null 2>&1; then
-    USE_DXVK=1
+  USE_DXVK=0
+  if command -v vulkaninfo >/dev/null 2>&1; then
+    if vulkaninfo --summary 2>/dev/null | grep -i "deviceName" | grep -viE "llvmpipe|softpipe|lavapipe" >/dev/null 2>&1; then
+      USE_DXVK=1
+    fi
   fi
 fi
 
@@ -138,7 +178,7 @@ WINEPREFIX="$HOME/wine-wotlk" \
 exec wine Wow.exe "$@"
 EOF
 else
-  echo "      Older pre-Vulkan GPU detected — using Wine OpenGL/WineD3D (safe mode, no DXVK)."
+  echo "      Using Wine OpenGL/WineD3D mode."
   rm -f "${WINE_DIR}/drive_c/windows/system32/d3d9.dll"
   cat > "${HOME}/wow.sh" <<'EOF'
 #!/usr/bin/env bash

@@ -266,10 +266,14 @@ class Batch2ZeroDowntimeP1Tests(unittest.TestCase):
                 srv.server_close()
 
     # ------------------------------------------------------------------
-    # Issue #70: On-demand LAN share requires token, publishes SHA-256, caps concurrent tar, no curl|bash
+    # Issue #70: On-demand LAN share executes real installer end-to-end with out-of-band checksums,
+    # redacted logs, single-use /wow.tar, and concurrent tar cap!
     # ------------------------------------------------------------------
     def test_issue70_lan_share_token_checksums_concurrency_and_no_thirdparty_pipe(self):
+        import subprocess
+
         serve_path = ROOT / "ops" / "wow-lan-share" / "serve.py"
+        setup_script_path = ROOT / "ops" / "wow-lan-share" / "setup-wow-laptop.sh"
         spec = importlib.util.spec_from_file_location("wow_lan_share_serve", serve_path)
         assert spec and spec.loader
         mod = importlib.util.module_from_spec(spec)
@@ -280,26 +284,29 @@ class Batch2ZeroDowntimeP1Tests(unittest.TestCase):
         self.assertNotIn("WantedBy=", unit_txt)
         self.assertIn("RuntimeMaxSec=", unit_txt)
         self.assertIn("Restart=no", unit_txt)
-
-        # Verify installer script has NO third-party curl | bash!
-        sh_txt = (ROOT / "ops" / "wow-lan-share" / "setup-wow-laptop.sh").read_text(encoding="utf-8")
-        self.assertNotIn("| bash", sh_txt)
-        self.assertIn("verify_checksum", sh_txt)
+        self.assertNotIn("| bash", setup_script_path.read_text(encoding="utf-8"))
 
         with tempfile.TemporaryDirectory() as tmp:
             tp = Path(tmp)
-            fake_setup = tp / "setup-wow-laptop.sh"
-            fake_setup.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
             fake_dll = tp / "d3d9.dll"
             fake_dll.write_bytes(b"FAKE_DXVK_DLL")
-            fake_wow = tp / "wow"
+            fake_wow = tp / "wow_src"
             fake_wow.mkdir()
-            (fake_wow / "Wow.exe").write_bytes(b"MZ_FAKE_WOW")
+            (fake_wow / "Wow.exe").write_bytes(b"MZ_FAKE_WOW_BINARY")
+            (fake_wow / "DivxDecoder.dll").write_bytes(b"MZ_FAKE_DLL")
 
-            tok = "one_time_lan_share_tok"
+            tok = "secret_one_time_lan_share_tok"
             lock = threading.Lock()
+            access_logs: list[str] = []
             handler_cls = mod.make_handler(
-                token=tok, setup_script=fake_setup, wow_dir=fake_wow, dxvk_dll=fake_dll, tar_lock=lock,
+                token=tok,
+                setup_script=setup_script_path,
+                wow_dir=fake_wow,
+                dxvk_dll=fake_dll,
+                tar_lock=lock,
+                max_tar_uses=1,
+                max_total_uses=12,
+                log_sink=access_logs,
             )
             srv = mod.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
             port = srv.server_address[1]
@@ -314,23 +321,69 @@ class Batch2ZeroDowntimeP1Tests(unittest.TestCase):
                     conn.close()
                     return resp.status, data, hdrs
 
-                # Unauthenticated / wrong token -> 403
+                # 1. Unauthenticated / wrong token -> 403
                 self.assertEqual(get("/setup")[0], 403)
                 self.assertEqual(get("/wrongtok/setup")[0], 403)
 
-                # Valid token serves checksums.sha256 matching real file digests
-                st, data, _ = get(f"/{tok}/checksums.sha256")
-                self.assertEqual(st, 200)
-                txt = data.decode("utf-8")
-                expected_dll_sha = hashlib.sha256(b"FAKE_DXVK_DLL").hexdigest()
-                self.assertIn(f"{expected_dll_sha}  dxvk-d3d9.dll", txt)
+                # 2. Fetch published manifest & compute out-of-band digest
+                st_c, data_c, _ = get(f"/{tok}/checksums.sha256")
+                self.assertEqual(st_c, 200)
+                manifest_sha = hashlib.sha256(data_c).hexdigest()
+                self.assertIn(b"wow/DivxDecoder.dll", data_c)
+                self.assertIn(b"Wow.exe", data_c)
 
-                # Concurrent /wow.tar stream rejected with 429 when lock is held!
+                # 3. Concurrent tar lock returns 429 when held
                 self.assertTrue(lock.acquire(blocking=False))
                 try:
                     self.assertEqual(get(f"/{tok}/wow.tar")[0], 429)
                 finally:
                     lock.release()
+
+                # 4. Run ACTUAL setup-wow-laptop.sh with WRONG out-of-band checksum -> MUST ABORT before install!
+                bad_home = tp / "bad_home"
+                bad_home.mkdir()
+                bad_env = dict(
+                    os.environ,
+                    HOME=str(bad_home),
+                    SERVER_IP="127.0.0.1",
+                    SHARE_PORT=str(port),
+                    SHARE_TOKEN=tok,
+                    EXPECTED_CHECKSUMS_SHA256="0" * 64,
+                    SKIP_SYSTEM_PACKAGES="1",
+                    SKIP_WINE_INIT="1",
+                )
+                r_bad = subprocess.run(["bash", str(setup_script_path)], env=bad_env, capture_output=True, text=True)
+                self.assertNotEqual(r_bad.returncode, 0)
+                self.assertIn("Out-of-band SHA-256 mismatch", r_bad.stderr)
+                self.assertFalse((bad_home / "WoW335a" / "Wow.exe").exists())
+
+                # 5. Run ACTUAL setup-wow-laptop.sh with VALID out-of-band checksum -> downloads, extracts & verifies!
+                good_home = tp / "good_home"
+                good_home.mkdir()
+                good_env = dict(
+                    os.environ,
+                    HOME=str(good_home),
+                    SERVER_IP="127.0.0.1",
+                    SHARE_PORT=str(port),
+                    SHARE_TOKEN=tok,
+                    EXPECTED_CHECKSUMS_SHA256=manifest_sha,
+                    SKIP_SYSTEM_PACKAGES="1",
+                    SKIP_WINE_INIT="1",
+                )
+                r_good = subprocess.run(["bash", str(setup_script_path)], env=good_env, capture_output=True, text=True)
+                self.assertEqual(r_good.returncode, 0, f"stderr={r_good.stderr}\nstdout={r_good.stdout}")
+                self.assertEqual((good_home / "WoW335a" / "Wow.exe").read_bytes(), b"MZ_FAKE_WOW_BINARY")
+                self.assertEqual((good_home / "WoW335a" / "DivxDecoder.dll").read_bytes(), b"MZ_FAKE_DLL")
+                self.assertIn("set realmlist 127.0.0.1", (good_home / "WoW335a" / "Data" / "enUS" / "realmlist.wtf").read_text())
+                self.assertTrue((good_home / "wow.sh").is_file())
+
+                # 6. Single-use /wow.tar: second download with same token MUST return 403!
+                self.assertEqual(get(f"/{tok}/wow.tar")[0], 403)
+
+                # 7. Access logs MUST NEVER contain the raw token!
+                self.assertTrue(access_logs)
+                for line in access_logs:
+                    self.assertNotIn(tok, line, f"Token leaked into access log: {line}")
             finally:
                 srv.shutdown()
                 srv.server_close()
