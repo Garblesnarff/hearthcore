@@ -40,14 +40,18 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 
-def _default_hearthcore_root() -> Path:
+def _default_hearthcore_root(base_dir: str | Path = BASE_DIR, home_dir: Path | None = None) -> Path:
     env_root = os.getenv("HEARTHCORE_ROOT")
     if env_root:
         return Path(env_root)
-    parent = Path(BASE_DIR).parent
-    if (parent / "hearthcore").is_dir():
+    parent = Path(base_dir).resolve().parent
+    # Only treat parent as the hearthcore repo root when it actually contains the Python package
+    # `hearthcore/__init__.py` (NOT when deployed as sibling ~/azeroth-watch next to ~/hearthcore!).
+    if (parent / "hearthcore" / "__init__.py").is_file():
         return parent
-    return Path.home() / "hearthcore"
+    if (parent / "hearthcore" / "hearthcore" / "__init__.py").is_file():
+        return parent / "hearthcore"
+    return (home_dir if home_dir is not None else Path.home()) / "hearthcore"
 
 
 HEARTHCORE_ENV = os.getenv("HEARTHCORE_ENV_PATH", str(_default_hearthcore_root() / ".env"))

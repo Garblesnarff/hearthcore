@@ -281,6 +281,33 @@ class ReviewRiskRegressionTests(unittest.TestCase):
             parsed = parse_mysql_tsv("1\tfoo\rbar\tNULL\n", expected_cols=3)
             self.assertEqual(parsed[0], ["1", "foo\rbar", None])
 
+    def test_azeroth_watch_default_hearthcore_root_deployed_sibling_dir(self):
+        """Regression test: ~/azeroth-watch sibling of ~/hearthcore MUST resolve to ~/hearthcore, not ~!"""
+        aw_dir = str((ROOT / "azeroth-watch").resolve())
+        if aw_dir not in sys.path:
+            sys.path.insert(0, aw_dir)
+        import server as aw_server  # type: ignore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp)
+            # Deployed layout: ~/azeroth-watch next to ~/hearthcore/hearthcore/__init__.py
+            (fake_home / "azeroth-watch").mkdir()
+            (fake_home / "hearthcore" / "hearthcore").mkdir(parents=True)
+            (fake_home / "hearthcore" / "hearthcore" / "__init__.py").write_text("", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"HEARTHCORE_ROOT": ""}):
+                resolved_deployed = aw_server._default_hearthcore_root(
+                    base_dir=fake_home / "azeroth-watch", home_dir=fake_home
+                )
+                self.assertEqual(resolved_deployed, (fake_home / "hearthcore").resolve())
+
+                # In-repo layout: ~/hearthcore/azeroth-watch
+                (fake_home / "hearthcore" / "azeroth-watch").mkdir()
+                resolved_repo = aw_server._default_hearthcore_root(
+                    base_dir=fake_home / "hearthcore" / "azeroth-watch", home_dir=fake_home
+                )
+                self.assertEqual(resolved_repo, (fake_home / "hearthcore").resolve())
+
 
 if __name__ == "__main__":
     unittest.main()

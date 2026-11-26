@@ -156,16 +156,23 @@
     const aiPill = $("ai-pill");
     if (aiPill) {
       const ab = d.ai_brain || {};
-      const t = ab.today || {};
-      const bal = ab.balance || {};
-      const mShort = fmtModelShort(ab.model);
-      const ok = t.ai_ok || 0;
-      const err = t.ai_err || 0;
-      const cap = ab.daily_cap || 500;
-      const rem = typeof bal.remaining_usd === "number" ? `~$${bal.remaining_usd.toFixed(2)}` : `${ok}/${cap}`;
-      aiPill.classList.toggle("has-err", err > 0);
-      $("ai-val").textContent = `${mShort} · ${rem}`;
-      aiPill.title = `Claude AI Brain (${ab.model || "none"} ${ab.effort || ""}) · Est. ${rem} left of $${(bal.credit_total_usd || 98).toFixed(2)} · Today: ${ok}/${cap} plans, ${err} errors · Click or press 4`;
+      if (ab.redacted) {
+        const activeCnt = Number(ab.active_plans_count || 0);
+        aiPill.classList.toggle("has-err", Boolean(ab.stale_alarm));
+        $("ai-val").textContent = `${activeCnt} active · 🔒`;
+        aiPill.title = `Claude AI Brain (${activeCnt} active companion plans) · Click or press 4 and unlock Admin to view model & budget`;
+      } else {
+        const t = ab.today || {};
+        const bal = ab.balance || {};
+        const mShort = fmtModelShort(ab.model);
+        const ok = t.ai_ok || 0;
+        const err = t.ai_err || 0;
+        const cap = ab.daily_cap || 500;
+        const rem = typeof bal.remaining_usd === "number" ? `~$${bal.remaining_usd.toFixed(2)}` : `${ok}/${cap}`;
+        aiPill.classList.toggle("has-err", err > 0);
+        $("ai-val").textContent = `${mShort} · ${rem}`;
+        aiPill.title = `Claude AI Brain (${ab.model || "none"} ${ab.effort || ""}) · Est. ${rem} left of $${(bal.credit_total_usd || 98).toFixed(2)} · Today: ${ok}/${cap} plans, ${err} errors · Click or press 4`;
+      }
     }
 
     const evPill = $("event-pill");
