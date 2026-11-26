@@ -10,9 +10,11 @@ import struct
 import mpyq
 from PIL import Image
 
-DATA = "/mnt/hdd/WoW335a/extracted/ChromieCraft_3.3.5a/Data/enUS"
-OUT_MAPS = "/home/wonky/azeroth-watch/static/maps"
-OUT_JSON = "/home/wonky/azeroth-watch/worldmap_areas.json"
+HERE = os.path.dirname(os.path.abspath(__file__))
+WOW_CLIENT_DIR = os.getenv("WOW_CLIENT_DIR", os.path.join(os.path.expanduser("~"), "WoW335a"))
+DATA = os.getenv("WOW_DATA_ENUS_DIR", os.path.join(WOW_CLIENT_DIR, "Data", "enUS"))
+OUT_MAPS = os.getenv("AZEROTH_WATCH_MAPS_DIR", os.path.join(HERE, "static", "maps"))
+OUT_JSON = os.getenv("AZEROTH_WATCH_WORLDMAP_JSON", os.path.join(HERE, "worldmap_areas.json"))
 os.makedirs(OUT_MAPS, exist_ok=True)
 
 
