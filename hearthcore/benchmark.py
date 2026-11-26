@@ -116,6 +116,7 @@ def build_benchmark_artifact(
     warmup_sec: float = 0.0,
     tick_histogram_ms: list[tuple[float, int]] | None = None,
     config_snapshot: dict[str, Any] | None = None,
+    run_info: dict[str, Any] | None = None,
     stale_after_sec: int = 180,
     now_ts: int | None = None,
 ) -> dict[str, Any]:
@@ -244,7 +245,9 @@ def build_benchmark_artifact(
         "correctness": merged_correctness,
         "all_correctness_passed": telemetry_complete and all(bool(v) for v in merged_correctness.values()),
     }
-    digest = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    if run_info is not None:
+        body["run"] = run_info
+    digest =hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
     body["artifact_sha256"] = digest
     return body
 
@@ -255,17 +258,25 @@ def run_live_baseline_benchmark(
     sample_count: int = 3,
     interval_sec: float = 2.0,
     warmup_sec: float = 0.0,
+    min_duration_sec: float = 600.0,
     dashboard_url: str | None = None,
     out_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Capture a non-destructive live baseline artifact from Azeroth Watch, /proc/meminfo & PSI."""
+    """Capture a non-destructive live baseline artifact from Azeroth Watch, /proc/meminfo & PSI.
+
+    Fails closed: a missing field is unknown (not zero), errors are judged by the change in
+    errors_bytes between the first and last sample, and the run must span at least min_duration_sec.
+    """
     url = dashboard_url or os.getenv("AZEROTH_WATCH_URL", "http://127.0.0.1:8787/api/state")
     if warmup_sec > 0:
         time.sleep(warmup_sec)
 
     samples: list[dict[str, Any]] = []
-    errors_zero = True
     world_up = True
+    telemetry_present = True
+    errors_first: int | None = None
+    errors_last: int | None = None
+    run_start = time.monotonic()
 
     for i in range(max(1, int(sample_count))):
         t0 = time.monotonic()
@@ -277,8 +288,13 @@ def run_live_baseline_benchmark(
         v = st.get("vitals") or {}
         t = st.get("ticks") or {}
         pop = st.get("population") or {}
-        if int(st.get("errors_bytes") or 0) > 0:
-            errors_zero = False
+        if not all(k in st for k in ("vitals", "ticks", "population", "errors_bytes")):
+            telemetry_present = False
+        raw_err = st.get("errors_bytes")
+        if raw_err is not None:
+            errors_last = int(raw_err)
+            if errors_first is None:
+                errors_first = errors_last
         if not v.get("worldserver_up"):
             world_up = False
         samples.append({
@@ -310,17 +326,31 @@ def run_live_baseline_benchmark(
             str(Path.home() / "AzerothCore" / "azerothcore-wotlk" / "modules" / "mod-playerbots"),
         )
     )
+    # Error growth is the change in errors_bytes over the run; unknown (missing) counts as a failure.
+    errors_delta = (errors_last - errors_first) if errors_first is not None and errors_last is not None else None
+    errors_zero = errors_delta == 0
+    duration_sec = round(time.monotonic() - run_start, 2)
     artifact = build_benchmark_artifact(
         scenario=scenario,
         samples=samples,
         correctness={
             "worldserver_up": world_up,
             "errors_log_zero_bytes": errors_zero,
+            "telemetry_present": telemetry_present,
+            "min_duration_met": duration_sec >= float(min_duration_sec),
         },
         hearthcore_sha=_git_sha(ROOT),
         mod_playerbots_sha=_git_sha(mpb_dir),
         interval_sec=interval_sec,
         warmup_sec=warmup_sec,
+        run_info={
+            "duration_sec": duration_sec,
+            "min_duration_sec": float(min_duration_sec),
+            "errors_bytes_first": errors_first,
+            "errors_bytes_last": errors_last,
+            "errors_bytes_delta": errors_delta,
+            "warmup_sec": float(warmup_sec),
+        },
     )
     target_dir = out_dir or (ROOT / "runtime" / "benchmarks")
     target_dir.mkdir(parents=True, exist_ok=True)
