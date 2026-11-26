@@ -1,0 +1,16 @@
+[Unit]
+Description=Hearthcore Weekly Backup Restore Drill (Issue #75)
+OnFailure=hearthcore-failure@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/hearthcore
+ExecStart=/bin/bash %h/hearthcore/ops/restore-drill.sh
+Nice=15
+IOSchedulingClass=idle
+CPUQuota=25%
+TimeoutStartSec=300
+NoNewPrivileges=yes
+UMask=0077
+StandardOutput=journal
+StandardError=journal

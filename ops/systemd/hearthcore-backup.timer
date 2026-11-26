@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Hearthcore Nightly Backup at 04:00 local time (Issue #75)
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

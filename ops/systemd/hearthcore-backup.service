@@ -1,0 +1,16 @@
+[Unit]
+Description=Hearthcore Nightly MySQL + SQLite brain.db Backup (Issue #75)
+OnFailure=hearthcore-failure@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/hearthcore
+ExecStart=/bin/bash %h/hearthcore/ops/backup.sh
+Nice=15
+IOSchedulingClass=idle
+CPUQuota=25%
+TimeoutStartSec=900
+NoNewPrivileges=yes
+UMask=0077
+StandardOutput=journal
+StandardError=journal
