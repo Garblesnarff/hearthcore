@@ -1,9 +1,12 @@
 [Unit]
-Description=Hearthcore systemd failure alert logger for %i
+Description=Hearthcore systemd failure alert dispatcher for %i
 
 [Service]
 Type=oneshot
 WorkingDirectory=%h/hearthcore
-ExecStart=/usr/bin/python3 -c "import sys; from hearthcore.bridge import record_failure_alert; record_failure_alert('systemd_failure', 'Unit failed: ' + sys.argv[1])" %i
+EnvironmentFile=-%h/hearthcore/.env
+ExecStart=/usr/bin/python3 -m hearthcore.alerts send --severity critical --source systemd_failure --detail "Unit failed: %i"
 StandardOutput=journal
 StandardError=journal
+NoNewPrivileges=yes
+UMask=0077

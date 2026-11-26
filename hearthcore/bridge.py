@@ -208,19 +208,11 @@ def set_brain_disabled(
     }
 
 
-def record_failure_alert(source: str, detail: str, *, runtime_dir: Path = RUNTIME_DIR) -> None:
-    """Append a structured failure alert entry to runtime/failure_alerts.log (Issue #59)."""
-    try:
-        runtime_dir.mkdir(parents=True, exist_ok=True)
-        entry = {
-            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "source": str(source)[:48],
-            "detail": str(detail)[:240],
-        }
-        with open(runtime_dir / "failure_alerts.log", "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, separators=(",", ":")) + "\n")
-    except OSError as exc:
-        logger.warning("Failed writing failure_alerts.log: %s", exc)
+def record_failure_alert(source: str, detail: str, *, runtime_dir: Path = RUNTIME_DIR, severity: str = "warning") -> None:
+    """Dispatch a structured operator failure alert (log, journal, dashboard, optional webhook/desktop, Issue #59)."""
+    from .alerts import dispatch_alert
+
+    dispatch_alert(source, detail, severity=severity, runtime_dir=runtime_dir)
 
 
 def _unescape_mysql_batch_field(field: str) -> str | None:
