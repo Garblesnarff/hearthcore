@@ -5,22 +5,23 @@
 --   - Restricts accounts strictly to localhost / 127.0.0.1 (NEVER wildcard '%').
 --   - Restricts acore_auth.account SELECT to (id, username) ONLY (never exposes salt/verifier/email).
 --
--- Usage (as root on ac-database):
---   mysql -h 127.0.0.1 -u root -p -e "SET @brain_pw='...'; SET @watch_pw='...'; SOURCE ops/sql/create_least_priv_users.sql;"
+-- Usage:
+--   Run via ops/provision-least-priv-db.sh or as root with session variables:
+--   SET @brain_pw='...'; SET @watch_pw='...'; SOURCE ops/sql/create_least_priv_users.sql;
 
-SET @check_pw = IF(
-  @brain_pw IS NULL OR CHAR_LENGTH(@brain_pw) < 16 OR @watch_pw IS NULL OR CHAR_LENGTH(@watch_pw) < 16,
-  (SELECT 'ERROR: Set @brain_pw and @watch_pw (>=16 chars) before sourcing this file' FROM information_schema.tables LIMIT 1, 1),
-  'ok'
-);
-
--- Fail loudly via invalid syntax if passwords were not supplied
 SET @s_brain_lo = IF(
   @brain_pw IS NULL OR CHAR_LENGTH(@brain_pw) < 16,
   'SELECT FAIL_MISSING_BRAIN_PW()',
   CONCAT('CREATE USER IF NOT EXISTS ''hearthcore_brain''@''localhost'' IDENTIFIED BY ', QUOTE(@brain_pw))
 );
 PREPARE stmt FROM @s_brain_lo; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @s_brain_lo_alt = IF(
+  @brain_pw IS NULL OR CHAR_LENGTH(@brain_pw) < 16,
+  'SELECT FAIL_MISSING_BRAIN_PW()',
+  CONCAT('ALTER USER ''hearthcore_brain''@''localhost'' IDENTIFIED BY ', QUOTE(@brain_pw))
+);
+PREPARE stmt FROM @s_brain_lo_alt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @s_brain_ip = IF(
   @brain_pw IS NULL OR CHAR_LENGTH(@brain_pw) < 16,
@@ -29,6 +30,13 @@ SET @s_brain_ip = IF(
 );
 PREPARE stmt FROM @s_brain_ip; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
+SET @s_brain_ip_alt = IF(
+  @brain_pw IS NULL OR CHAR_LENGTH(@brain_pw) < 16,
+  'SELECT FAIL_MISSING_BRAIN_PW()',
+  CONCAT('ALTER USER ''hearthcore_brain''@''127.0.0.1'' IDENTIFIED BY ', QUOTE(@brain_pw))
+);
+PREPARE stmt FROM @s_brain_ip_alt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
 SET @s_watch_lo = IF(
   @watch_pw IS NULL OR CHAR_LENGTH(@watch_pw) < 16,
   'SELECT FAIL_MISSING_WATCH_PW()',
@@ -36,12 +44,26 @@ SET @s_watch_lo = IF(
 );
 PREPARE stmt FROM @s_watch_lo; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
+SET @s_watch_lo_alt = IF(
+  @watch_pw IS NULL OR CHAR_LENGTH(@watch_pw) < 16,
+  'SELECT FAIL_MISSING_WATCH_PW()',
+  CONCAT('ALTER USER ''azeroth_watch''@''localhost'' IDENTIFIED BY ', QUOTE(@watch_pw))
+);
+PREPARE stmt FROM @s_watch_lo_alt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
 SET @s_watch_ip = IF(
   @watch_pw IS NULL OR CHAR_LENGTH(@watch_pw) < 16,
   'SELECT FAIL_MISSING_WATCH_PW()',
   CONCAT('CREATE USER IF NOT EXISTS ''azeroth_watch''@''127.0.0.1'' IDENTIFIED BY ', QUOTE(@watch_pw))
 );
 PREPARE stmt FROM @s_watch_ip; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @s_watch_ip_alt = IF(
+  @watch_pw IS NULL OR CHAR_LENGTH(@watch_pw) < 16,
+  'SELECT FAIL_MISSING_WATCH_PW()',
+  CONCAT('ALTER USER ''azeroth_watch''@''127.0.0.1'' IDENTIFIED BY ', QUOTE(@watch_pw))
+);
+PREPARE stmt FROM @s_watch_ip_alt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'hearthcore_brain'@'localhost';
 REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'hearthcore_brain'@'127.0.0.1';

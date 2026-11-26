@@ -132,15 +132,36 @@ class PersistentMySQLPipe:
         self._close()
         try:
             db_defaults = os.getenv("AZEROTH_WATCH_DB_DEFAULTS_FILE", "").strip()
+            db_container_defaults = os.getenv("AZEROTH_WATCH_DB_CONTAINER_DEFAULTS_FILE", "").strip()
+            if not db_container_defaults and os.path.isfile(AI_ENV_FILE):
+                try:
+                    with open(AI_ENV_FILE, "r", encoding="utf-8") as ef:
+                        for raw_l in ef:
+                            ln = raw_l.strip()
+                            if ln.startswith("AZEROTH_WATCH_DB_CONTAINER_DEFAULTS_FILE="):
+                                db_container_defaults = ln.split("=", 1)[1].strip().strip('"').strip("'")
+                                break
+                except OSError:
+                    pass
             db_user = os.getenv("AZEROTH_WATCH_DB_USER", "").strip()
             db_pass = os.getenv("AZEROTH_WATCH_DB_PASSWORD", "")
             db_host = os.getenv("AZEROTH_WATCH_DB_HOST", "127.0.0.1").strip()
             db_port = os.getenv("AZEROTH_WATCH_DB_PORT", "3306").strip()
             db_container = os.getenv("HEARTHCORE_DB_CONTAINER", "ac-database")
             if db_defaults and shutil.which("mysql"):
-                # Safest path: chmod-600 option file (zero password in argv/env, zero Docker socket!)
+                # Safest path: chmod-600 option file over TCP (zero password in argv/env, zero Docker socket!)
                 cmd = [
                     "mysql", f"--defaults-extra-file={db_defaults}",
+                    "--batch", "--quick", "--unbuffered", "--skip-column-names",
+                ]
+                self._proc = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                )
+            elif db_container_defaults:
+                # Least-privilege SELECT-only user via chmod-600 option file inside container (zero root, zero password on argv!)
+                cmd = [
+                    "docker", "exec", "-i", db_container,
+                    "mysql", f"--defaults-extra-file={db_container_defaults}",
                     "--batch", "--quick", "--unbuffered", "--skip-column-names",
                 ]
                 self._proc = subprocess.Popen(
