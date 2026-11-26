@@ -230,8 +230,8 @@ def main():
                     "tick_p99": (st.get("ticks") or {}).get("p99"),
                 }
                 raid_stage = int((st.get("raid") or {}).get("stage") or 0)
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.getLogger("hearthcore").warning("Dashboard telemetry fetch failed (fail-closed): %s", exc)
             world_ctx = fetch_world_context()
             res = run_shadow_match_snapshot(
                 world_ctx, db_path=BRAIN_DB_PATH, runtime_dir=RUNTIME_DIR, vitals=vitals, raid_stage=raid_stage

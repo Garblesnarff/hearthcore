@@ -13,12 +13,15 @@ Design guarantees (docs/PHASE_II_LIVING_GUILD.md Sections 5 & 10):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("hearthcore.opportunities")
 
 from .core import ROOT, profile, profiles
 from .dungeons import (
@@ -101,7 +104,8 @@ def evaluate_persisted_headroom(
         if state_path.is_file():
             saved = json.loads(state_path.read_text(encoding="utf-8"))
             prev_paused = bool(saved.get("paused", False))
-    except Exception:
+    except Exception as exc:
+        logger.warning("Corrupt headroom state at %s (%s); failing closed", state_path, exc)
         prev_paused = True  # fail closed on corrupt state
 
     res = check_resource_headroom(
@@ -119,8 +123,49 @@ def evaluate_persisted_headroom(
             encoding="utf-8",
         )
         tmp.replace(state_path)
-    except OSError:
-        pass
+    except OSError as exc:
+        logger.warning("Failed persisting headroom state to %s: %s", state_path, exc)
+    return res
+
+
+def admit_cooperative_opportunity(
+    coordinator: "OpportunityCoordinator",
+    opportunity_id: int,
+    *,
+    expected_revision: int,
+    state_path: Path,
+    mem_avail_mib: float | None,
+    tick_p99_ms: float | None,
+    active_managed_groups: int,
+    max_managed_groups: int = DEFAULT_MAX_GROUPS,
+    now_ts: int | None = None,
+) -> dict[str, Any]:
+    """Live cooperative admission path enforcing fail-closed persisted headroom & hysteresis (Issue #61)."""
+    hr = evaluate_persisted_headroom(
+        state_path,
+        mem_avail_mib=mem_avail_mib,
+        tick_p99_ms=tick_p99_ms,
+        active_managed_groups=active_managed_groups,
+        max_managed_groups=max_managed_groups,
+        now_ts=now_ts,
+    )
+    if not hr["admit_ok"]:
+        logger.warning(
+            "Cooperative opportunity #%s blocked by resource headroom: %s",
+            opportunity_id,
+            ",".join(hr["reasons"]),
+        )
+        return {
+            "ok": False,
+            "reason": "resource_headroom_blocked",
+            "headroom": hr,
+        }
+    res = coordinator.reserve_party(
+        opportunity_id,
+        expected_revision=expected_revision,
+        now_ts=now_ts,
+    )
+    res["headroom"] = hr
     return res
 
 
@@ -508,7 +553,8 @@ def _read_existing_enrollments_readonly(db_path: Path) -> dict[int, tuple[str, b
         ).fetchall()
         for r in rows:
             out[int(r["character_guid"])] = (str(r["persona_id"]), bool(int(r["enrolled_coop"])))
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        logger.warning("Read-only persona enrollment lookup failed for %s: %s", db_path, exc)
         return {}
     finally:
         if conn is not None:
@@ -541,7 +587,8 @@ def read_shadow_artifact(path: Path, *, now_ts: int | None = None, max_age_sec: 
             "age_sec": age_sec,
             "data": raw,
         }
-    except Exception:
+    except Exception as exc:
+        logger.warning("Failed reading shadow artifact %s: %s: %s", path, type(exc).__name__, exc)
         return {"ok": False, "status": "corrupted", "stale": True, "data": None}
 
 
@@ -576,7 +623,8 @@ def run_shadow_match_snapshot(
     try:
         if hr_path.is_file():
             prev_paused = bool(json.loads(hr_path.read_text(encoding="utf-8")).get("paused", False))
-    except Exception:
+    except Exception as exc:
+        logger.warning("Corrupt headroom state at %s during shadow read (%s); assuming paused", hr_path, exc)
         prev_paused = True
     headroom = check_resource_headroom(
         mem_avail_mib=mem_avail_mib,

@@ -179,6 +179,74 @@ class Batch3And4P2Tests(unittest.TestCase):
             self.assertEqual(focus, set())
             self.assertEqual(mats, {})
 
+            # Live cooperative admission guard enforces fail-closed headroom + persisted hysteresis
+            from hearthcore.opportunities import OpportunityCoordinator, admit_cooperative_opportunity
+            coord = OpportunityCoordinator(tp / "coop.db")
+            opp = coord.create_opportunity(dungeon_id="deadmines_n", creator_guid=101, now_ts=2000, is_shadow=False)
+            for idx, (slug, role) in enumerate((("brannoc", "tank"), ("mira", "healer"), ("talia", "damage"), ("garrick", "damage"), ("aldric", "damage")), start=1):
+                coord.express_interest(
+                    opportunity_id=opp["id"], expected_revision=1, persona_id=f"p-{slug}",
+                    character_guid=200 + idx, character_slug=slug, role=role,
+                    reason_code="volunteer", available_until=5000, now_ts=2000,
+                )
+            live_hr = tp / "live_headroom.json"
+            blk_missing = admit_cooperative_opportunity(
+                coord, opp["id"], expected_revision=1, state_path=live_hr,
+                mem_avail_mib=None, tick_p99_ms=20.0, active_managed_groups=0, now_ts=2001,
+            )
+            self.assertFalse(blk_missing["ok"])
+            self.assertEqual(blk_missing["reason"], "resource_headroom_blocked")
+            # Hysteresis keeps live path paused at 580 MiB (<640)
+            blk_hyst = admit_cooperative_opportunity(
+                coord, opp["id"], expected_revision=1, state_path=live_hr,
+                mem_avail_mib=580.0, tick_p99_ms=20.0, active_managed_groups=0, now_ts=2005,
+            )
+            self.assertFalse(blk_hyst["ok"])
+            # Recovery >=640 MiB and <=38 ms admits and reserves party!
+            admitted = admit_cooperative_opportunity(
+                coord, opp["id"], expected_revision=1, state_path=live_hr,
+                mem_avail_mib=700.0, tick_p99_ms=20.0, active_managed_groups=0, now_ts=2010,
+            )
+            self.assertTrue(admitted["ok"])
+            self.assertEqual(len(admitted["party"]), 5)
+
+            # Structured cycle_summary JSON log is emitted on hearthcore.bridge logger
+            from hearthcore.bridge import run_cycle
+            world = {
+                "observed_at": "2026-11-25T16:00:00Z",
+                "weekly_event": "",
+                "companions": {
+                    "brannoc": {
+                        "guid": 101, "name": "Brannoc", "slug": "brannoc", "level": 30,
+                        "xp": 0, "zone_id": 10, "zone": "Duskwood", "map_id": 0, "gold": 25.0,
+                        "online": True, "shift_group": "core-wonky",
+                        "skills": {164: (100, 150), 186: (100, 150)},
+                        "orders_delivered": 0, "quests_rewarded": 0, "ledger_ops": 0,
+                        "recent_events": [], "social_bonds": [],
+                    }
+                },
+                "work_orders": [], "humans": [], "owner_levels": {"wonky": 30},
+                "qm_focus": set(), "qm_mats_by_skill": {}, "qm_meta": {}, "proposals": {},
+            }
+            with self.assertLogs("hearthcore", level="INFO") as logs:
+                run_cycle(
+                    provider="fallback", apply=False, character="brannoc",
+                    db_path=tp / "brain.db", runtime_dir=tp / "rt",
+                    world_ctx_override=world, sql_exec=lambda _s: [], now_ts_override=1_800_000_000,
+                )
+            self.assertTrue(any("cycle_summary" in msg for msg in logs.output))
+
+        # AST invariant: ZERO silent `except ...: pass` handlers anywhere in hearthcore/*.py!
+        import ast
+        silent_handlers = []
+        for py in sorted((ROOT / "hearthcore").glob("*.py")):
+            tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ExceptHandler):
+                    if len(node.body) == 1 and isinstance(node.body[0], ast.Pass):
+                        silent_handlers.append(f"{py.name}:{node.lineno}")
+        self.assertEqual(silent_handlers, [], f"Found silent except:pass handlers: {silent_handlers}")
+
     # ------------------------------------------------------------------
     # Issue #62: TSV parser handles NULL, tab, newline, U+2028 & fails loudly on malformed rows
     # ------------------------------------------------------------------
