@@ -1022,8 +1022,26 @@ void Dismount(PlayerbotAI* botAI, Player* bot)
     }
 }
 
-bool Teleport(Player* bot, Point const& p)
+// The only teleports the transport system performs. Every one names an approved reason and is logged with its leg.
+// A stock area trigger or portal that refuses the companion is NOT a reason to teleport: the leg waits and retries.
+enum class TeleportReason : uint8
 {
+    BoatDock,  // dock-to-dock boat move (owner-approved)
+    TramRide,  // platform-to-platform tram move (owner-approved, issue #80)
+};
+
+char const* TeleportReasonName(TeleportReason reason)
+{
+    return reason == TeleportReason::BoatDock ? "boat-dock" : "tram-ride";
+}
+
+bool Teleport(Player* bot, Point const& p, TeleportReason reason, uint32 legId)
+{
+    LOG_INFO("playerbots",
+             "Companion {}: transport teleport leg={} reason={} from={}:{:.1f},{:.1f},{:.1f} "
+             "to={}:{:.1f},{:.1f},{:.1f}",
+             bot->GetName(), legId, TeleportReasonName(reason), bot->GetMapId(), bot->GetPositionX(),
+             bot->GetPositionY(), bot->GetPositionZ(), p.map, p.x, p.y, p.z);
     bot->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_TELEPORTED | AURA_INTERRUPT_FLAG_CHANGE_MAP);
     return bot->TeleportTo(p.map, p.x, p.y, p.z, bot->GetOrientation());
 }
@@ -1209,6 +1227,9 @@ CompanionTransport::Drive CompanionTransport::Step(PlayerbotAI* botAI, std::stri
     if (!Ready() || !Enabled())
         return bot->GetMapId() != mapId ? Drive::Failed : Drive::NotNeeded;
     if (bot->IsBeingTeleported() || !bot->IsInWorld())
+        return Drive::Busy;
+    // No transport phase advances while the companion is dead or in combat (issue #80): it waits here.
+    if (!bot->IsAlive() || bot->IsInCombat())
         return Drive::Busy;
 
     uint32 const low = bot->GetGUID().GetCounter();
@@ -1452,7 +1473,7 @@ CompanionTransport::Drive CompanionTransport::Step(PlayerbotAI* botAI, std::stri
                          "Companion {}: transport depart from={} to={} wait={} kind=tram id={} sched=random",
                          bot->GetName(), from.name, to.name, run.waitSec, leg->id);
                 if (!FireTrigger(bot, leg->id))
-                    Teleport(bot, leg->tramIn);   // the trigger's own destination
+                    return replan("tram-trigger-refused", false);   // walk back to the dock; fails after repeats
                 run.phase = Phase::InTram;
                 run.waitUntilMs = 0;
             }
@@ -1463,7 +1484,7 @@ CompanionTransport::Drive CompanionTransport::Step(PlayerbotAI* botAI, std::stri
                          "Companion {}: transport depart from={} to={} wait=0 kind=portal id={} sched=portal",
                          bot->GetName(), from.name, to.name, leg->id);
                 if (!FireTrigger(bot, leg->id))
-                    Teleport(bot, to);   // the trigger's own destination
+                    return replan("portal-trigger-refused", false);   // walk back to the dock; fails after repeats
                 run.phase = Phase::Arriving;
             }
             else   // Dalaran portal object
@@ -1500,7 +1521,7 @@ CompanionTransport::Drive CompanionTransport::Step(PlayerbotAI* botAI, std::stri
                 StoreRun(low, run);
                 return Drive::Busy;
             }
-            if (!Teleport(bot, to))
+            if (!Teleport(bot, to, TeleportReason::BoatDock, leg->id))
             {
                 if (++run.fails >= 3)
                     return replan("teleport-failed", false);
@@ -1542,7 +1563,7 @@ CompanionTransport::Drive CompanionTransport::Step(PlayerbotAI* botAI, std::stri
             if (nowMs >= run.waitUntilMs)
             {
                 // The ride: platform to platform on map 369, then the exit trigger.
-                Teleport(bot, leg->tramOut);
+                Teleport(bot, leg->tramOut, TeleportReason::TramRide, leg->id);
                 run.phase = Phase::TramExit;
                 run.nearSinceMs = nowMs;
             }
@@ -1554,8 +1575,8 @@ CompanionTransport::Drive CompanionTransport::Step(PlayerbotAI* botAI, std::stri
             CompanionLease::KeepAlive(low);
             if (bot->GetMapId() == MAP_TRAM)
             {
-                if (!FireTrigger(bot, leg->exitTrigger) && nowMs - run.nearSinceMs > 5000)
-                    Teleport(bot, to);   // the exit trigger's own destination
+                // Stock exit trigger only. If it never fires, the 60 s replan below fails the leg.
+                FireTrigger(bot, leg->exitTrigger);
                 if (nowMs - run.nearSinceMs > 60000)
                     return replan("tram-exit-failed", false);
             }
