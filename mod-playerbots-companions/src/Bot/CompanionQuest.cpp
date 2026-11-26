@@ -1764,6 +1764,31 @@ bool CompanionQuest::BuyMount(PlayerbotAI* botAI, Creature* vendor, uint32 itemI
                  vendor->GetEntry(), itemId);
         return false;
     }
+    // Decide before paying: find the learn trigger, refuse a mount the companion already knows, and refuse an
+    // item with no learn trigger (it would only sit in the bags). Keep a gold reserve after the purchase.
+    uint32 taught = 0;
+    for (auto const& spell : proto->Spells)
+        if (spell.SpellTrigger == ITEM_SPELLTRIGGER_LEARN_SPELL_ID && spell.SpellId > 0)
+            taught = static_cast<uint32>(spell.SpellId);
+    if (!taught)
+    {
+        LOG_INFO("playerbots", "Companion {}: mount blocked reason=no-learn-trigger item={}", bot->GetName(), itemId);
+        return false;
+    }
+    if (bot->HasSpell(taught))
+    {
+        LOG_INFO("playerbots", "Companion {}: mount blocked reason=already-known item={} spell={}", bot->GetName(),
+                 itemId, taught);
+        return false;
+    }
+    uint64 const reserveCopper =
+        static_cast<uint64>(sConfigMgr->GetOption<uint32>("AiPlayerbot.Companion.Quest.MountGoldReserve", 1)) * 10000u;
+    if (static_cast<uint64>(bot->GetMoney()) < static_cast<uint64>(proto->BuyPrice) + reserveCopper)
+    {
+        LOG_INFO("playerbots", "Companion {}: mount blocked reason=gold-reserve item={} price={} gold={}",
+                 bot->GetName(), itemId, proto->BuyPrice, bot->GetMoney());
+        return false;
+    }
     uint32 const moneyBefore = bot->GetMoney();
     bot->BuyItemFromVendorSlot(vendor->GetGUID(), static_cast<uint32>(slot), itemId, 1, NULL_BAG, NULL_SLOT);
     if (!bot->HasItemCount(itemId, 1))
@@ -1774,11 +1799,7 @@ bool CompanionQuest::BuyMount(PlayerbotAI* botAI, Creature* vendor, uint32 itemI
     }
     uint32 const cost = moneyBefore > bot->GetMoney() ? moneyBefore - bot->GetMoney() : 0;
     // Same result as using the item: the taught spell is learned and the item is consumed.
-    uint32 taught = 0;
-    for (auto const& spell : proto->Spells)
-        if (spell.SpellTrigger == ITEM_SPELLTRIGGER_LEARN_SPELL_ID && spell.SpellId > 0)
-            taught = static_cast<uint32>(spell.SpellId);
-    if (taught && !bot->HasSpell(taught))
+    if (!bot->HasSpell(taught))
     {
         bot->learnSpell(taught);
         bot->DestroyItemCount(itemId, 1, true);
