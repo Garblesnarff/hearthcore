@@ -47,9 +47,9 @@ from .guides import (
     compute_supply_report,
 )
 from .provider import (
-    DEFAULT_BUDGET_DB,
     VALID_EFFORTS,
     _strip_json_fences,
+    default_budget_db_path,
     load_env,
     parse_retry_after_seconds,
 )
@@ -339,7 +339,7 @@ def call_claude_quartermaster(
 
     ledger: BudgetLedger | None = budget
     if ledger is None and not allow_unbudgeted_for_test:
-        ledger = BudgetLedger(budget_db_path or DEFAULT_BUDGET_DB)
+        ledger = BudgetLedger(budget_db_path or default_budget_db_path())
     if ledger is not None:
         ledger.check_provider_available("anthropic", now_ts=now_ts)
 

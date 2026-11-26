@@ -570,13 +570,20 @@ def run_shadow_match_snapshot(
     v = vitals or {}
     mem_avail_mib = float(v["mem_avail_gib"]) * 1024.0 if v.get("mem_avail_gib") is not None else None
     tick_p99 = float(v["tick_p99"]) if v.get("tick_p99") is not None else None
-    headroom = evaluate_persisted_headroom(
-        runtime_dir / "headroom_state.json",
+    # Issue #15: Shadow pass reads persisted headroom state READ-ONLY and NEVER writes headroom_state.json!
+    prev_paused = False
+    hr_path = runtime_dir / "headroom_state.json"
+    try:
+        if hr_path.is_file():
+            prev_paused = bool(json.loads(hr_path.read_text(encoding="utf-8")).get("paused", False))
+    except Exception:
+        prev_paused = True
+    headroom = check_resource_headroom(
         mem_avail_mib=mem_avail_mib,
         tick_p99_ms=tick_p99,
         active_managed_groups=0,
         max_managed_groups=DEFAULT_MAX_GROUPS,
-        now_ts=ts,
+        prev_paused=prev_paused,
     )
 
     shadow_dungeons: list[dict[str, Any]] = []

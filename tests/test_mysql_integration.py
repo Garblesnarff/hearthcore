@@ -1,10 +1,13 @@
 """Real MySQL 8.4 schema & SQL integration tests (Issues #53, #54, #62, #64).
 
-Skipped automatically when HEARTHCORE_DB_HOST is not set (unit-only local runs);
-runs automatically in GitHub Actions `mysql-integration` job against ops/sql/companion_schema.sql.
+SAFETY GUARD:
+- Skipped unless BOTH `HEARTHCORE_TEST_DB=1` AND `HEARTHCORE_DB_HOST` are set AND
+  `HEARTHCORE_DB_NAME` explicitly ends with `_test` (e.g. `acore_characters_test`).
+- Never runs TRUNCATE against a live `acore_characters` database!
 """
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -15,9 +18,20 @@ from hearthcore.core import ROOT, fallback, profile, snapshot
 from hearthcore.quartermaster import apply_quartermaster_plan
 
 
-@unittest.skipUnless(os.getenv("HEARTHCORE_DB_HOST"), "Requires live/CI MySQL via HEARTHCORE_DB_HOST")
+def _is_safe_test_db() -> bool:
+    return (
+        os.getenv("HEARTHCORE_TEST_DB") == "1"
+        and bool(os.getenv("HEARTHCORE_DB_HOST", "").strip())
+        and os.getenv("HEARTHCORE_DB_NAME", "").strip().endswith("_test")
+    )
+
+
+@unittest.skipUnless(_is_safe_test_db(), "Requires HEARTHCORE_TEST_DB=1, HEARTHCORE_DB_HOST, and *_test DB name")
 class MySQLIntegrationTests(unittest.TestCase):
     def setUp(self):
+        db_name = os.getenv("HEARTHCORE_DB_NAME", "").strip()
+        if not db_name.endswith("_test"):
+            raise RuntimeError(f"Refusing to truncate non-test database: {db_name!r}")
         run_sql(
             "TRUNCATE TABLE companion_weight_overrides;\n"
             "TRUNCATE TABLE companion_proposals;\n"
@@ -27,8 +41,6 @@ class MySQLIntegrationTests(unittest.TestCase):
         )
 
     def test_apply_plan_monotonic_revision_and_reconcile(self):
-        import json
-
         p = profile("brannoc")
         snap = snapshot(json.loads((ROOT / "examples" / "brannoc.json").read_text(encoding="utf-8")), "brannoc")
         plan = fallback(p, snap)
@@ -47,7 +59,6 @@ class MySQLIntegrationTests(unittest.TestCase):
             self.assertTrue(rep["ok"])
 
     def test_quartermaster_atomic_manual_preservation_and_order_cap(self):
-        # Seed a manual GM bank request that Quartermaster MUST NEVER overwrite or delete!
         run_sql(
             "INSERT INTO companion_bank_requests (item_entry, requested_by, min_count, note) "
             "VALUES (2770, 'WonkyGM', 150, 'Manual GM priority');"
@@ -69,22 +80,20 @@ class MySQLIntegrationTests(unittest.TestCase):
         self.assertEqual(added, 1, "Transaction must cap open orders at target_open_orders=1")
         self.assertEqual(qm_banks, 1)
 
-        # Manual GM row untouched!
         gm_row = run_sql(
             "SELECT requested_by, min_count, note FROM companion_bank_requests WHERE item_entry = 2770;",
             expected_cols=3,
         )
         self.assertEqual(gm_row[0], ["WonkyGM", "150", "Manual GM priority"])
 
-    def test_tsv_parser_handles_null_tab_newline_and_u2028(self):
-        # Insert tricky characters (tab, newline, U+2028) into companion_events and read back cleanly
+    def test_tsv_parser_handles_null_tab_newline_cr_and_u2028(self):
         run_sql(
             "INSERT INTO companion_events (guid, event_type, summary, partner_guid, zone_id, created_at) "
-            "VALUES (101, 'test', CONCAT('a', CHAR(9), 'b', CHAR(10), 'c', UNHEX('E280A8'), 'd'), 0, 12, 1800000000);"
+            "VALUES (101, 'test', CONCAT('a', CHAR(9), 'b', CHAR(10), 'c', CHAR(13), 'd', UNHEX('E280A8'), 'e'), 0, 12, 1800000000);"
         )
         rows = run_sql("SELECT guid, summary, NULL FROM companion_events LIMIT 1;", expected_cols=3)
         self.assertEqual(rows[0][0], "101")
-        self.assertEqual(rows[0][1], "a\tb\nc\u2028d")
+        self.assertEqual(rows[0][1], "a\tb\nc\rd\u2028e")
         self.assertIsNone(rows[0][2])
 
 

@@ -34,5 +34,5 @@ Profile preference keys in `characters/<slug>/profile.json` map to native `Compa
 | `travel` | `travel` |
 | `rest` | `hearth` |
 
-- **Native merge rule (`CompanionBrain.cpp`):** Active, non-expired rows in `companion_weight_overrides` **REPLACE** baseline `companion_weights` values for each key present, **except** manually tuned baseline rows (`source != 'hearthcore'`), which retain strict precedence (`manualKeys`).
-- **Persona preservation:** Because native overrides replace baseline keys, `weights_for_cpp()` starts from the companion's mapped `char_profile["preferences"]` baseline rather than `1.0`, so unmentioned persona traits persist throughout every session plan. `ops/hearthcore-sync.py` never overwrites manually tuned canonical rows unless `--overwrite-manual` is explicitly passed.
+- **Native merge rule (`CompanionBrain.cpp:523,555`):** Active, non-expired rows in `companion_weight_overrides` **REPLACE** baseline `companion_weights` values for each key present, **except** rows with `source == 'manual'` (`manualKeys`), which retain strict precedence.
+- **Persona preservation:** Because native overrides replace baseline keys, `weights_for_cpp()` starts from the companion's mapped `char_profile["preferences"]` baseline rather than `1.0`, so unmentioned persona traits persist throughout every session plan. `ops/hearthcore-sync.py` never overwrites manually tuned canonical rows (`source != 'hearthcore'`, including `source == 'manual'`) unless `--overwrite-manual` is explicitly passed.

@@ -24,13 +24,18 @@ from .core import Invalid, ROOT, validate
 VALID_EFFORTS = {"low", "medium", "high", "max"}
 FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*\Z", re.DOTALL)
 DEFAULT_MAX_TOKENS = 1600
-DEFAULT_BUDGET_DB = ROOT / "runtime" / "brain.db"
+
+
+def default_budget_db_path() -> Path:
+    """Resolve shared budget DB dynamically from HEARTHCORE_RUNTIME_DIR (Issue #55)."""
+    rt = Path(os.getenv("HEARTHCORE_RUNTIME_DIR", str(ROOT / "runtime")))
+    return rt / "brain.db"
 
 
 def load_env(env_path: Path | None = None) -> None:
     """Populate os.environ from dashboard overrides & .env (setdefault only, never prints secrets)."""
-    # Issue #72: Dashboard mutable settings live in runtime/dashboard_overrides.env (never rewriting .env!)
-    override_path = Path(os.getenv("HEARTHCORE_DASHBOARD_OVERRIDES_PATH", str(ROOT / "runtime" / "dashboard_overrides.env")))
+    rt = Path(os.getenv("HEARTHCORE_RUNTIME_DIR", str(ROOT / "runtime")))
+    override_path = Path(os.getenv("HEARTHCORE_DASHBOARD_OVERRIDES_PATH", str(rt / "dashboard_overrides.env")))
     base_path = env_path or Path(os.getenv("HEARTHCORE_ENV_PATH", str(ROOT / ".env")))
     for path in (override_path, base_path):
         if not path.is_file():
@@ -107,7 +112,7 @@ def anthropic_with_meta(
 
     ledger: BudgetLedger | None = budget
     if ledger is None and not allow_unbudgeted_for_test:
-        ledger = BudgetLedger(budget_db_path or DEFAULT_BUDGET_DB)
+        ledger = BudgetLedger(budget_db_path or default_budget_db_path())
 
     if ledger is not None:
         ledger.check_provider_available("anthropic", now_ts=now_ts)

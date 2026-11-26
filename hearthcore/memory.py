@@ -175,10 +175,11 @@ class MemoryEngine:
                 "CREATE INDEX IF NOT EXISTS idx_intentions_char_status "
                 "ON intentions(character_id, status, updated_at DESC)"
             )
-            # Durable autobiographical event journal (Issue #4)
+            # Durable autobiographical event journal keyed by (epoch, source_id) so counter resets never drop events (Issues #4 & #57)
             db.execute("""
                 CREATE TABLE IF NOT EXISTS event_journal (
-                    source_id INTEGER PRIMARY KEY,
+                    epoch INTEGER NOT NULL DEFAULT 0,
+                    source_id INTEGER NOT NULL,
                     guid INTEGER NOT NULL,
                     character_id TEXT NOT NULL,
                     event_type TEXT NOT NULL,
@@ -187,9 +188,39 @@ class MemoryEngine:
                     zone_id INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL,
                     is_milestone INTEGER NOT NULL DEFAULT 0,
-                    ingested_at INTEGER NOT NULL
+                    ingested_at INTEGER NOT NULL,
+                    PRIMARY KEY (epoch, source_id)
                 )
             """)
+            ej_cols = {r[1] for r in db.execute("PRAGMA table_info(event_journal)").fetchall()}
+            if "epoch" not in ej_cols:
+                db.execute("""
+                    CREATE TABLE event_journal_v2 (
+                        epoch INTEGER NOT NULL DEFAULT 0,
+                        source_id INTEGER NOT NULL,
+                        guid INTEGER NOT NULL,
+                        character_id TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        summary TEXT NOT NULL,
+                        partner_guid INTEGER NOT NULL DEFAULT 0,
+                        zone_id INTEGER NOT NULL DEFAULT 0,
+                        created_at INTEGER NOT NULL,
+                        is_milestone INTEGER NOT NULL DEFAULT 0,
+                        ingested_at INTEGER NOT NULL,
+                        PRIMARY KEY (epoch, source_id)
+                    )
+                """)
+                db.execute("""
+                    INSERT INTO event_journal_v2 (
+                        epoch, source_id, guid, character_id, event_type, summary,
+                        partner_guid, zone_id, created_at, is_milestone, ingested_at
+                    )
+                    SELECT 0, source_id, guid, character_id, event_type, summary,
+                           partner_guid, zone_id, created_at, is_milestone, ingested_at
+                    FROM event_journal
+                """)
+                db.execute("DROP TABLE event_journal")
+                db.execute("ALTER TABLE event_journal_v2 RENAME TO event_journal")
             db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_ej_char_ms "
                 "ON event_journal(character_id, is_milestone DESC, created_at DESC, source_id DESC)"
@@ -204,6 +235,7 @@ class MemoryEngine:
                     last_source_id INTEGER NOT NULL DEFAULT 0,
                     first_source_id INTEGER NOT NULL DEFAULT 0,
                     latest_source_id INTEGER NOT NULL DEFAULT 0,
+                    current_epoch INTEGER NOT NULL DEFAULT 0,
                     gap_detected INTEGER NOT NULL DEFAULT 0,
                     gap_note TEXT NOT NULL DEFAULT '',
                     updated_at INTEGER NOT NULL
@@ -212,6 +244,8 @@ class MemoryEngine:
             ec_cols = {r[1] for r in db.execute("PRAGMA table_info(event_cursors)").fetchall()}
             if "latest_source_id" not in ec_cols:
                 db.execute("ALTER TABLE event_cursors ADD COLUMN latest_source_id INTEGER NOT NULL DEFAULT 0")
+            if "current_epoch" not in ec_cols:
+                db.execute("ALTER TABLE event_cursors ADD COLUMN current_epoch INTEGER NOT NULL DEFAULT 0")
 
     @contextlib.contextmanager
     def _conn(self):
@@ -260,22 +294,25 @@ class MemoryEngine:
 
         with self._conn() as db:
             cur_row = db.execute(
-                "SELECT last_source_id, first_source_id, latest_source_id, gap_detected, gap_note "
+                "SELECT last_source_id, first_source_id, latest_source_id, current_epoch, gap_detected, gap_note "
                 "FROM event_cursors WHERE scope = ?",
                 (scope,),
             ).fetchone()
             prev_last = int(cur_row["last_source_id"]) if cur_row else 0
             first_seen = int(cur_row["first_source_id"]) if cur_row else 0
             prev_latest = int(cur_row["latest_source_id"]) if cur_row else 0
+            epoch = int(cur_row["current_epoch"]) if cur_row else 0
             prev_gap = bool(cur_row["gap_detected"]) if cur_row else False
             prev_gap_note = str(cur_row["gap_note"]) if cur_row else ""
 
             # Detect source table truncation / AUTO_INCREMENT counter reset on EVERY run (Issue #57)
+            # Increment epoch so reused source_ids 1..N are NEVER dropped by INSERT OR IGNORE!
             if max_available_source_id is not None and prev_last > 0 and max_available_source_id < prev_last:
                 reset_detected = True
+                epoch += 1
                 gap_detected = True
                 gap_note = (
-                    f"Source counter reset/truncated (max #{max_available_source_id} < cursor #{prev_last}); rewound cursor"
+                    f"Source counter reset/truncated (max #{max_available_source_id} < cursor #{prev_last}); rewound cursor (epoch={epoch})"
                 )
                 prev_last = 0
 
@@ -296,11 +333,12 @@ class MemoryEngine:
                 res = db.execute(
                     """
                     INSERT OR IGNORE INTO event_journal (
-                        source_id, guid, character_id, event_type, summary,
+                        epoch, source_id, guid, character_id, event_type, summary,
                         partner_guid, zone_id, created_at, is_milestone, ingested_at
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
+                        epoch,
                         sid,
                         int(ev.get("guid") or 0),
                         str(ev.get("character_id") or "").lower(),
@@ -335,32 +373,34 @@ class MemoryEngine:
             if reset_detected:
                 db.execute(
                     """
-                    INSERT INTO event_cursors (scope, last_source_id, first_source_id, latest_source_id, gap_detected, gap_note, updated_at)
-                    VALUES (?,?,?,?,?,?,?)
+                    INSERT INTO event_cursors (scope, last_source_id, first_source_id, latest_source_id, current_epoch, gap_detected, gap_note, updated_at)
+                    VALUES (?,?,?,?,?,?,?,?)
                     ON CONFLICT(scope) DO UPDATE SET
                         last_source_id = excluded.last_source_id,
                         first_source_id = CASE WHEN first_source_id = 0 THEN excluded.first_source_id ELSE first_source_id END,
                         latest_source_id = excluded.latest_source_id,
+                        current_epoch = excluded.current_epoch,
                         gap_detected = 1,
                         gap_note = excluded.gap_note,
                         updated_at = excluded.updated_at
                     """,
-                    (scope, max_id, first_seen, latest_src, final_gap, final_note[:180], ts),
+                    (scope, max_id, first_seen, latest_src, epoch, final_gap, final_note[:180], ts),
                 )
             else:
                 db.execute(
                     """
-                    INSERT INTO event_cursors (scope, last_source_id, first_source_id, latest_source_id, gap_detected, gap_note, updated_at)
-                    VALUES (?,?,?,?,?,?,?)
+                    INSERT INTO event_cursors (scope, last_source_id, first_source_id, latest_source_id, current_epoch, gap_detected, gap_note, updated_at)
+                    VALUES (?,?,?,?,?,?,?,?)
                     ON CONFLICT(scope) DO UPDATE SET
                         last_source_id = MAX(last_source_id, excluded.last_source_id),
                         first_source_id = CASE WHEN first_source_id = 0 THEN excluded.first_source_id ELSE MIN(first_source_id, excluded.first_source_id) END,
                         latest_source_id = MAX(latest_source_id, excluded.latest_source_id),
+                        current_epoch = MAX(current_epoch, excluded.current_epoch),
                         gap_detected = MAX(gap_detected, excluded.gap_detected),
                         gap_note = CASE WHEN excluded.gap_note != '' THEN excluded.gap_note ELSE gap_note END,
                         updated_at = excluded.updated_at
                     """,
-                    (scope, max_id, first_seen, latest_src, final_gap, final_note[:180], ts),
+                    (scope, max_id, first_seen, latest_src, epoch, final_gap, final_note[:180], ts),
                 )
 
         return {

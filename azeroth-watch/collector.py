@@ -131,13 +131,24 @@ class PersistentMySQLPipe:
             return True
         self._close()
         try:
+            db_defaults = os.getenv("AZEROTH_WATCH_DB_DEFAULTS_FILE", "").strip()
             db_user = os.getenv("AZEROTH_WATCH_DB_USER", "").strip()
             db_pass = os.getenv("AZEROTH_WATCH_DB_PASSWORD", "")
             db_host = os.getenv("AZEROTH_WATCH_DB_HOST", "127.0.0.1").strip()
             db_port = os.getenv("AZEROTH_WATCH_DB_PORT", "3306").strip()
             db_container = os.getenv("HEARTHCORE_DB_CONTAINER", "ac-database")
-            if db_user and db_pass and shutil.which("mysql"):
-                # Direct TCP connection as SELECT-only user (zero Docker socket access required!)
+            if db_defaults and shutil.which("mysql"):
+                # Safest path: chmod-600 option file (zero password in argv/env, zero Docker socket!)
+                cmd = [
+                    "mysql", f"--defaults-extra-file={db_defaults}",
+                    "--batch", "--quick", "--unbuffered", "--skip-column-names",
+                ]
+                self._proc = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True, bufsize=1,
+                )
+            elif db_user and db_pass and shutil.which("mysql"):
+                # Direct TCP connection as SELECT-only user (password passed in child env ONLY, never argv!)
                 env = dict(os.environ, MYSQL_PWD=db_pass)
                 cmd = [
                     "mysql", f"-h{db_host}", f"-P{db_port}", f"-u{db_user}",
@@ -146,15 +157,6 @@ class PersistentMySQLPipe:
                 self._proc = subprocess.Popen(
                     cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                     text=True, bufsize=1, env=env,
-                )
-            elif db_user and db_pass:
-                cmd = [
-                    "docker", "exec", "-i", "-e", f"MYSQL_PWD={db_pass}", db_container,
-                    "mysql", f"-u{db_user}", "--batch", "--quick", "--unbuffered", "--skip-column-names",
-                ]
-                self._proc = subprocess.Popen(
-                    cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                    text=True, bufsize=1,
                 )
             else:
                 self._proc = subprocess.Popen(
@@ -688,6 +690,16 @@ class AzerothCollector:
                     ai_brain["budget"] = raw_ai["budget"]
                 if isinstance(raw_ai.get("ab_report"), dict):
                     ai_brain["ab_report"] = raw_ai["ab_report"]
+                ai_brain["stale_alarm"] = bool(raw_ai.get("stale_alarm"))
+                # Surface recent failure alerts from runtime/failure_alerts.log so alerts reach the operator!
+                alerts_log = os.path.join(_HC_ROOT, "runtime", "failure_alerts.log")
+                if os.path.isfile(alerts_log):
+                    try:
+                        with open(alerts_log, "r", encoding="utf-8") as af:
+                            tail_lines = af.read().splitlines()[-10:]
+                        ai_brain["failure_alerts"] = [json.loads(ln) for ln in tail_lines if ln.strip().startswith("{")]
+                    except Exception:
+                        ai_brain["failure_alerts"] = []
             if os.path.isfile(AI_QM_FILE):
                 with open(AI_QM_FILE, "r", encoding="utf-8") as f:
                     ai_brain["quartermaster"] = json.load(f)

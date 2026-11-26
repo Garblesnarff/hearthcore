@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -8,6 +9,10 @@ from .store import record
 
 
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     cli = argparse.ArgumentParser()
     commands = cli.add_subparsers(dest="command", required=True)
     commands.add_parser("roster")
@@ -66,14 +71,19 @@ def main():
             return 0
 
         if args.command == "brain-tick":
-            from .bridge import run_cycle
-            res = run_cycle(
-                provider=args.provider,
-                apply=not args.shadow,
-                force=args.force,
-                limit=args.limit,
-                character=args.character,
-            )
+            from .bridge import RunLockBusy, install_sigterm_handler, run_cycle
+            install_sigterm_handler()
+            try:
+                res = run_cycle(
+                    provider=args.provider,
+                    apply=not args.shadow,
+                    force=args.force,
+                    limit=args.limit,
+                    character=args.character,
+                )
+            except RunLockBusy as exc:
+                logging.getLogger("hearthcore").warning("brain-tick skipped cleanly: %s", exc)
+                return 0
             for item in res["planned"]:
                 err = f" err={item['error']}" if item["error"] else ""
                 print(
@@ -82,12 +92,15 @@ def main():
                     f"tok={item['tokens']}, {item['latency_ms']}ms){err}"
                 )
             t = res["summary"]["today"]
+            failed = res.get("failed") or []
             print(
-                f"Cycle done: planned={res['planned_count']} | today: ai_ok={t['ai_ok']} "
+                f"Cycle done: planned={res['planned_count']} failed={len(failed)} | today: ai_ok={t['ai_ok']} "
                 f"ai_err={t['ai_err']} fb={t['fallback']} tok={t['input_tokens']}in/{t['output_tokens']}out "
                 f"cap={res['summary']['daily_cap']}"
             )
-            return 0
+            for fitem in failed:
+                print(f"FAILED {fitem['name']}: {fitem['error']}", file=sys.stderr)
+            return 1 if failed else 0
 
         if args.command == "brain-status":
             from .bridge import BRAIN_DB_PATH, BrainStore, is_brain_disabled, load_env
@@ -121,6 +134,14 @@ def main():
                     for src, v in sorted(by_src.items())
                 ]
                 print(f"A/B Outcomes ({ab.get('window_days', 14)}d, holdout={ab.get('holdout_pct', 0)}%): " + " | ".join(parts))
+            from .bridge import RUNTIME_DIR
+            alerts_file = RUNTIME_DIR / "failure_alerts.log"
+            if alerts_file.is_file():
+                recent_alerts = alerts_file.read_text(encoding="utf-8").splitlines()[-5:]
+                if recent_alerts:
+                    print(f"Recent Failure Alerts ({len(recent_alerts)} shown from {alerts_file.name}):")
+                    for ln in recent_alerts:
+                        print(f"  ! {ln}")
             active = [v for v in s["plans"].values() if v["active"]]
             print(f"Active session plans ({len(active)}):")
             for v in sorted(active, key=lambda x: x["character_id"]):
@@ -169,12 +190,17 @@ def main():
             return 0
 
         if args.command == "quartermaster-tick":
+            from .bridge import RunLockBusy
             from .quartermaster import run_quartermaster
-            res = run_quartermaster(
-                provider=args.provider,
-                apply=not args.shadow,
-                model=args.model,
-            )
+            try:
+                res = run_quartermaster(
+                    provider=args.provider,
+                    apply=not args.shadow,
+                    model=args.model,
+                )
+            except RunLockBusy as exc:
+                logging.getLogger("hearthcore").warning("quartermaster-tick skipped cleanly: %s", exc)
+                return 0
             p = res["plan"]
             m = res["meta"]
             print(f"[{res['source']}] model={m.get('model', res['source'])} ({m.get('latency_ms', 0)}ms, tok={m.get('input_tokens', 0)}/{m.get('output_tokens', 0)})")
@@ -244,11 +270,9 @@ def main():
         snap = snapshot(json.loads(Path(args.snapshot).read_text()), args.character)
         source = args.provider
         if source == "anthropic":
-            from .bridge import BRAIN_DB_PATH
             from .budget import BudgetLedger
-            from .provider import anthropic
-            ledger_path = (Path(args.db).parent / "brain.db") if args.db else BRAIN_DB_PATH
-            ledger = BudgetLedger(ledger_path)
+            from .provider import anthropic, default_budget_db_path
+            ledger = BudgetLedger(default_budget_db_path())
             try:
                 plan = anthropic(character, snap, budget=ledger, caller="cli_plan")
             except Invalid as e:

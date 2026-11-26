@@ -24,14 +24,29 @@ import json
 import logging
 import os
 import re
+import signal
 import sqlite3
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("hearthcore")
+_STOP_EVENT = threading.Event()
+
+
+def request_graceful_stop(*_args) -> None:
+    """Signal active planning cycle to finish current companion cleanly and exit without orphans."""
+    _STOP_EVENT.set()
+
+
+def install_sigterm_handler() -> None:
+    try:
+        signal.signal(signal.SIGTERM, request_graceful_stop)
+    except (ValueError, OSError):
+        pass
 
 from .budget import BudgetExceeded, BudgetLedger, InvalidWithUsage, ProviderBackoffError
 from .core import Invalid, ROOT, fallback, profile, profiles, snapshot, validate
@@ -62,11 +77,15 @@ QUARTERMASTER_PATH = RUNTIME_DIR / "quartermaster.json"
 DEFAULT_SQL_TIMEOUT_SEC = float(os.getenv("HEARTHCORE_SQL_TIMEOUT_SEC", "20") or 20)
 DEFAULT_STALE_MINUTES = int(os.getenv("HEARTHCORE_STALE_MINUTES", "45") or 45)
 DEFAULT_QM_MAX_AGE_SEC = int(os.getenv("HEARTHCORE_QM_MAX_AGE_SEC", str(6 * 3600)) or (6 * 3600))
-DEFAULT_FALLBACK_HOLDOUT_PCT = int(os.getenv("HEARTHCORE_FALLBACK_HOLDOUT_PCT", "10") or 10)
+DEFAULT_FALLBACK_HOLDOUT_PCT = int(os.getenv("HEARTHCORE_FALLBACK_HOLDOUT_PCT", "0") or 0)
+DEFAULT_MAX_PLANS_PER_TICK = int(os.getenv("HEARTHCORE_MAX_PLANS_PER_TICK", "8") or 8)
+DEFAULT_MAX_CONSECUTIVE_APPLY_FAILURES = int(os.getenv("HEARTHCORE_MAX_APPLY_FAILURES", "2") or 2)
+DEFAULT_APPLY_FAILURE_BACKOFF_SEC = int(os.getenv("HEARTHCORE_APPLY_BACKOFF_SEC", "900") or 900)
 
 # Canonical 1-to-many mapping between character profile preference keys and native CompanionBrain keys (Issue #60).
-# Native C++ merge rule (CompanionBrain.cpp): active companion_weight_overrides rows REPLACE baseline
-# companion_weights values for each key present, EXCEPT manually tuned keys (manualKeys) which always win.
+# Native C++ merge rule (CompanionBrain.cpp:523,555): active companion_weight_overrides rows REPLACE
+# baseline companion_weights values for each key present, EXCEPT rows with `source == 'manual'`
+# (`manualKeys`), which always take precedence.
 PROFILE_PREF_TO_NATIVE_WEIGHTS: dict[str, tuple[str, ...]] = {
     "quest": ("quest_work", "quest_turnin", "quest_hub", "quest_grind"),
     "craft": ("craft",),
@@ -78,7 +97,7 @@ PROFILE_PREF_TO_NATIVE_WEIGHTS: dict[str, tuple[str, ...]] = {
     "travel": ("travel",),
     "rest": ("hearth",),
 }
-NATIVE_MERGE_RULE = "replace_except_manual"
+NATIVE_MERGE_RULE = "replace_except_manual_source"
 
 CRAFT_SKILLS = {164, 165, 171, 197, 202, 333, 755, 773}
 GATHER_SKILLS = {182, 186, 393}
@@ -269,9 +288,14 @@ def run_sql(sql: str, *, timeout: float | None = None, expected_cols: int | None
     db_name = os.getenv("HEARTHCORE_DB_NAME", "acore_characters").strip()
     db_user = os.getenv("HEARTHCORE_DB_USER", "").strip()
     db_pass = os.getenv("HEARTHCORE_DB_PASSWORD", "")
+    defaults_file = os.getenv("HEARTHCORE_DB_DEFAULTS_FILE", "").strip()
 
-    if db_host:
-        # Direct TCP mysql client (used for least-privilege host connections & CI MySQL service container!)
+    if defaults_file:
+        # Safest path: chmod-600 MySQL option file (zero password in env or argv)
+        cmd = ["mysql", f"--defaults-extra-file={defaults_file}", "-N", "-B", db_name]
+        res = subprocess.run(cmd, input=sql, text=True, capture_output=True, check=True, timeout=max(1.0, use_timeout))
+    elif db_host:
+        # Direct TCP mysql client with MYSQL_PWD in child env ONLY (never on argv)
         env = dict(os.environ)
         env["MYSQL_PWD"] = db_pass
         cmd = [
@@ -292,21 +316,8 @@ def run_sql(sql: str, *, timeout: float | None = None, expected_cols: int | None
             timeout=max(1.0, use_timeout),
             env=env,
         )
-    elif db_user and db_pass:
-        # Least-privilege user inside container without passing password on argv
-        cmd = [
-            "docker", "exec", "-i", "-e", f"MYSQL_PWD={db_pass}", DB_CONTAINER,
-            "mysql", f"-u{db_user}", "-N", "-B", db_name,
-        ]
-        res = subprocess.run(
-            cmd,
-            input=sql,
-            text=True,
-            capture_output=True,
-            check=True,
-            timeout=max(1.0, use_timeout),
-        )
     else:
+        # Fallback to container root shell using container's own internal env var (never passed on host argv)
         res = subprocess.run(
             [
                 "docker", "exec", "-i", DB_CONTAINER, "sh", "-c",
@@ -1346,6 +1357,21 @@ class BrainStore:
                 (int(plan_id),),
             )
 
+    def recent_apply_failed(self, slug: str, now_ts: int, backoff_sec: int = DEFAULT_APPLY_FAILURE_BACKOFF_SEC) -> bool:
+        """Return True if slug had a failed MySQL apply within backoff_sec (prevents paid retry storms)."""
+        if backoff_sec <= 0:
+            return False
+        with self._conn() as db:
+            row = db.execute(
+                """
+                SELECT planned_at FROM plans
+                WHERE character_id = ? AND plan_state = 'apply_failed' AND planned_at > ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (slug, int(now_ts) - int(backoff_sec)),
+            ).fetchone()
+            return row is not None
+
     def mark_plan_failed(self, plan_id: int, error_note: str) -> None:
         """Mark a pending plan as apply_failed so it never blocks replanning on the next tick (Issue #52)."""
         with self._conn() as db:
@@ -1980,7 +2006,7 @@ def run_cycle(
         }
 
     with acquire_run_lock(runtime_dir, timeout_sec=lock_timeout_sec):
-        # Sync monotonic plan_id / revision authority with MySQL before planning (Issue #53)
+        # Sync monotonic plan_id / revision authority with MySQL before planning (Issue #53: FAIL CLOSED!)
         seq_info: dict[str, Any] = {"resynced": False}
         if apply:
             remote_max = remote_max_rev_override
@@ -1988,10 +2014,8 @@ def run_cycle(
                 if world_ctx_override is not None and sql_exec is None:
                     remote_max = int(world_ctx_override.get("remote_max_revision") or 0)
                 else:
-                    try:
-                        remote_max = fetch_remote_max_revision(sql_exec=sql_exec)
-                    except Exception:
-                        remote_max = 0
+                    # Do NOT swallow MySQL errors into remote_max=0; fail closed before making paid API calls!
+                    remote_max = fetch_remote_max_revision(sql_exec=sql_exec)
             seq_info = store.sync_sequence_floor(int(remote_max or 0))
             if seq_info.get("resynced"):
                 record_failure_alert(
@@ -2000,10 +2024,11 @@ def run_cycle(
                     runtime_dir=runtime_dir,
                 )
 
+        # Shadow mode NEVER syncs/mutates live event_journal (Issue #15)
         world_ctx = (
             world_ctx_override
             if world_ctx_override is not None
-            else fetch_world_context(mem=mem, now_ts=now_ts)
+            else fetch_world_context(mem=(mem if apply else None), now_ts=now_ts)
         )
         if apply:
             store.refresh_outcomes(
@@ -2025,13 +2050,30 @@ def run_cycle(
                 continue
             if not force and store.active_plan(slug, now_ts) is not None:
                 continue
+            # Per-companion paid-API backoff after a recent apply_failed (prevents repeated paid calls while DB broken)
+            if (
+                apply
+                and provider == "anthropic"
+                and not force
+                and store.recent_apply_failed(slug, now_ts, DEFAULT_APPLY_FAILURE_BACKOFF_SEC)
+            ):
+                logger.warning("Skipping paid API retry for %s (recent apply_failed backoff active)", slug)
+                continue
             targets.append(comp)
 
-        if limit > 0:
-            targets = targets[:limit]
+        eff_limit = int(limit)
+        if eff_limit <= 0 and provider == "anthropic" and not character and world_ctx_override is None:
+            eff_limit = int(os.getenv("HEARTHCORE_MAX_PLANS_PER_TICK", str(DEFAULT_MAX_PLANS_PER_TICK)) or 0)
+        if eff_limit > 0:
+            targets = targets[:eff_limit]
 
         planned: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
+        consecutive_apply_failures = 0
+        max_apply_failures = int(
+            os.getenv("HEARTHCORE_MAX_APPLY_FAILURES", str(DEFAULT_MAX_CONSECUTIVE_APPLY_FAILURES))
+            or DEFAULT_MAX_CONSECUTIVE_APPLY_FAILURES
+        )
         counters = {
             "planned": 0,
             "anthropic": 0,
@@ -2044,6 +2086,15 @@ def run_cycle(
         day_key_utc = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%d")
         try:
             for comp in targets:
+                if _STOP_EVENT.is_set():
+                    logger.warning("Graceful stop requested (SIGTERM); ending cycle cleanly before %s", comp.get("name"))
+                    break
+                if consecutive_apply_failures >= max(1, max_apply_failures):
+                    logger.error(
+                        "Aborting remaining companions after %d consecutive apply failures (protecting API budget)",
+                        consecutive_apply_failures,
+                    )
+                    break
                 slug = str(comp.get("slug") or comp.get("name", "")).lower()
                 pending_plan_id: int | None = None
                 try:
@@ -2108,31 +2159,33 @@ def run_cycle(
 
                     # Issue #52: record live plan as 'pending' (applied=0) BEFORE MySQL write;
                     # promote to applied=1 ONLY after apply_plan_to_db succeeds!
-                    plan_id = store.record_plan(
-                        now_ts=now_ts,
-                        slug=slug,
-                        guid=comp["guid"],
-                        source=source,
-                        model=meta.get("model") or (cfg_model if source == "anthropic" else source),
-                        effort=meta.get("effort") or (cfg_effort if source == "anthropic" else ""),
-                        plan=plan,
-                        primary_desc=primary_desc,
-                        cpp_weights=cpp_w,
-                        meta=meta,
-                        applied=False,
-                        plan_state="pending" if apply else "shadow",
-                        error_note=err_note,
-                        observed_at=snap["observed_at"],
-                        start_level=int(comp["level"]),
-                        start_xp=int(comp.get("xp", 0)),
-                        start_skill_sum=sum(v for v, _ in comp["skills"].values()),
-                        start_orders_done=int(comp.get("orders_delivered", 0)),
-                        start_quests_done=int(comp.get("quests_rewarded", 0)),
-                        start_ledger_ops=int(comp.get("ledger_ops", 0)),
-                        advisory_only=bool(prop_spec["advisory_only"]),
-                        proposal_status=("advisory" if prop_spec["advisory_only"] else "proposed") if apply else "shadow",
-                    )
+                    # Shadow mode (apply=False) writes ONLY to shadow_plans.json, NEVER mutating brain.db plans!
+                    plan_id = 0
                     if apply:
+                        plan_id = store.record_plan(
+                            now_ts=now_ts,
+                            slug=slug,
+                            guid=comp["guid"],
+                            source=source,
+                            model=meta.get("model") or (cfg_model if source == "anthropic" else source),
+                            effort=meta.get("effort") or (cfg_effort if source == "anthropic" else ""),
+                            plan=plan,
+                            primary_desc=primary_desc,
+                            cpp_weights=cpp_w,
+                            meta=meta,
+                            applied=False,
+                            plan_state="pending",
+                            error_note=err_note,
+                            observed_at=snap["observed_at"],
+                            start_level=int(comp["level"]),
+                            start_xp=int(comp.get("xp", 0)),
+                            start_skill_sum=sum(v for v, _ in comp["skills"].values()),
+                            start_orders_done=int(comp.get("orders_delivered", 0)),
+                            start_quests_done=int(comp.get("quests_rewarded", 0)),
+                            start_ledger_ops=int(comp.get("ledger_ops", 0)),
+                            advisory_only=bool(prop_spec["advisory_only"]),
+                            proposal_status=("advisory" if prop_spec["advisory_only"] else "proposed"),
+                        )
                         pending_plan_id = plan_id
                         cpp_w, prop_spec = apply_plan_to_db(
                             comp["guid"],
@@ -2150,6 +2203,7 @@ def run_cycle(
                         store.finalize_character_open_plans(slug, comp, now_ts, exclude_plan_id=plan_id)
                         store.mark_plan_applied(plan_id)
                         pending_plan_id = None
+                        consecutive_apply_failures = 0
                         mem.record_plan_intention(slug, plan, primary_desc, now_ts)
                         picked_oid = parse_order_id(plan["primary_goal_id"])
                         if picked_oid is not None:
@@ -2173,6 +2227,7 @@ def run_cycle(
                     })
                 except Exception as exc:
                     counters["sql_error"] += 1
+                    consecutive_apply_failures += 1
                     err_msg = f"{type(exc).__name__}: {exc}"
                     logger.warning("Companion planning/apply failed for %s: %s", slug, err_msg)
                     if pending_plan_id is not None:

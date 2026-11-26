@@ -85,7 +85,7 @@ class Batch3And4P2Tests(unittest.TestCase):
     # Issue #60: Canonical weight namespace, persona baseline preservation & sync manual protection
     # ------------------------------------------------------------------
     def test_issue60_weight_namespace_persona_preservation_and_sync_protection(self):
-        self.assertEqual(NATIVE_MERGE_RULE, "replace_except_manual")
+        self.assertEqual(NATIVE_MERGE_RULE, "replace_except_manual_source")
         self.assertIn("quest_work", PROFILE_PREF_TO_NATIVE_WEIGHTS["quest"])
         self.assertIn("hearth", PROFILE_PREF_TO_NATIVE_WEIGHTS["rest"])
 

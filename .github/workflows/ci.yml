@@ -22,7 +22,7 @@ jobs:
         image: mysql:8.4
         env:
           MYSQL_ROOT_PASSWORD: testrootpassword
-          MYSQL_DATABASE: acore_characters
+          MYSQL_DATABASE: acore_characters_test
         ports:
           - 3306:3306
         options: >-
@@ -36,12 +36,13 @@ jobs:
         with:
           python-version: "3.11"
       - name: Load companion_* schema DDL
-        run: mysql -h 127.0.0.1 -P 3306 -uroot -ptestrootpassword acore_characters < ops/sql/companion_schema.sql
+        run: mysql -h 127.0.0.1 -P 3306 -uroot -ptestrootpassword acore_characters_test < ops/sql/companion_schema.sql
       - name: Run MySQL integration tests
         env:
+          HEARTHCORE_TEST_DB: "1"
           HEARTHCORE_DB_HOST: 127.0.0.1
           HEARTHCORE_DB_PORT: "3306"
-          HEARTHCORE_DB_NAME: acore_characters
+          HEARTHCORE_DB_NAME: acore_characters_test
           HEARTHCORE_DB_USER: root
           HEARTHCORE_DB_PASSWORD: testrootpassword
         run: python -m unittest tests/test_mysql_integration.py -v

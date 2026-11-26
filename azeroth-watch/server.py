@@ -137,10 +137,27 @@ def _discover_default_allowed_hosts() -> set[str]:
             hosts.add(f"{hn}.local")
     except OSError:
         pass
+    # Discover ALL local IPv4 interface addresses cleanly (never assumes 192.168.1.1 gateway!)
+    try:
+        res = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                parts = line.split()
+                if "inet" in parts:
+                    idx = parts.index("inet")
+                    if idx + 1 < len(parts):
+                        ip = parts[idx + 1].split("/", 1)[0].strip()
+                        if ip:
+                            hosts.add(ip)
+    except Exception:
+        pass
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            s.connect(("192.168.1.1", 80))
+            s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
             if ip:
                 hosts.add(ip)
@@ -345,7 +362,7 @@ def make_handler(
     state_lock = threading.Lock()
     sessions: dict[str, float] = {}  # session_id -> expires_at_epoch
     sse_active = {"count": 0}
-    ser_cache: dict[tuple[int, bool], bytes] = {}
+    ser_cache: dict[tuple[int, bool, int], bytes] = {}
     auth_fails: dict[str, list[float]] = {}
 
     def _is_rate_limited(ip: str) -> bool:
@@ -393,14 +410,17 @@ def make_handler(
             sessions.pop(sid, None)
 
     def _cached_serialized_state(ver: int, snap: dict | None, authenticated: bool) -> bytes:
-        key = (int(ver), bool(authenticated))
+        # Bucket live data_age_sec every 5s so stale DB age NEVER freezes in cache while healthy traffic hits 100%!
+        age_sec = int((snap or {}).get("data_age_sec") or 0) if isinstance(snap, dict) else 0
+        age_bucket = age_sec // 5
+        key = (int(ver), bool(authenticated), age_bucket)
         with state_lock:
             hit = ser_cache.get(key)
             if hit is not None:
                 return hit
         payload = json.dumps(project_snapshot(snap, authenticated=authenticated), separators=(",", ":")).encode("utf-8")
         with state_lock:
-            if len(ser_cache) > 8:
+            if len(ser_cache) > 12:
                 ser_cache.clear()
             ser_cache[key] = payload
         return payload
@@ -509,19 +529,29 @@ def make_handler(
                 return
 
             if path == "/api/brain/auth-status":
-                is_auth, _ = self._is_authenticated(count_failure=False)
+                is_auth, rate_lim = self._is_authenticated(count_failure=True)
+                if rate_lim:
+                    self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Too many failed attempts; wait 60s"}', close_conn=True)
+                    return
                 body = json.dumps({"ok": True, "authenticated": is_auth}).encode("utf-8")
                 self._send_bytes(200, "application/json; charset=utf-8", body)
                 return
 
             if path == "/api/state":
-                is_auth, _ = self._is_authenticated(count_failure=False)
+                is_auth, rate_lim = self._is_authenticated(count_failure=True)
+                if rate_lim:
+                    self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Too many failed attempts; wait 60s"}', close_conn=True)
+                    return
                 ver, snap = collector.get_snapshot()
                 body = _cached_serialized_state(ver, snap, is_auth)
                 self._send_bytes(200, "application/json; charset=utf-8", body)
                 return
 
             if path == "/api/stream":
+                is_auth, rate_lim = self._is_authenticated(count_failure=True)
+                if rate_lim:
+                    self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Too many failed attempts; wait 60s"}', close_conn=True)
+                    return
                 with state_lock:
                     if sse_active["count"] >= max(1, int(max_sse_clients)):
                         self._send_bytes(
@@ -533,7 +563,8 @@ def make_handler(
                         return
                     sse_active["count"] += 1
                 try:
-                    is_auth, _ = self._is_authenticated(count_failure=False)
+                    stream_sid = self._extract_session_cookie()
+                    stream_used_cookie = bool(is_auth and stream_sid and not (self.headers.get("X-Azeroth-Admin-Token") or "").strip())
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                     self.send_header("Cache-Control", "no-cache")
@@ -541,15 +572,21 @@ def make_handler(
                     self.send_header("X-Content-Type-Options", "nosniff")
                     self.send_header("Content-Security-Policy", CSP_HEADER)
                     self.end_headers()
-                    last_ver = -1
+                    last_key = None
                     while True:
+                        # Re-check session revocation on active SSE streams so logout immediately stops admin view!
+                        if stream_used_cookie and not _validate_session(stream_sid):
+                            is_auth = False
+                            stream_used_cookie = False
                         ver, snap = collector.get_snapshot()
-                        if ver != last_ver and snap:
+                        age_bucket = int((snap or {}).get("data_age_sec") or 0) // 5 if isinstance(snap, dict) else 0
+                        cur_key = (ver, is_auth, age_bucket)
+                        if cur_key != last_key and snap:
                             payload_b = _cached_serialized_state(ver, snap, is_auth)
                             msg = f"id: {ver}\nevent: state\ndata: ".encode("utf-8") + payload_b + b"\n\n"
                             self.wfile.write(msg)
                             self.wfile.flush()
-                            last_ver = ver
+                            last_key = cur_key
                         else:
                             self.wfile.write(b": ping\n\n")
                             self.wfile.flush()

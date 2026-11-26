@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Auto-heals acore_auth.realmlist.flag=2 -> 0 ONLY when ac-worldserver is live and answering on port 8085.
-# Safe during intentional stops/builds: does nothing when port 8085 is closed OR maintenance flag exists.
+# Safe during intentional stops/builds: exits 0 cleanly when port 8085 is closed OR maintenance flag exists.
 #
 # Maintenance override (Issue #75):
 #   touch ~/hearthcore/runtime/maintenance.flag   # pause auto-heal during deliberate maintenance
@@ -13,8 +13,9 @@ if [[ -f "$MAINT_FLAG" ]]; then
   exit 0
 fi
 
-# 1. Require ac-worldserver running and returning the 44-byte WotLK auth challenge on 8085
-python3 - <<'EOF'
+# 1. Require ac-worldserver running and returning the 44-byte WotLK auth challenge on 8085.
+#    During deliberate stops/builds port 8085 is closed -> exit 0 cleanly (not an alertable error!).
+if ! python3 - <<'EOF'
 import socket, sys
 try:
     s = socket.create_connection(("127.0.0.1", 8085), timeout=3)
@@ -25,6 +26,9 @@ try:
 except Exception:
     sys.exit(1)
 EOF
+then
+  exit 0
+fi
 
 # 2. Only update if flag is currently 2 (stuck offline from boot ordering)
 DB_CONTAINER="${HEARTHCORE_DB_CONTAINER:-ac-database}"

@@ -1,6 +1,5 @@
 [Unit]
 Description=Auto-heal AzerothCore realmlist.flag=2 when ac-worldserver is live on 8085
-OnFailure=hearthcore-failure@%n.service
 
 [Service]
 Type=oneshot
