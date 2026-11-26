@@ -13,9 +13,17 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from hearthcore.bridge import apply_plan_to_db, fetch_remote_max_revision, reconcile_state, run_sql
+from hearthcore.bridge import (
+    BrainStore,
+    apply_plan_to_db,
+    fetch_remote_max_revision,
+    fetch_world_context,
+    reconcile_state,
+    run_sql,
+)
 from hearthcore.core import ROOT, fallback, profile, snapshot
-from hearthcore.quartermaster import apply_quartermaster_plan
+from hearthcore.memory import MemoryEngine
+from hearthcore.quartermaster import apply_quartermaster_plan, fetch_40char_supply_state
 
 
 def _is_safe_test_db() -> bool:
@@ -178,6 +186,111 @@ class MySQLIntegrationTests(unittest.TestCase):
         self.assertNotEqual(r_b_deny_canon.returncode, 0, "hearthcore_brain MUST NOT write canonical companion_weights!")
         r_b_deny_ver = run_as("hearthcore_brain", brain_pw, "SELECT verifier FROM acore_auth.account;")
         self.assertNotEqual(r_b_deny_ver.returncode, 0, "hearthcore_brain MUST NOT read account.verifier!")
+
+    def test_world_context_and_supply_state_reads_migrations_and_reconcile_drift(self):
+        import importlib.util
+        import subprocess
+
+        host = os.environ["HEARTHCORE_DB_HOST"]
+        port = os.environ.get("HEARTHCORE_DB_PORT", "3306")
+        db_name = os.environ["HEARTHCORE_DB_NAME"]
+        root_pw = os.environ["HEARTHCORE_DB_PASSWORD"]
+        env_root = dict(os.environ, MYSQL_PWD=root_pw)
+
+        # 1. Versioned migrations runner applies cleanly and is idempotent on second run
+        mig_path = ROOT / "ops" / "sql" / "apply_migrations.py"
+        spec = importlib.util.spec_from_file_location("apply_migrations", mig_path)
+        assert spec and spec.loader
+        mig_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mig_mod)
+        run_sql("DROP TABLE IF EXISTS companion_schema_migrations;")
+        first = mig_mod.apply_migrations()
+        self.assertGreaterEqual(len(first), 2)
+        second = mig_mod.apply_migrations()
+        self.assertEqual(second, [], "Second migration run must be a no-op")
+
+        # 2. Populate realistic AzerothCore character/skill/bank/auth fixtures in the throwaway test DB
+        seed_sql = f"""
+        CREATE DATABASE IF NOT EXISTS acore_auth;
+        CREATE TABLE IF NOT EXISTS acore_auth.account (
+            id INT PRIMARY KEY, username VARCHAR(32), verifier VARBINARY(32)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        DROP TABLE IF EXISTS `{db_name}`.characters;
+        CREATE TABLE `{db_name}`.characters (
+            guid INT PRIMARY KEY, account INT NOT NULL, name VARCHAR(32) NOT NULL,
+            level TINYINT UNSIGNED NOT NULL, zone INT NOT NULL, map INT NOT NULL,
+            money INT NOT NULL, online TINYINT NOT NULL, xp INT NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        CREATE TABLE IF NOT EXISTS `{db_name}`.character_skills (
+            guid INT NOT NULL, skill SMALLINT NOT NULL, value SMALLINT NOT NULL, max SMALLINT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS `{db_name}`.character_queststatus_rewarded (guid INT NOT NULL, quest INT NOT NULL);
+        CREATE TABLE IF NOT EXISTS `{db_name}`.guild_bank_item (guildid INT NOT NULL, item_guid INT NOT NULL);
+        CREATE TABLE IF NOT EXISTS `{db_name}`.item_instance (guid INT NOT NULL, itemEntry INT NOT NULL, count INT NOT NULL);
+
+        TRUNCATE TABLE `{db_name}`.characters;
+        TRUNCATE TABLE `{db_name}`.character_skills;
+        TRUNCATE TABLE `{db_name}`.character_queststatus_rewarded;
+        TRUNCATE TABLE `{db_name}`.guild_bank_item;
+        TRUNCATE TABLE `{db_name}`.item_instance;
+        TRUNCATE TABLE `{db_name}`.companion_schedule;
+        TRUNCATE TABLE `{db_name}`.companion_relationships;
+        TRUNCATE TABLE `{db_name}`.companion_ledger;
+
+        INSERT IGNORE INTO acore_auth.account (id, username, verifier) VALUES (1, 'WONKY', UNHEX('00')), (2, 'COMPBOT', UNHEX('00'));
+        INSERT INTO `{db_name}`.characters VALUES
+            (1, 1, 'Wonky', 30, 10, 0, 500000, 1, 12000),
+            (101, 2, 'Brannoc', 33, 10, 0, 250000, 1, 0);
+        INSERT INTO `{db_name}`.companion_schedule (name, shift_group, start_hour, end_hour, days_mask, always_online, note)
+            VALUES ('Brannoc', 'core-wonky', 0, 24, 127, 1, 'Core tank');
+        INSERT INTO `{db_name}`.character_skills VALUES (101, 164, 105, 150), (101, 186, 121, 150);
+        INSERT INTO `{db_name}`.character_queststatus_rewarded VALUES (101, 1001), (101, 1002);
+        INSERT INTO `{db_name}`.guild_bank_item VALUES (6, 9001);
+        INSERT INTO `{db_name}`.item_instance VALUES (9001, 2770, 40);
+        INSERT INTO `{db_name}`.companion_events (guid, event_type, summary, partner_guid, zone_id, created_at)
+            VALUES (101, 'level_up', 'Brannoc reached 33', 0, 10, 1800000000);
+        """
+        subprocess.run(
+            ["mysql", f"-h{host}", f"-P{port}", "-uroot"],
+            input=seed_sql.encode("utf-8"),
+            check=True,
+            capture_output=True,
+            env=env_root,
+        )
+
+        # 3. Exercise REAL fetch_world_context() & fetch_40char_supply_state() read paths against MySQL 8.4!
+        with tempfile.TemporaryDirectory() as tmp:
+            db_p = Path(tmp) / "brain.db"
+            mem = MemoryEngine(db_p)
+            wctx = fetch_world_context(mem=mem, now_ts=1_800_000_050)
+            self.assertIn("brannoc", wctx["companions"])
+            self.assertEqual(wctx["companions"]["brannoc"]["skills"][186], (121, 150))
+            self.assertEqual(wctx["companions"]["brannoc"]["quests_rewarded"], 2)
+            self.assertEqual(wctx["owner_levels"]["wonky"], 30)
+            self.assertEqual(mem.journal_status()["total_events"], 1)
+
+            sup_state = fetch_40char_supply_state()
+            self.assertEqual(sup_state["vault_counts"][2770], 40)
+            self.assertEqual(sup_state["supply"]["characters_analyzed"], 2)
+
+            # 4. Exercise real reconcile_state() detecting orphan SQLite plan vs clean MySQL match!
+            p = profile("brannoc")
+            snap = snapshot(json.loads((ROOT / "examples" / "brannoc.json").read_text(encoding="utf-8")), "brannoc")
+            plan = fallback(p, snap)
+            store = BrainStore(db_p)
+            pid = store.record_plan(
+                now_ts=1_800_000_000, slug="brannoc", guid=101, source="fallback",
+                model="fallback", effort="", plan=plan, primary_desc="Test",
+                cpp_weights={"craft": 1.2}, meta={}, applied=True, error_note="",
+                observed_at="2026-11-25T20:00:00Z",
+            )
+            drift_rep = reconcile_state(db_path=db_p, now_ts=1_800_000_060)
+            self.assertFalse(drift_rep["ok"])
+            self.assertEqual(len(drift_rep["orphan_plans"]), 1)
+
+            apply_plan_to_db(101, "Brannoc", plan, snap, "fallback", plan_id=pid, now_ts=1_800_000_000, char_profile=p)
+            clean_rep = reconcile_state(db_path=db_p, now_ts=1_800_000_060)
+            self.assertTrue(clean_rep["ok"], f"Expected clean reconcile after apply, got: {clean_rep}")
 
 
 if __name__ == "__main__":
