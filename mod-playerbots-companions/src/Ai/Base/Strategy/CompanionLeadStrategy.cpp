@@ -1381,7 +1381,11 @@ void UpdateKillOrder(PlayerbotAI* botAI)
         KillOrderState& live = gKillOrders[gid];
         if (!live.active)
         {
+            // Keep the skull the lead placed at pull time (recorded before this pack was active).
+            // A finished pack still clears it when its state is reset.
+            std::array<ObjectGuid, 8> const placedAtPull = live.botPlacedIcon;
             live = KillOrderState();
+            live.botPlacedIcon = placedAtPull;
             live.active = true;
             live.packId = gNextPackId++;
             live.pullStartMs = now;
@@ -1766,7 +1770,11 @@ public:
         if (Group* group = bot->GetGroup())
         {
             if (group->GetTargetIcon(CompanionLead::SKULL_ICON).IsEmpty())
+            {
                 group->SetTargetIcon(CompanionLead::SKULL_ICON, bot->GetGUID(), target->GetGUID());
+                // Record the lead's own skull as bot-placed, so the kill-order update does not lock it as owner-placed.
+                gKillOrders[group->GetGUID().GetCounter()].botPlacedIcon[CompanionLead::SKULL_ICON] = target->GetGUID();
+            }
         }
         context->GetValue<Unit*>("current target")->Set(target);
         NoteTankAttack(target);
