@@ -85,15 +85,26 @@ class Batch3And4P2Tests(unittest.TestCase):
     # Issue #60: Canonical weight namespace, persona baseline preservation & sync manual protection
     # ------------------------------------------------------------------
     def test_issue60_weight_namespace_persona_preservation_and_sync_protection(self):
-        self.assertEqual(NATIVE_MERGE_RULE, "replace_except_manual_source")
-        self.assertIn("quest_work", PROFILE_PREF_TO_NATIVE_WEIGHTS["quest"])
-        self.assertIn("hearth", PROFILE_PREF_TO_NATIVE_WEIGHTS["rest"])
+        import importlib.util
+        from hearthcore.core import profile as load_profile, profiles as list_profiles
 
-        prof = {"name": "TestBot", "preferences": {"fish": 1.4, "craft": 1.35, "repair": 0.8}}
-        base = persona_baseline_weights(prof)
-        self.assertEqual(base["fish"], 1.4)
-        self.assertEqual(base["sell"], 0.8)
+        # 1. Single canonical key namespace between ops/hearthcore-sync.py and hearthcore/bridge.py
+        sync_path = ROOT / "ops" / "hearthcore-sync.py"
+        spec = importlib.util.spec_from_file_location("hearthcore_sync_mod", sync_path)
+        assert spec and spec.loader
+        sync_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sync_mod)
+        self.assertEqual(sync_mod.KEY_MAP, PROFILE_PREF_TO_NATIVE_WEIGHTS)
 
+        # 2. Verify actual mirrored CompanionBrain.cpp implements `src == "manual"` precedence + REPLACE overrides
+        cpp_path = ROOT / "mod-playerbots-companions" / "src" / "Bot" / "CompanionBrain.cpp"
+        cpp_txt = cpp_path.read_text(encoding="utf-8")
+        self.assertIn('if (src == "manual")', cpp_txt)
+        self.assertIn("manualKeys[guid].insert(key);", cpp_txt)
+        self.assertIn("rows[guid][key] = std::clamp(val, WEIGHT_MIN_FACTOR, WEIGHT_MAX_FACTOR);", cpp_txt)
+
+        # 3. Verify EVERY character profile in characters/*/profile.json preserves unmentioned persona
+        #    preferences across weights_for_cpp() instead of flattening to 1.0!
         snap = {
             "character_id": "testbot",
             "observed_at": "2026-11-25T16:00:00Z",
@@ -103,20 +114,30 @@ class Batch3And4P2Tests(unittest.TestCase):
             "character_id": "testbot",
             "primary_goal_id": "quest:zone_12",
             "secondary_goal_ids": [],
-            "weight_modifiers": {"quest": 1.2},  # omits fish/craft!
+            "weight_modifiers": {"quest": 1.2},  # deliberately omits fish/craft/gather/train/bank/travel/rest/repair
             "session_minutes": 60,
             "reason_code": "quest_push",
         }
-        w = weights_for_cpp(plan, snap, char_profile=prof)
-        # Persona baseline for unmentioned keys MUST survive instead of flattening to 1.0!
-        self.assertEqual(w["fish"], 1.4)
-        self.assertEqual(w["craft"], 1.35)
-        self.assertEqual(w["sell"], 0.8)
+        all_slugs = list_profiles()
+        self.assertGreaterEqual(len(all_slugs), 30)
+        for slug in all_slugs:
+            prof = load_profile(slug)
+            base = persona_baseline_weights(prof)
+            w = weights_for_cpp(plan, snap, char_profile=prof)
+            for k in ("fish", "craft", "gather", "train", "bank", "travel", "hearth", "repair", "sell"):
+                self.assertAlmostEqual(
+                    w[k], base[k], places=4,
+                    msg=f"Profile {slug} key {k} flattened from baseline {base[k]} to {w[k]}",
+                )
 
-        # Verify ops/hearthcore-sync.py protects manual rows by default
-        sync_txt = (ROOT / "ops" / "hearthcore-sync.py").read_text(encoding="utf-8")
-        self.assertIn("--overwrite-manual", sync_txt)
-        self.assertIn("IF(`source` = 'hearthcore'", sync_txt)
+        # 4. Behavioral check on build_sync_sql() default vs --overwrite-manual
+        sample_prof = [{"name": "Brannoc", "slug": "brannoc", "preferences": {"craft": 1.35, "gather": 1.25}}]
+        sample_existing = {"brannoc": {"guid": 101, "level": 33}}
+        default_sql, _, _ = sync_mod.build_sync_sql(sample_prof, sample_existing, overwrite_manual=False, db_name="acore_characters_test")
+        overwrite_sql, _, _ = sync_mod.build_sync_sql(sample_prof, sample_existing, overwrite_manual=True, db_name="acore_characters_test")
+        self.assertEqual(len(default_sql), 2)
+        self.assertTrue(all("IF(`source` = 'hearthcore'" in s for s in default_sql))
+        self.assertTrue(all("IF(`source`" not in s for s in overwrite_sql))
 
     # ------------------------------------------------------------------
     # Issue #61: Fail-closed headroom + persisted hysteresis + stale Quartermaster directives

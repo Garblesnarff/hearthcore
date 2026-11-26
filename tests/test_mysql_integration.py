@@ -292,6 +292,45 @@ class MySQLIntegrationTests(unittest.TestCase):
             clean_rep = reconcile_state(db_path=db_p, now_ts=1_800_000_060)
             self.assertTrue(clean_rep["ok"], f"Expected clean reconcile after apply, got: {clean_rep}")
 
+    def test_issue60_hearthcore_sync_protects_manual_rows_until_overwrite_flag(self):
+        import importlib.util
+
+        db_name = os.environ["HEARTHCORE_DB_NAME"]
+        sync_path = ROOT / "ops" / "hearthcore-sync.py"
+        spec = importlib.util.spec_from_file_location("hearthcore_sync_ci", sync_path)
+        assert spec and spec.loader
+        sync_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sync_mod)
+
+        run_sql("TRUNCATE TABLE companion_weights;")
+        run_sql(
+            "INSERT INTO companion_weights (`guid`, `key`, `value`, `source`) VALUES "
+            "(101, 'craft', 1.45, 'manual'), "
+            "(101, 'gather', 0.90, 'hearthcore');"
+        )
+        profs = [{"name": "Brannoc", "slug": "brannoc", "preferences": {"craft": 1.15, "gather": 1.30}}]
+        existing = {"brannoc": {"guid": 101, "level": 33}}
+
+        # 1. Default sync MUST preserve source='manual' while updating source='hearthcore'
+        sql_default, _, _ = sync_mod.build_sync_sql(profs, existing, overwrite_manual=False, db_name=db_name)
+        run_sql("\n".join(sql_default) + "\n")
+        rows = {
+            r[0]: (round(float(r[1]), 2), r[2])
+            for r in run_sql("SELECT `key`, `value`, `source` FROM companion_weights WHERE guid = 101;", expected_cols=3)
+        }
+        self.assertEqual(rows["craft"], (1.45, "manual"), "Default sync MUST NOT overwrite manual rows!")
+        self.assertEqual(rows["gather"], (1.30, "hearthcore"), "Default sync MUST update hearthcore rows!")
+
+        # 2. Explicit --overwrite-manual MUST overwrite source='manual'
+        sql_over, _, _ = sync_mod.build_sync_sql(profs, existing, overwrite_manual=True, db_name=db_name)
+        run_sql("\n".join(sql_over) + "\n")
+        rows2 = {
+            r[0]: (round(float(r[1]), 2), r[2])
+            for r in run_sql("SELECT `key`, `value`, `source` FROM companion_weights WHERE guid = 101;", expected_cols=3)
+        }
+        self.assertEqual(rows2["craft"], (1.15, "hearthcore"))
+        self.assertEqual(rows2["gather"], (1.30, "hearthcore"))
+
 
 if __name__ == "__main__":
     unittest.main()
