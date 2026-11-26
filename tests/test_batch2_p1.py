@@ -261,9 +261,54 @@ class Batch2ZeroDowntimeP1Tests(unittest.TestCase):
                 self.assertEqual(data_adm["view_mode"], "admin")
                 self.assertEqual(data_adm["ai_brain"]["balance"]["remaining_usd"], 95.0)
                 self.assertNotIn("WONKY_LOGIN", body_adm)
+
+                # 4. Minimal /api/kiosk endpoint returns zero PII/spend/logs
+                st_k, body_k = get("/api/kiosk", f"127.0.0.1:{port}")
+                self.assertEqual(st_k, 200)
+                self.assertEqual(json.loads(body_k)["view_mode"], "kiosk_minimal")
+                self.assertNotIn("WONKY_LOGIN", body_k)
+                self.assertNotIn("remaining_usd", body_k)
+                self.assertNotIn("secret stacktrace", body_k)
             finally:
                 srv.shutdown()
                 srv.server_close()
+
+            # 5. Strict read-auth mode (AZEROTH_WATCH_REQUIRE_AUTH_FOR_READS=1): /api/state & /api/stream require auth -> 401!
+            strict_cls = aw_server.make_handler(
+                DummyCollector(),
+                admin_token=tok,
+                env_path=os.path.join(tmp, ".env"),
+                audit_path=os.path.join(tmp, "audit.log"),
+                allowed_hosts={"127.0.0.1", "localhost"},
+                require_auth_for_reads=True,
+            )
+            srv2 = aw_server.ThreadingHTTPServer(("127.0.0.1", 0), strict_cls)
+            port2 = srv2.server_address[1]
+            threading.Thread(target=srv2.serve_forever, daemon=True).start()
+            try:
+                def get2(path, extra_hdrs=None):
+                    conn = http.client.HTTPConnection("127.0.0.1", port2, timeout=5)
+                    hdrs = {"Host": f"127.0.0.1:{port2}"}
+                    if extra_hdrs:
+                        hdrs.update(extra_hdrs)
+                    conn.request("GET", path, headers=hdrs)
+                    resp = conn.getresponse()
+                    body = resp.read().decode("utf-8")
+                    conn.close()
+                    return resp.status, body
+
+                self.assertEqual(get2("/api/state")[0], 401)
+                self.assertEqual(get2("/api/stream")[0], 401)
+                self.assertEqual(get2("/api/kiosk")[0], 200)
+                self.assertEqual(get2("/api/state", {"X-Azeroth-Admin-Token": tok})[0], 200)
+            finally:
+                srv2.shutdown()
+                srv2.server_close()
+
+            # 6. Default repo systemd unit MUST bind loopback 127.0.0.1 (LAN is explicit drop-in opt-in)
+            unit_txt = (ROOT / "ops" / "systemd" / "azeroth-watch.service").read_text(encoding="utf-8")
+            self.assertIn("--host 127.0.0.1", unit_txt)
+            self.assertNotIn("--host 0.0.0.0", unit_txt)
 
     # ------------------------------------------------------------------
     # Issue #70: On-demand LAN share executes real installer end-to-end with out-of-band checksums,

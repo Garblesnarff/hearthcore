@@ -239,6 +239,28 @@ def project_snapshot(snap: dict | None, *, authenticated: bool) -> dict:
     return out
 
 
+def project_kiosk_summary(snap: dict | None) -> dict:
+    """Minimal read-only wall-display summary with zero PII, coordinates, logs, or API spend (Issue #71)."""
+    if not isinstance(snap, dict):
+        return {"view_mode": "kiosk_minimal", "db_ok": False}
+    realm = snap.get("realm") if isinstance(snap.get("realm"), dict) else {}
+    ticks = snap.get("ticks") if isinstance(snap.get("ticks"), dict) else {}
+    raid = snap.get("raid") if isinstance(snap.get("raid"), dict) else {}
+    ab = snap.get("ai_brain") if isinstance(snap.get("ai_brain"), dict) else {}
+    return {
+        "view_mode": "kiosk_minimal",
+        "generated_at": snap.get("generated_at"),
+        "db_ok": bool(snap.get("db_ok", False)),
+        "data_age_sec": int(snap.get("data_age_sec") or 0),
+        "realm_name": str(realm.get("name") or ""),
+        "population": snap.get("population") or {},
+        "tick_latest_ms": ticks.get("latest"),
+        "raid_stage": raid.get("stage"),
+        "weekly_event": str(snap.get("weekly_event") or ""),
+        "stale_alarm": bool(ab.get("stale_alarm")),
+    }
+
+
 def _read_env_value(key: str, env_path: str = HEARTHCORE_ENV) -> str:
     if os.environ.get(key):
         return str(os.environ[key]).strip()
@@ -364,6 +386,7 @@ def make_handler(
     allowed_hosts: set[str] | None = None,
     max_sse_clients: int = MAX_SSE_CLIENTS,
     session_ttl_sec: int = SESSION_TTL_SEC,
+    require_auth_for_reads: bool | None = None,
 ):
     # Separate mutable settings file so dashboard NEVER rewrites .env holding ANTHROPIC_API_KEY (Issue #72).
     settings_path = overrides_path if overrides_path is not None else (
@@ -371,6 +394,11 @@ def make_handler(
     )
     token_secret = admin_token if admin_token is not None else ensure_admin_token(env_path, settings_path)
     host_allowlist = set(allowed_hosts) if allowed_hosts is not None else _discover_default_allowed_hosts()
+    auth_reads = (
+        bool(require_auth_for_reads)
+        if require_auth_for_reads is not None
+        else (os.getenv("AZEROTH_WATCH_REQUIRE_AUTH_FOR_READS") or "0").strip().lower() in ("1", "true", "yes", "on")
+    )
 
     # Per-server-instance server-side session store (revocable!), SSE counter, and serialization cache
     state_lock = threading.Lock()
@@ -551,10 +579,19 @@ def make_handler(
                 self._send_bytes(200, "application/json; charset=utf-8", body)
                 return
 
+            if path == "/api/kiosk":
+                _ver, snap = collector.get_snapshot()
+                body = json.dumps(project_kiosk_summary(snap), separators=(",", ":")).encode("utf-8")
+                self._send_bytes(200, "application/json; charset=utf-8", body)
+                return
+
             if path == "/api/state":
                 is_auth, rate_lim = self._is_authenticated(count_failure=True)
                 if rate_lim:
                     self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Too many failed attempts; wait 60s"}', close_conn=True)
+                    return
+                if auth_reads and not is_auth:
+                    self._send_bytes(401, "application/json; charset=utf-8", b'{"ok":false,"error":"Authentication required for /api/state (use /api/kiosk for minimal view)"}', close_conn=True)
                     return
                 ver, snap = collector.get_snapshot()
                 body = _cached_serialized_state(ver, snap, is_auth)
@@ -565,6 +602,9 @@ def make_handler(
                 is_auth, rate_lim = self._is_authenticated(count_failure=True)
                 if rate_lim:
                     self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Too many failed attempts; wait 60s"}', close_conn=True)
+                    return
+                if auth_reads and not is_auth:
+                    self._send_bytes(401, "application/json; charset=utf-8", b'{"ok":false,"error":"Authentication required for /api/stream"}', close_conn=True)
                     return
                 with state_lock:
                     if sse_active["count"] >= max(1, int(max_sse_clients)):
@@ -797,13 +837,17 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1; use 0.0.0.0 for LAN read-only dashboard)")
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--interval", type=float, default=4.0)
+    parser.add_argument("--require-auth-for-reads", action="store_true", help="Require admin auth on /api/state and /api/stream")
     args = parser.parse_args()
 
     ensure_admin_token()
     collector = AzerothCollector(poll_interval_s=args.interval)
     collector.start()
 
-    srv = ThreadingHTTPServer((args.host, args.port), make_handler(collector))
+    srv = ThreadingHTTPServer(
+        (args.host, args.port),
+        make_handler(collector, require_auth_for_reads=True if args.require_auth_for_reads else None),
+    )
 
     def shutdown(*_args):
         collector.stop()
