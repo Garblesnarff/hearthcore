@@ -145,7 +145,6 @@ class PersistentMySQLPipe:
                 ]
                 self._proc = subprocess.Popen(
                     cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                    text=True, bufsize=1,
                 )
             elif db_user and db_pass and shutil.which("mysql"):
                 # Direct TCP connection as SELECT-only user (password passed in child env ONLY, never argv!)
@@ -156,7 +155,7 @@ class PersistentMySQLPipe:
                 ]
                 self._proc = subprocess.Popen(
                     cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                    text=True, bufsize=1, env=env,
+                    env=env,
                 )
             else:
                 self._proc = subprocess.Popen(
@@ -165,7 +164,6 @@ class PersistentMySQLPipe:
                         'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql -uroot --batch --quick --unbuffered --skip-column-names 2>/dev/null',
                     ],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                    text=True, bufsize=1,
                 )
             return True
         except Exception as exc:
@@ -186,7 +184,7 @@ class PersistentMySQLPipe:
             self._proc = None
 
     def query(self, sql: str) -> List[List[str]]:
-        """Execute a single SELECT query with a per-query random sentinel (Issue #62)."""
+        """Execute a single SELECT query on raw binary lines so lone '\\r' never splits rows (Issue #62)."""
         with self._lock:
             for _attempt in range(2):
                 if not self._ensure():
@@ -195,20 +193,25 @@ class PersistentMySQLPipe:
                 assert self._proc and self._proc.stdin and self._proc.stdout
                 sentinel = f"__AW_END_{secrets.token_hex(8)}__"
                 clean_sql = " ".join(sql.strip().splitlines()).rstrip(";")
-                payload = f"{clean_sql};\nSELECT '{sentinel}';\n"
+                payload = f"{clean_sql};\nSELECT '{sentinel}';\n".encode("utf-8")
                 try:
                     self._proc.stdin.write(payload)
                     self._proc.stdin.flush()
                     rows: List[List[str]] = []
                     while True:
-                        line = self._proc.stdout.readline()
-                        if not line:
+                        raw_line = self._proc.stdout.readline()
+                        if not raw_line:
                             raise BrokenPipeError("mysql pipe EOF")
-                        stripped = line.rstrip("\r\n")
-                        if stripped == sentinel:
+                        # Split strictly on '\n'; strip only trailing '\n' (and CRLF '\r\n'), NEVER embedded '\r'!
+                        if raw_line.endswith(b"\r\n"):
+                            raw_line = raw_line[:-2]
+                        elif raw_line.endswith(b"\n"):
+                            raw_line = raw_line[:-1]
+                        line = raw_line.decode("utf-8", errors="replace")
+                        if line == sentinel:
                             self.last_ok = True
                             return rows
-                        rows.append([_unescape_mysql_field(f) for f in stripped.split("\t")])
+                        rows.append([_unescape_mysql_field(f) for f in line.split("\t")])
                 except Exception:
                     self._close()
             self.last_ok = False

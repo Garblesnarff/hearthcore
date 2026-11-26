@@ -290,10 +290,13 @@ def run_sql(sql: str, *, timeout: float | None = None, expected_cols: int | None
     db_pass = os.getenv("HEARTHCORE_DB_PASSWORD", "")
     defaults_file = os.getenv("HEARTHCORE_DB_DEFAULTS_FILE", "").strip()
 
+    # Use raw bytes (NOT text=True universal newlines!) so lone '\r' in MySQL text columns
+    # is NEVER translated into '\n' and cannot split a row (Issue #62).
+    sql_bytes = sql.encode("utf-8")
     if defaults_file:
         # Safest path: chmod-600 MySQL option file (zero password in env or argv)
         cmd = ["mysql", f"--defaults-extra-file={defaults_file}", "-N", "-B", db_name]
-        res = subprocess.run(cmd, input=sql, text=True, capture_output=True, check=True, timeout=max(1.0, use_timeout))
+        res = subprocess.run(cmd, input=sql_bytes, capture_output=True, check=True, timeout=max(1.0, use_timeout))
     elif db_host:
         # Direct TCP mysql client with MYSQL_PWD in child env ONLY (never on argv)
         env = dict(os.environ)
@@ -309,8 +312,7 @@ def run_sql(sql: str, *, timeout: float | None = None, expected_cols: int | None
         ]
         res = subprocess.run(
             cmd,
-            input=sql,
-            text=True,
+            input=sql_bytes,
             capture_output=True,
             check=True,
             timeout=max(1.0, use_timeout),
@@ -323,13 +325,12 @@ def run_sql(sql: str, *, timeout: float | None = None, expected_cols: int | None
                 "docker", "exec", "-i", DB_CONTAINER, "sh", "-c",
                 f'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -u root -N -B {db_name}',
             ],
-            input=sql,
-            text=True,
+            input=sql_bytes,
             capture_output=True,
             check=True,
             timeout=max(1.0, use_timeout),
         )
-    return parse_mysql_tsv(res.stdout, expected_cols=expected_cols)
+    return parse_mysql_tsv(res.stdout.decode("utf-8", errors="replace"), expected_cols=expected_cols)
 
 
 def fetch_remote_max_revision(*, sql_exec=None) -> int:
