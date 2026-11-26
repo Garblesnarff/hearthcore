@@ -136,6 +136,13 @@ Player* FindCompanionTank(Group* group)
     return nullptr;
 }
 
+// The one lead of a group (issue #83): the first live companion tank in group order. A second tank-spec companion
+// is not the lead; it takes the damage or off-tank role and assists the lead.
+bool IsGroupLead(Player* bot)
+{
+    return bot && bot == FindCompanionTank(bot->GetGroup());
+}
+
 // Lead v2 (3c): healer is the group member with the heal role; if none, the owner.
 Player* FindGroupHealer(Player* tank, Group* group)
 {
@@ -715,7 +722,7 @@ Player* MeleeFollowTarget(PlayerbotAI* botAI)
     if (!sPlayerbotAIConfig.companionLeadMeleeFollowTank || !botAI)
         return nullptr;
     Player* bot = botAI->GetBot();
-    if (!bot || !LeadActive(bot) || PlayerbotAI::IsTank(bot) || PlayerbotAI::IsHeal(bot) ||
+    if (!bot || !LeadActive(bot) || IsGroupLead(bot) || PlayerbotAI::IsHeal(bot) ||
         !PlayerbotAI::IsMelee(bot))
         return nullptr;
     Player* tank = FindCompanionTank(bot->GetGroup());
@@ -729,7 +736,7 @@ bool NotifyOwnerPullCommand(PlayerbotAI* botAI, Player* requester)
     if (!botAI || !sPlayerbotAIConfig.companionLeadHealerTetherEnabled)
         return false;
     Player* bot = botAI->GetBot();
-    if (!bot || !PlayerbotAI::IsTank(bot) || !LeadActive(bot))
+    if (!bot || !IsGroupLead(bot) || !LeadActive(bot))
         return false;
     if (requester && !sCompanionBotMgr.IsOwner(requester))
         return false;
@@ -755,7 +762,7 @@ Unit* PickPullTarget(PlayerbotAI* botAI, bool* far)
     if (far)
         *far = false;
     Player* bot = botAI->GetBot();
-    if (!bot || !PlayerbotAI::IsTank(bot) || !ReadyToPull(botAI, false))
+    if (!bot || !IsGroupLead(bot) || !ReadyToPull(botAI, false))
         return nullptr;
 
     Unit* chosen = nullptr;
@@ -830,7 +837,7 @@ Unit* AssistTarget(PlayerbotAI* botAI, std::string* reason)
     if (reason)
         reason->clear();
     Player* bot = botAI->GetBot();
-    if (!bot || PlayerbotAI::IsTank(bot) || !LeadActive(bot))
+    if (!bot || IsGroupLead(bot) || !LeadActive(bot))
         return nullptr;
 
     Group* group = bot->GetGroup();
@@ -1070,7 +1077,7 @@ Unit* LeadDpsTarget(PlayerbotAI* botAI, bool* handled)
     if (!botAI || !sPlayerbotAIConfig.companionLeadTargetPersistence)
         return nullptr;
     Player* bot = botAI->GetBot();
-    if (!bot || PlayerbotAI::IsTank(bot) || !LeadActive(bot))
+    if (!bot || IsGroupLead(bot) || !LeadActive(bot))
         return nullptr;
     if (handled)
         *handled = true;
@@ -1086,7 +1093,7 @@ void LockFallbackTarget(PlayerbotAI* botAI, Unit* target)
     if (!botAI || !target || !sPlayerbotAIConfig.companionLeadTargetPersistence)
         return;
     Player* bot = botAI->GetBot();
-    if (!bot || PlayerbotAI::IsTank(bot) || !LeadActive(bot))
+    if (!bot || IsGroupLead(bot) || !LeadActive(bot))
         return;
     if (CompanionClass::IsOffTankUnit(botAI, target) || IsCrowdControlled(target))
         return;
@@ -1107,7 +1114,7 @@ void LockFallbackTarget(PlayerbotAI* botAI, Unit* target)
 bool IconHeldUnengaged(PlayerbotAI* botAI, ObjectGuid guid)
 {
     Player* bot = botAI->GetBot();
-    if (!bot || PlayerbotAI::IsTank(bot) || guid.IsEmpty() || !LeadActive(bot))
+    if (!bot || IsGroupLead(bot) || guid.IsEmpty() || !LeadActive(bot))
         return false;
     Group* group = bot->GetGroup();
     if (!group)
@@ -1139,7 +1146,7 @@ Unit* ChainTarget(PlayerbotAI* botAI, std::string* refusal)
     if (refusal)
         refusal->clear();
     Player* bot = botAI->GetBot();
-    if (!bot || !sPlayerbotAIConfig.companionChainEnabled || !PlayerbotAI::IsTank(bot) || !bot->IsInCombat() ||
+    if (!bot || !sPlayerbotAIConfig.companionChainEnabled || !IsGroupLead(bot) || !bot->IsInCombat() ||
         !LeadActive(bot))
         return nullptr;
     Unit* skull = SkullUnit(botAI, false);
@@ -1154,7 +1161,7 @@ Unit* ChainTarget(PlayerbotAI* botAI, std::string* refusal)
 void NoteAttackTarget(PlayerbotAI* botAI, Unit* target, std::string const& reason)
 {
     Player* bot = botAI->GetBot();
-    if (!bot || !LeadActive(bot) || PlayerbotAI::IsTank(bot))
+    if (!bot || !LeadActive(bot) || IsGroupLead(bot))
         return;
     uint32 low = bot->GetGUID().GetCounter();
     ObjectGuid guid = target ? target->GetGUID() : ObjectGuid();
