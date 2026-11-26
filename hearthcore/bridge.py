@@ -495,6 +495,13 @@ def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = No
             "recent_events": [],
             "social_bonds": [],
         }
+        if isinstance(lp, dict):
+            if lp.get("xp_cap_level") is not None:
+                companions[slug]["xp_cap_level"] = int(lp["xp_cap_level"])
+            if lp.get("xp_eligible") is not None:
+                companions[slug]["xp_eligible"] = bool(lp["xp_eligible"])
+            if lp.get("owner_name"):
+                companions[slug]["owner_name"] = str(lp["owner_name"])
         guid_to_slug[guid] = slug
 
     all_guids = [str(c["guid"]) for c in companions.values()]
@@ -634,11 +641,16 @@ def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = No
         for r in human_rows if len(r) >= 3
     ]
 
-    # Authoritative owner levels (Wonky / Logan) for CompanionLevelLead XP-cap awareness
+    # Authoritative owner levels & CompanionLevelLead discovered dynamically (Issue #23 — no hardcoded owners/+3!)
+    owner_bindings = discover_owner_bindings(companions)
+    owner_names_wanted = sorted({v for v in owner_bindings.values() if v})
     owner_levels: dict[str, int] = {}
-    for r in run_sql("SELECT name, level FROM characters WHERE name IN ('Wonky', 'Logan');"):
-        if len(r) >= 2:
-            owner_levels[r[0].lower()] = int(r[1])
+    if owner_names_wanted:
+        in_clause = ", ".join(f"'{_sql_esc(n)}'" for n in owner_names_wanted)
+        for r in run_sql(f"SELECT name, level FROM characters WHERE LOWER(name) IN ({in_clause});"):
+            if len(r) >= 2:
+                owner_levels[r[0].lower()] = int(r[1])
+    companion_level_lead = load_companion_level_lead()
 
     # Live Quartermaster directives with freshness check (Issues #7 & #61)
     qm_focus, qm_mats_by_skill, qm_meta = load_fresh_quartermaster_directives(QUARTERMASTER_PATH, now_ts=ts)
@@ -650,6 +662,8 @@ def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = No
         "work_orders": work_orders,
         "humans": humans,
         "owner_levels": owner_levels,
+        "owner_bindings": owner_bindings,
+        "companion_level_lead": companion_level_lead,
         "qm_focus": qm_focus,
         "qm_mats_by_skill": qm_mats_by_skill,
         "qm_directives_meta": qm_meta,
@@ -657,32 +671,91 @@ def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = No
     }
 
 
+def load_companion_level_lead(conf_path: Path | None = None) -> int:
+    """Read authoritative AiPlayerbot.CompanionLevelLead from playerbots.conf or env override (Issue #23)."""
+    env_override = (os.getenv("HEARTHCORE_COMPANION_LEVEL_LEAD") or "").strip()
+    if env_override:
+        try:
+            return max(0, int(env_override))
+        except ValueError as exc:
+            logger.warning("Invalid HEARTHCORE_COMPANION_LEVEL_LEAD=%r: %s", env_override, exc)
+
+    cfg = conf_path
+    if cfg is None:
+        env_cfg = (os.getenv("HEARTHCORE_PLAYERBOTS_CONF") or "").strip()
+        cfg = Path(env_cfg) if env_cfg else (
+            Path.home() / "AzerothCore" / "azerothcore-wotlk" / "env" / "dist" / "etc" / "modules" / "playerbots.conf"
+        )
+    try:
+        if cfg.is_file():
+            for raw in cfg.read_text(encoding="utf-8", errors="replace").splitlines():
+                ln = raw.split("#", 1)[0].strip()
+                if not ln or "=" not in ln:
+                    continue
+                k, v = ln.split("=", 1)
+                if k.strip() == "AiPlayerbot.CompanionLevelLead":
+                    return max(0, int(v.strip().strip('"').strip("'")))
+    except (OSError, ValueError) as exc:
+        logger.warning("Failed reading CompanionLevelLead from %s: %s", cfg, exc)
+    return 3
+
+
+def discover_owner_bindings(companions: dict[str, dict[str, Any]] | None = None) -> dict[str, str]:
+    """Build shift_group -> owner_character mapping from HEARTHCORE_OWNER_GROUPS and `core-<owner>` groups (Issue #23)."""
+    bindings: dict[str, str] = {}
+    # 1. Dynamic convention: any shift_group named `core-<owner>` binds to `<owner>`
+    if isinstance(companions, dict):
+        for comp in companions.values():
+            sg = str(comp.get("shift_group") or "").strip().lower()
+            if sg.startswith("core-") and len(sg) > 5:
+                bindings[sg] = sg[5:]
+            explicit_owner = str(comp.get("owner_name") or "").strip().lower()
+            if sg and explicit_owner:
+                bindings[sg] = explicit_owner
+
+    # 2. Explicit env config overrides/adds mappings: e.g. `core-wonky:Wonky,core-logan:Logan,team-alex:Alex`
+    raw_env = (os.getenv("HEARTHCORE_OWNER_GROUPS") or "").strip()
+    for pair in raw_env.split(","):
+        if ":" in pair:
+            grp, owner = pair.split(":", 1)
+            g_k = grp.strip().lower()
+            o_v = owner.strip().lower()
+            if g_k and o_v:
+                bindings[g_k] = o_v
+    return bindings
+
+
 def _xp_cap_prof_catchup_state(comp: dict[str, Any], world_ctx: dict[str, Any]) -> dict[str, Any]:
     """Compute authoritative per-character XP-cap & primary-profession catch-up state (Issue #23).
 
     Rules:
-    - Scoped ONLY to companions with an authoritative owner-cap binding (`core-wonky`, `core-logan`,
-      or explicit `owner_name` / `xp_cap_level`). Ordinary guild bots are never falsely treated as
-      Wonky-capped!
-    - Respects explicit `xp_eligible` and configured `HEARTHCORE_COMPANION_LEVEL_LEAD` (default 3).
+    - Scoped ONLY to companions with an authoritative owner-cap binding (`xp_cap_level`, `owner_name`,
+      `world_ctx["owner_bindings"]`, or `core-<owner>` shift group). Ordinary guild bots never inherit
+      any owner's level cap!
+    - Reads authoritative `companion_level_lead` from `playerbots.conf` (`AiPlayerbot.CompanionLevelLead`)
+      or `HEARTHCORE_COMPANION_LEVEL_LEAD` (fallback 3).
+    - Respects explicit `xp_eligible` exported by runtime (`live_positions.json` / C++ seam).
     - Distinguishes `at_cap` (0 XP) from `near_cap` (1 level below cap, still earning XP).
     - Respects trained skill ceilings (`val >= mx` and `mx < 300` -> needs profession trainer!).
     """
     lvl = int(comp.get("level") or 0)
     sg = str(comp.get("shift_group") or "").strip().lower()
     owner_levels = world_ctx.get("owner_levels") or {}
-    level_lead = int(world_ctx.get("companion_level_lead") or os.getenv("HEARTHCORE_COMPANION_LEVEL_LEAD", "3") or 3)
+    owner_bindings = world_ctx.get("owner_bindings") or discover_owner_bindings(world_ctx.get("companions"))
+    if world_ctx.get("companion_level_lead") is not None:
+        level_lead = max(0, int(world_ctx["companion_level_lead"]))
+    else:
+        level_lead = load_companion_level_lead()
 
     cap_lvl = 0
     if comp.get("xp_cap_level") is not None:
         cap_lvl = int(comp["xp_cap_level"])
     else:
         owner_name = str(comp.get("owner_name") or "").strip().lower()
-        if not owner_name:
-            if sg == "core-logan":
-                owner_name = "logan"
-            elif sg == "core-wonky":
-                owner_name = "wonky"
+        if not owner_name and sg:
+            owner_name = owner_bindings.get(sg, "")
+            if not owner_name and sg.startswith("core-") and len(sg) > 5:
+                owner_name = sg[5:]
         if owner_name and owner_levels.get(owner_name, 0) > 0:
             cap_lvl = int(owner_levels[owner_name]) + level_lead
 
