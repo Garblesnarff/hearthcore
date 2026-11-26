@@ -12,6 +12,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from hearthcore.benchmark import build_benchmark_artifact
 from hearthcore.bridge import _xp_cap_prof_catchup_state, build_snapshot, weights_for_cpp
@@ -140,6 +141,46 @@ class Batch2ZeroDowntimeP1Tests(unittest.TestCase):
         snap_tr = build_snapshot(capped_skill_comp, world_ctx)
         t_cand = next(c for c in snap_tr["candidates"] if c["id"] == "train:skills")
         self.assertEqual(t_cand["score"], 90)
+
+        # 5. Dynamic arbitrary owner discovery & authoritative playerbots.conf CompanionLevelLead!
+        from hearthcore.bridge import discover_owner_bindings, load_companion_level_lead, weights_for_cpp
+        with tempfile.TemporaryDirectory() as tmp:
+            pb_conf = Path(tmp) / "playerbots.conf"
+            pb_conf.write_text("# comment\nAiPlayerbot.CompanionLevelLead = 5\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"HEARTHCORE_COMPANION_LEVEL_LEAD": "", "HEARTHCORE_PLAYERBOTS_CONF": str(pb_conf)}):
+                self.assertEqual(load_companion_level_lead(), 5)
+
+            alex_ctx = {
+                **world_ctx,
+                "owner_levels": {"alex": 20},
+                "companion_level_lead": 5,
+                "owner_bindings": discover_owner_bindings({"fiona": {"shift_group": "core-alex"}}),
+            }
+            fiona = {
+                "guid": 301, "name": "Fiona", "slug": "fiona", "level": 25, "zone_id": 10, "zone": "Duskwood",
+                "shift_group": "core-alex", "skills": {164: (50, 150), 186: (55, 150)},
+                "recent_events": [], "social_bonds": [],
+            }
+            st_alex = _xp_cap_prof_catchup_state(fiona, alex_ctx)
+            self.assertEqual(st_alex["mode"], "at_cap")
+            self.assertEqual(st_alex["cap_level"], 25)
+
+            # 6. Authoritative xp_eligible=False / xp_cap_level override takes precedence & travel stays >=0.90!
+            override_comp = {**ordinary, "xp_eligible": False, "xp_cap_level": 33}
+            self.assertEqual(_xp_cap_prof_catchup_state(override_comp, world_ctx)["mode"], "at_cap")
+            snap_cap = build_snapshot(fiona, alex_ctx)
+            craft_goal = next(c for c in snap_cap["candidates"] if c["type"] in ("craft", "gather"))
+            plan_cap = {
+                "character_id": "fiona",
+                "primary_goal_id": craft_goal["id"],
+                "secondary_goal_ids": [],
+                "weight_modifiers": {craft_goal["type"]: 1.3},
+                "session_minutes": 60,
+                "reason_code": "prof_catchup",
+            }
+            w_cap = weights_for_cpp(plan_cap, snap_cap, xp_capped_catchup=True)
+            self.assertGreaterEqual(w_cap["travel"], 0.90)
+            self.assertLessEqual(w_cap["quest_grind"], 0.55)
 
     # ------------------------------------------------------------------
     # Issue #47: Benchmark synthetic histogram, workload attribution & missing/stale telemetry failure
