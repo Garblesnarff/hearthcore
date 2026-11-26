@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import time
@@ -24,6 +25,8 @@ from pathlib import Path
 from typing import Any
 
 from .core import ROOT
+
+logger = logging.getLogger("hearthcore.benchmark")
 
 BENCH_SCHEMA_VERSION = 2
 
@@ -68,8 +71,8 @@ def _read_meminfo_mib() -> dict[str, float]:
             parts = line.split()
             if len(parts) >= 2 and parts[0] in ("MemTotal:", "MemAvailable:", "SwapTotal:", "SwapFree:"):
                 out[parts[0].rstrip(":")] = round(int(parts[1]) / 1024.0, 1)
-    except OSError:
-        pass
+    except OSError as exc:
+        logger.debug("Unable to read /proc/meminfo: %s", exc)
     if "SwapTotal" in out and "SwapFree" in out:
         out["SwapUsed"] = round(max(0.0, out["SwapTotal"] - out["SwapFree"]), 1)
     return out
@@ -96,7 +99,8 @@ def _read_psi() -> dict[str, dict[str, float]]:
                         res_map[f"{kind}_avg60"] = float(kv.split("=", 1)[1])
             if res_map:
                 psi[res_name] = res_map
-        except Exception:
+        except Exception as exc:
+            logger.debug("Unable to parse /proc/pressure/%s: %s", res_name, exc)
             continue
     return psi
 

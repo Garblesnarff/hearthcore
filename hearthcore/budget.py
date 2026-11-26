@@ -15,6 +15,7 @@ Addresses Issues #8 and #55 (#56 consolidated):
 from __future__ import annotations
 
 import calendar
+import logging
 import os
 import sqlite3
 import time
@@ -23,6 +24,8 @@ from pathlib import Path
 from typing import Any
 
 from .core import Invalid
+
+logger = logging.getLogger("hearthcore.budget")
 
 # USD per 1M tokens: (input, output, cache_write, cache_read)
 MODEL_PRICING: dict[str, tuple[float, float, float, float]] = {
@@ -175,8 +178,8 @@ def _month_key(ts: int, credit_reset: str | None = None) -> str:
                     month -= 1
                 eff_day = min(reset_day, calendar.monthrange(year, month)[1])
             return f"{year:04d}-{month:02d}-{eff_day:02d}"
-        except ValueError:
-            pass
+        except ValueError as exc:
+            logger.warning("Ignoring unparseable credit_reset %r: %s", credit_reset, exc)
     return dt.strftime("%Y-%m")
 
 
@@ -482,8 +485,8 @@ class BudgetLedger:
         except Exception:
             try:
                 conn.execute("ROLLBACK")
-            except Exception:
-                pass
+            except sqlite3.Error as rb_exc:
+                logger.debug("Budget ledger rollback skipped: %s", rb_exc)
             raise
         finally:
             conn.close()

@@ -45,8 +45,8 @@ def request_graceful_stop(*_args) -> None:
 def install_sigterm_handler() -> None:
     try:
         signal.signal(signal.SIGTERM, request_graceful_stop)
-    except (ValueError, OSError):
-        pass
+    except (ValueError, OSError) as exc:
+        logger.debug("SIGTERM handler not installed (non-main thread or unsupported OS): %s", exc)
 
 from .budget import BudgetExceeded, BudgetLedger, InvalidWithUsage, ProviderBackoffError
 from .core import Invalid, ROOT, fallback, profile, profiles, snapshot, validate
@@ -158,8 +158,8 @@ def acquire_run_lock(runtime_dir: Path = RUNTIME_DIR, *, timeout_sec: float = 0.
         if acquired:
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.debug("flock unlock ignored for %s: %s", lock_path, exc)
         fh.close()
 
 
@@ -219,8 +219,8 @@ def record_failure_alert(source: str, detail: str, *, runtime_dir: Path = RUNTIM
         }
         with open(runtime_dir / "failure_alerts.log", "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, separators=(",", ":")) + "\n")
-    except OSError:
-        pass
+    except OSError as exc:
+        logger.warning("Failed writing failure_alerts.log: %s", exc)
 
 
 def _unescape_mysql_batch_field(field: str) -> str | None:
@@ -370,8 +370,10 @@ def read_live_context() -> dict[str, Any]:
             ctx["weekly_event"] = str(raw.get("weekly_event") or "")
             for u in raw.get("units", []):
                 ctx["live_by_guid"][int(u["g"])] = u
-    except Exception:
-        pass
+    except FileNotFoundError:
+        logger.debug("live_positions.json not present at %s", LIVE_POS_FILE)
+    except Exception as exc:
+        logger.warning("Failed reading live_positions.json (%s): %s: %s", LIVE_POS_FILE, type(exc).__name__, exc)
     return ctx
 
 
@@ -605,8 +607,8 @@ def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = No
                     "progress_delta": int(r[6]),
                     "advisory_only": bool(int(r[7])),
                 }
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Failed reading companion_proposals: %s: %s", type(exc).__name__, exc)
 
     # Open guild work orders
     work_orders: list[dict[str, Any]] = []
