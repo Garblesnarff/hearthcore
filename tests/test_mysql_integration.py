@@ -169,7 +169,7 @@ class MySQLIntegrationTests(unittest.TestCase):
         r_b_ok = run_as(
             "hearthcore_brain", brain_pw,
             "INSERT INTO acore_characters.companion_weight_overrides (guid, `key`, value, plan_id, revision, source, enabled, created_at, expires_at) "
-            "VALUES (101, 'craft', 1.2, 1, 1, 'hearthcore_ai', 1, 1, 9999999999) ON DUPLICATE KEY UPDATE value=1.2;",
+            "VALUES (101, 'craft', 1.2, 1, 1, 'hearthcore_ai', 1, 1, 1900000000) ON DUPLICATE KEY UPDATE value=1.2;",
         )
         self.assertEqual(r_b_ok.returncode, 0, r_b_ok.stderr.decode())
         r_b_deny_chars = run_as("hearthcore_brain", brain_pw, "INSERT INTO acore_characters.characters (guid, name) VALUES (999, 'Hack');")
