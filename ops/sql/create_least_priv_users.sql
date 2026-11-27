@@ -59,6 +59,7 @@ SET @s = CONCAT('GRANT SELECT ON acore_characters.character_talent TO ', @bh); P
 SET @s = CONCAT('GRANT SELECT ON acore_characters.character_spell TO ', @bh); PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 SET @s = CONCAT('GRANT SELECT ON acore_characters.character_inventory TO ', @bh); PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 SET @s = CONCAT('GRANT SELECT ON acore_world.item_template TO ', @bh); PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @s = CONCAT('GRANT SELECT ON acore_world.dungeon_access_template TO ', @bh); PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 SET @s = CONCAT('GRANT SELECT (id, username) ON acore_auth.account TO ', @bh); PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 -- Write access strictly limited to planner/Quartermaster/Phase-II operational tables

@@ -55,7 +55,16 @@ def main():
     qm.add_argument("--model", help="Override strategist model (default: claude-sonnet-5-5)")
 
     commands.add_parser("phase2-shadow-match", help="Run pure Phase II shadow dungeon matchmaking (zero live DB writes)")
-    commands.add_parser("phase2-readiness", help="Evaluate distinct-persona Raid Readiness & shortfalls (read-only)")
+    pr = commands.add_parser("phase2-readiness", help="Evaluate owner-selected distinct-persona Raid Readiness & shortfalls (read-only)")
+    pr.add_argument("--raid", default=None, help="Specific raid_id (e.g. mc_40, bwl_40, aq40_40, karazhan_10, gruul_25, naxx_10, onyxia_10)")
+    pr.add_argument("--stage", type=int, default=None, help="Explicit server raid_stage override (default: read live from dashboard)")
+    pr.add_argument("--human", action="append", default=[], help="Confirmed human slot as Name:role (repeatable, e.g. --human Wonky:tank)")
+    pr.add_argument("--include", action="append", default=[], help="Restrict companion roster to specific slug(s) (repeatable)")
+    pr.add_argument("--exclude", action="append", default=[], help="Exclude specific companion slug(s) (repeatable)")
+    pr.add_argument("--pin", action="append", default=[], help="Pin companion to specific role as slug:role (repeatable)")
+    pr.add_argument("--attestations", default=None, help="Path to read-only owner encounter-tactics attestation JSON")
+    pr.add_argument("--owner-group-id", type=int, default=None, help="Owner's forming raid group ID (members in this group count as available)")
+    pr.add_argument("--list-raids", action="store_true", help="List all defined raid specs and exit")
     bmk = commands.add_parser("phase2-benchmark", help="Capture non-destructive live baseline benchmark artifact")
     bmk.add_argument("--scenario", default="baseline_outdoor_solo")
     bmk.add_argument("--samples", type=int, default=3)
@@ -253,17 +262,112 @@ def main():
             return 0
 
         if args.command == "phase2-readiness":
-            from .bridge import RUNTIME_DIR, fetch_world_context
-            from .readiness import evaluate_raid_roster
+            import os
+            import tempfile
+            import urllib.request
+            from .bridge import BRAIN_DB_PATH, RUNTIME_DIR, fetch_world_context
+            from .readiness import (
+                ALLOWED_HUMAN_ROLES,
+                RAID_CATALOG,
+                evaluate_raid_roster,
+                fetch_raid_readiness_telemetry,
+                load_owner_attestations,
+                resolve_raid_spec,
+            )
+            if args.list_raids:
+                for rs in RAID_CATALOG:
+                    print(f"  {rs.raid_id:<14} {rs.name:<28} stage>={rs.raid_stage_min} size={rs.raid_size:<2} map={rs.map_id:<3} diff={rs.difficulty} ilvl>={rs.min_avg_ilvl:.0f} roles={rs.roles_dict()}")
+                return 0
+
+            raid_stage = args.stage
+            raid_stage_source = "owner_override" if raid_stage is not None else "unknown"
+            if raid_stage is None:
+                dash_url = (os.getenv("HEARTHCORE_DASHBOARD_URL") or "http://127.0.0.1:8787").rstrip("/")
+                try:
+                    with urllib.request.urlopen(f"{dash_url}/api/state", timeout=3) as r:
+                        st = json.load(r)
+                    raw_st = (st.get("raid") or {}).get("stage")
+                    if raw_st is not None:
+                        raid_stage = int(raw_st)
+                        raid_stage_source = "live_dashboard"
+                except Exception as exc:
+                    logging.getLogger("hearthcore").warning("Live raid_stage fetch failed (fail-closed -> None): %s", exc)
+
+            spec = resolve_raid_spec(args.raid, raid_stage=raid_stage)
+            if not args.raid:
+                logging.getLogger("hearthcore").info("No --raid provided; using stage %s default raid %s", raid_stage, spec.raid_id)
+
+            # Strictly validate --human Name:role arguments (P1-6: never silently drop or guess role!)
+            human_slots = []
+            seen_h: set[str] = set()
+            for h_raw in (args.human or []):
+                if ":" not in h_raw:
+                    raise ValueError(f"Invalid --human {h_raw!r}: must be Name:role (tank|healer|damage)")
+                hn, hr = h_raw.split(":", 1)
+                hn = hn.strip()
+                hr = hr.strip().lower()
+                if hr in ("dps", "mdps", "rdps"):
+                    hr = "damage"
+                if not hn or hr not in ALLOWED_HUMAN_ROLES:
+                    raise ValueError(f"Invalid --human {h_raw!r}: role must be tank, healer, or damage")
+                if hn.lower() in seen_h:
+                    raise ValueError(f"Duplicate --human name: {hn!r}")
+                seen_h.add(hn.lower())
+                human_slots.append({"name": hn, "role": hr, "status": "confirmed"})
+
+            owner_pins: dict[str, str] = {}
+            for p_raw in (args.pin or []):
+                if ":" not in p_raw:
+                    raise ValueError(f"Invalid --pin {p_raw!r}: must be slug:role")
+                ps, pr_role = p_raw.split(":", 1)
+                ps, pr_role = ps.strip().lower(), pr_role.strip().lower()
+                if pr_role in ("dps", "mdps", "rdps"):
+                    pr_role = "damage"
+                if not ps or pr_role not in ALLOWED_HUMAN_ROLES:
+                    raise ValueError(f"Invalid --pin {p_raw!r}: role must be tank, healer, or damage")
+                owner_pins[ps] = pr_role
+
+            att_map, att_errs = load_owner_attestations(
+                Path(args.attestations) if args.attestations else None, raid_id=spec.raid_id
+            )
             world_ctx = fetch_world_context()
-            rep = evaluate_raid_roster(world_ctx["companions"], raid_stage=0, observed_at=world_ctx["observed_at"])
+            telem_bundle = fetch_raid_readiness_telemetry(world_ctx, spec, attestations=att_map)
+            rep = evaluate_raid_roster(
+                world_ctx["companions"],
+                raid_id=spec.raid_id,
+                raid_stage=raid_stage,
+                raid_stage_source=raid_stage_source,
+                bank_consumable_pool=telem_bundle["bank_pool"],
+                telemetry_by_slug=telem_bundle["telemetry_by_slug"],
+                human_slots=human_slots,
+                owner_selected_slugs=(args.include if args.include else None),
+                owner_excluded_slugs=(args.exclude if args.exclude else None),
+                owner_pinned_roles=(owner_pins if owner_pins else None),
+                owner_group_id=args.owner_group_id,
+                access_verified_against_db=telem_bundle["access_verified_against_db"],
+                db_legal_min_level=telem_bundle["db_legal_min_level"],
+                db_path=BRAIN_DB_PATH,
+                observed_at=world_ctx["observed_at"],
+            )
+            all_errs = list(att_errs) + list(telem_bundle["errors"])
+            if all_errs:
+                rep["telemetry_errors"] = all_errs
             out_path = RUNTIME_DIR / "phase2_readiness.json"
             RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(json.dumps(rep, indent=2) + "\n", encoding="utf-8")
-            print(f"Raid Readiness ({rep['tier_name']}): {rep['summary_counts']} | feasible_now={rep['feasible_now']}")
+            with tempfile.NamedTemporaryFile("w", dir=RUNTIME_DIR, prefix="phase2_readiness.", suffix=".tmp", delete=False, encoding="utf-8") as tf:
+                tf.write(json.dumps(rep, indent=2) + "\n")
+                tmp_name = tf.name
+            Path(tmp_name).replace(out_path)
+            print(
+                f"Raid Readiness ({rep['raid_id']} — {rep['tier_name']}, stage={rep['raid_stage']} [{rep['raid_stage_source']}]): "
+                f"obtained={rep['summary_counts_obtained']} | feasible_now(obtained)={rep['feasible_now']} "
+                f"| with_potential_bank={rep['feasible_with_potential_bank']} "
+                f"| bench={len(rep['viable_bench'])} | bank_pool={rep['bank_consumables_pool']} "
+                f"(pot_alloc={rep['bank_consumables_potential_allocated']}, unalloc={rep['bank_consumables_unallocated']})"
+            )
             for b in rep["bottlenecks"]:
                 print("  -", b)
-            return 0
+            return 1 if rep["rejected_humans"] else 0
 
         if args.command == "phase2-benchmark":
             from .benchmark import run_live_baseline_benchmark

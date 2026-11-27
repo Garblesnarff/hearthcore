@@ -274,27 +274,46 @@ class Phase2Tests(unittest.TestCase):
     # Card II-08: Readiness unknowns, bank reserve non-double-counting & distinct personas
     # ------------------------------------------------------------------
     def test_readiness_unknowns_and_non_double_counted_bank_supply(self):
+        now = 1_800_000_000
         comps = {
-            "brannoc": {"guid": 101, "name": "Brannoc", "slug": "brannoc", "level": 60, "online": True, "shift_group": "core-wonky", "zone": "Ironforge"},
-            "ironbulwark": {"guid": 201, "name": "Ironbulwark", "slug": "ironbulwark", "level": 60, "online": True, "shift_group": "early-birds", "zone": "Stormwind City"},
+            "brannoc": {"guid": 101, "name": "Brannoc", "slug": "brannoc", "level": 60, "online": True, "shift_group": "core-wonky", "zone": "Ironforge", "in_group": False, "locked_instances": [], "telemetry_observed_at": now},
+            "ironbulwark": {"guid": 201, "name": "Ironbulwark", "slug": "ironbulwark", "level": 60, "online": True, "shift_group": "early-birds", "zone": "Stormwind City", "in_group": False, "locked_instances": [], "telemetry_observed_at": now},
             # Same persona_id as brannoc (synthetic alt) -> must NOT be counted twice in distinct_personas!
-            "kelda": {"guid": 102, "name": "Kelda", "slug": "kelda", "persona_id": "per_brannoc", "level": 60, "online": True, "shift_group": "core-wonky", "zone": "Ironforge"},
+            "kelda": {"guid": 102, "name": "Kelda", "slug": "kelda", "persona_id": "per_brannoc", "level": 60, "online": True, "shift_group": "core-wonky", "zone": "Ironforge", "in_group": False, "locked_instances": [], "telemetry_observed_at": now},
         }
-        # Missing durability/consumable telemetry -> MUST be 'unknown', NEVER 'ready_available'!
-        rep_unk = evaluate_raid_roster(comps, raid_stage=0, bank_consumable_pool=5)
+        # Missing gear/tactics/consumable/live-role telemetry -> MUST be 'unknown', NEVER 'ready_available'!
+        rep_unk = evaluate_raid_roster(
+            comps, raid_id="mc_40", raid_stage=0, bank_consumable_pool=5,
+            allow_no_persona_db=True, now_ts=now,
+        )
         self.assertEqual(rep_unk["summary_counts"]["ready_available"], 0)
         self.assertEqual(rep_unk["summary_counts"]["unknown"], 2)  # 2 distinct personas (kelda shares per_brannoc)
 
-        # Only 5 bank consumables available -> FIRST raider claims all 5, SECOND raider fails consumables (no double counting!)
+        # Only 5 bank consumables available; BOTH brannoc & ironbulwark need 5, while kelda (brannoc's alt) also needs 5!
+        # Non-greedy potential bank allocation gives 5 to ONE distinct persona; obtained-only stays 0 (zero double counting!).
         telem = {
-            "brannoc": {"personal_consumables": 0, "durability_pct": 100.0},
-            "ironbulwark": {"personal_consumables": 0, "durability_pct": 100.0},
-            "kelda": {"personal_consumables": 5, "durability_pct": 100.0},
+            "brannoc": {
+                "personal_consumables": 0, "durability_pct": 100.0, "avg_ilvl": 62.0, "tactics_verified": True,
+                "live_telemetry": {"class_id": 1, "spec_tab": 2, "known_spells": [71, 355], "equipped": {"has_main_hand": True, "has_shield": True, "broken_slots": 0}, "native_role_mask": 0x02},
+            },
+            "ironbulwark": {
+                "personal_consumables": 0, "durability_pct": 100.0, "avg_ilvl": 62.0, "tactics_verified": True,
+                "live_telemetry": {"class_id": 2, "spec_tab": 1, "known_spells": [25780], "equipped": {"has_main_hand": True, "has_shield": True, "broken_slots": 0}, "native_role_mask": 0x02},
+            },
+            "kelda": {
+                "personal_consumables": 0, "durability_pct": 100.0, "avg_ilvl": 62.0, "tactics_verified": True,
+                "live_telemetry": {"class_id": 5, "spec_tab": 1, "known_spells": [2061], "equipped": {"has_main_hand": True, "has_shield": False, "broken_slots": 0}, "native_role_mask": 0x04},
+            },
         }
-        rep_bank = evaluate_raid_roster(comps, raid_stage=0, bank_consumable_pool=5, telemetry_by_slug=telem)
+        rep_bank = evaluate_raid_roster(
+            comps, raid_id="mc_40", raid_stage=0, bank_consumable_pool=5, telemetry_by_slug=telem,
+            allow_no_persona_db=True, now_ts=now,
+        )
+        self.assertEqual(rep_bank["bank_consumables_potential_allocated"], 5)
         self.assertEqual(rep_bank["bank_consumables_unallocated"], 0)
-        self.assertEqual(rep_bank["summary_counts"]["ready_available"], 1)
-        self.assertEqual(rep_bank["summary_counts"]["not_ready"], 1)
+        self.assertEqual(rep_bank["summary_counts_obtained"]["ready_available"], 0)
+        self.assertEqual(rep_bank["summary_counts_with_potential"]["ready_pending_distribution"], 1)
+        self.assertEqual(rep_bank["summary_counts_with_potential"]["not_ready"], 1)
 
     # ------------------------------------------------------------------
     # Card II-09: Bounded playstyle traits & non-stacking with memory fatigue

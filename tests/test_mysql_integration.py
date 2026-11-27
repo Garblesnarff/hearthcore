@@ -132,6 +132,7 @@ class MySQLIntegrationTests(unittest.TestCase):
         CREATE TABLE IF NOT EXISTS acore_auth.account (id INT PRIMARY KEY, username VARCHAR(32), verifier VARBINARY(32));
         CREATE TABLE IF NOT EXISTS acore_auth.realmlist (id INT PRIMARY KEY, name VARCHAR(32), address VARCHAR(32), port INT, flag INT);
         CREATE TABLE IF NOT EXISTS acore_world.item_template (entry INT PRIMARY KEY, name VARCHAR(64), MaxDurability INT DEFAULT 100, InventoryType TINYINT DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS acore_world.dungeon_access_template (id INT PRIMARY KEY, map_id SMALLINT, difficulty TINYINT, min_level TINYINT, max_level TINYINT);
         CREATE TABLE IF NOT EXISTS acore_world.quest_template (ID INT PRIMARY KEY, QuestLevel INT, LogTitle VARCHAR(128));
         CREATE TABLE IF NOT EXISTS acore_world.player_xp_for_level (level INT PRIMARY KEY, Experience INT);
         INSERT IGNORE INTO acore_auth.account (id, username, verifier) VALUES (1, 'Tester', UNHEX('AABBCC'));
