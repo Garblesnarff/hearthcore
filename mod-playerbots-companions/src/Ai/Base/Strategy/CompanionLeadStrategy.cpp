@@ -37,6 +37,7 @@
 #include "ObjectAccessor.h"
 #include "PathGenerator.h"
 #include "Spell.h"
+#include "SpellAuraEffects.h"
 #include "SpellInfo.h"
 #include "ThreatManager.h"
 #include "Timer.h"
@@ -49,13 +50,24 @@
 
 namespace
 {
-// Auras of the drink spells (Drink ranks in 3.3.5a). A caster drinking is not ready to pull.
-bool IsDrinking(Player* player)
+// Drinking detection by aura type rather than a fixed spell ID list (issue #86): matches any seated
+// mana-regeneration drink aura (including food+drink refreshments and all Classic/TBC/WotLK ranks).
+bool IsDrinking(Unit* unit)
 {
-    static constexpr uint32 DRINK_AURAS[] = { 430, 431, 432, 833, 1133, 1135, 22734, 27089 };
-    for (uint32 spell : DRINK_AURAS)
-        if (player->HasAura(spell))
-            return true;
+    if (!unit)
+        return false;
+    for (AuraType type : {SPELL_AURA_MOD_POWER_REGEN, SPELL_AURA_OBS_MOD_POWER})
+    {
+        for (AuraEffect const* eff : unit->GetAuraEffectsByType(type))
+        {
+            if (!eff)
+                continue;
+            SpellInfo const* info = eff->GetSpellInfo();
+            if (eff->GetMiscValue() == POWER_MANA && info &&
+                (info->AuraInterruptFlags & AURA_INTERRUPT_FLAG_NOT_SEATED))
+                return true;
+        }
+    }
     return false;
 }
 
@@ -220,6 +232,8 @@ bool ReadyToPull(PlayerbotAI* botAI, bool withRange)
         if (!member->IsAlive() || member->GetMapId() != bot->GetMapId() ||
             member->GetHealthPct() < sPlayerbotAIConfig.companionLeadMinMemberHealthPct)
             ready = false;
+        if (PlayerbotAI::IsHeal(member) && IsDrinking(member))
+            ready = false;
         // Phase 2: a companion gathering a node or skinning is not waited for (the group does not stop for it).
         // Lead v2: when HealerTether is on, the healer's distance/LOS is governed by the soft healer tether instead.
         if (withRange && member != healer && member->GetMapId() == bot->GetMapId() &&
@@ -305,6 +319,27 @@ struct KillOrderState
 
 std::unordered_map<uint32, KillOrderState> gKillOrders;   // group low guid -> kill order state
 uint32 gNextPackId = 1;
+
+// Single mark-placement helper for lead mode (issue #86): keeps group target icons and botPlacedIcon ownership
+// records in sync everywhere the lead sets or clears a raid icon. Both pull-time and UpdateKillOrder mark
+// writes run on the single elected lead bot's update thread.
+void SetLeadIcon(Group* group, Player* lead, uint8 icon, ObjectGuid targetGuid, KillOrderState* localState = nullptr)
+{
+    if (!group || !lead || icon >= 8)
+        return;
+    if (group->GetTargetIcon(icon) != targetGuid)
+        group->SetTargetIcon(icon, lead->GetGUID(), targetGuid);
+    if (localState)
+    {
+        localState->botPlacedIcon[icon] = targetGuid;
+        return;
+    }
+    if (!sPlayerbotAIConfig.companionLeadKillOrder)
+        return;
+    uint32 const gid = group->GetGUID().GetCounter();
+    std::lock_guard<std::mutex> lock(gStateMutex);
+    gKillOrders[gid].botPlacedIcon[icon] = targetGuid;
+}
 
 bool IsCastingHeal(Unit* unit)
 {
@@ -1375,13 +1410,24 @@ void UpdateKillOrder(PlayerbotAI* botAI)
         return;
     }
 
+    std::array<ObjectGuid, 8> curIcons = {};
+    for (uint8 i = 0; i < curIcons.size(); ++i)
+        curIcons[i] = group->GetTargetIcon(i);
+
     KillOrderState st;
     {
         std::lock_guard<std::mutex> lock(gStateMutex);
         KillOrderState& live = gKillOrders[gid];
         if (!live.active)
         {
+            // Keep only pull-time marks placed by the lead that still match what the group currently displays
+            // (issue #86); stale records from cancelled pulls or previous packs are dropped.
+            std::array<ObjectGuid, 8> carried = {};
+            for (uint8 i = 0; i < carried.size(); ++i)
+                if (!live.botPlacedIcon[i].IsEmpty() && curIcons[i] == live.botPlacedIcon[i])
+                    carried[i] = live.botPlacedIcon[i];
             live = KillOrderState();
+            live.botPlacedIcon = carried;
             live.active = true;
             live.packId = gNextPackId++;
             live.pullStartMs = now;
@@ -1605,9 +1651,7 @@ void UpdateKillOrder(PlayerbotAI* botAI)
         {
             if (!st.ownerLockedIcon[icon].IsEmpty())
                 continue;
-            if (group->GetTargetIcon(icon) != wantIcon[icon])
-                group->SetTargetIcon(icon, tank->GetGUID(), wantIcon[icon]);
-            st.botPlacedIcon[icon] = wantIcon[icon];
+            SetLeadIcon(group, tank, icon, wantIcon[icon], &st);
         }
 
         std::ostringstream oss;
@@ -1766,7 +1810,7 @@ public:
         if (Group* group = bot->GetGroup())
         {
             if (group->GetTargetIcon(CompanionLead::SKULL_ICON).IsEmpty())
-                group->SetTargetIcon(CompanionLead::SKULL_ICON, bot->GetGUID(), target->GetGUID());
+                SetLeadIcon(group, bot, CompanionLead::SKULL_ICON, target->GetGUID());
         }
         context->GetValue<Unit*>("current target")->Set(target);
         NoteTankAttack(target);
