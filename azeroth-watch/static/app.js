@@ -127,10 +127,17 @@
 
   function renderHeader(d) {
     const v = d.vitals;
-    const up = v.worldserver_up && d.realm.flag === 0;
+    const up = v.worldserver_up && d.realm.flag === 0 && d.db_ok !== false;
+    const stale = d.db_ok === false || (typeof d.data_age_sec === "number" && d.data_age_sec > 30);
     const sp = $("status-pill");
-    sp.className = `pill status-pill ${up ? "online" : "offline"}`;
-    $("status-text").textContent = up ? `ONLINE · ${fmtUptime(v.worldserver_uptime_s)}` : "OFFLINE";
+    sp.className = `pill status-pill ${up && !stale ? "online" : "offline"}`;
+    if (d.db_ok === false) {
+      $("status-text").textContent = `DB STALE (${d.data_age_sec || 0}s)`;
+    } else if (stale) {
+      $("status-text").textContent = `STALE (${d.data_age_sec}s)`;
+    } else {
+      $("status-text").textContent = up ? `ONLINE · ${fmtUptime(v.worldserver_uptime_s)}` : "OFFLINE";
+    }
 
     $("realm-sub").textContent = `${d.realm.name} · ${d.realm.address}:${d.realm.port} · ${d.population.total_online} Online`;
     $("clock-val").textContent = d.clock;
@@ -149,16 +156,23 @@
     const aiPill = $("ai-pill");
     if (aiPill) {
       const ab = d.ai_brain || {};
-      const t = ab.today || {};
-      const bal = ab.balance || {};
-      const mShort = fmtModelShort(ab.model);
-      const ok = t.ai_ok || 0;
-      const err = t.ai_err || 0;
-      const cap = ab.daily_cap || 500;
-      const rem = typeof bal.remaining_usd === "number" ? `~$${bal.remaining_usd.toFixed(2)}` : `${ok}/${cap}`;
-      aiPill.classList.toggle("has-err", err > 0);
-      $("ai-val").textContent = `${mShort} · ${rem}`;
-      aiPill.title = `Claude AI Brain (${ab.model || "none"} ${ab.effort || ""}) · Est. ${rem} left of $${(bal.credit_total_usd || 98).toFixed(2)} · Today: ${ok}/${cap} plans, ${err} errors · Click or press 4`;
+      if (ab.redacted) {
+        const activeCnt = Number(ab.active_plans_count || 0);
+        aiPill.classList.toggle("has-err", Boolean(ab.stale_alarm));
+        $("ai-val").textContent = `${activeCnt} active · 🔒`;
+        aiPill.title = `Claude AI Brain (${activeCnt} active companion plans) · Click or press 4 and unlock Admin to view model & budget`;
+      } else {
+        const t = ab.today || {};
+        const bal = ab.balance || {};
+        const mShort = fmtModelShort(ab.model);
+        const ok = t.ai_ok || 0;
+        const err = t.ai_err || 0;
+        const cap = ab.daily_cap || 500;
+        const rem = typeof bal.remaining_usd === "number" ? `~$${bal.remaining_usd.toFixed(2)}` : `${ok}/${cap}`;
+        aiPill.classList.toggle("has-err", err > 0);
+        $("ai-val").textContent = `${mShort} · ${rem}`;
+        aiPill.title = `Claude AI Brain (${ab.model || "none"} ${ab.effort || ""}) · Est. ${rem} left of $${(bal.credit_total_usd || 98).toFixed(2)} · Today: ${ok}/${cap} plans, ${err} errors · Click or press 4`;
+      }
     }
 
     const evPill = $("event-pill");
@@ -166,6 +180,34 @@
       const ev = d.weekly_event || "";
       evPill.style.display = ev ? "" : "none";
       if (ev) $("event-val").textContent = ev;
+    }
+
+    // Issue #59: Visible operator alert banner for DB outage, stale data, brain staleness, or recent failure alerts
+    const alertBanner = $("operator-alert-banner");
+    if (alertBanner) {
+      const ab = d.ai_brain || {};
+      const msgs = [];
+      if (!d.db_ok) msgs.push("MySQL disconnected (db_ok=false)");
+      if ((d.data_age_sec || 0) > 120) msgs.push(`Telemetry stale (${d.data_age_sec}s old)`);
+      if (ab.stale_alarm) msgs.push("AI Brain stale alarm: no recent applied companion plan");
+      const nowEpoch = Math.floor(Date.now() / 1000);
+      const rawAlerts = Array.isArray(ab.failure_alerts) ? ab.failure_alerts : [];
+      const recentRaw = rawAlerts.filter((a) => !a.epoch || nowEpoch - Number(a.epoch) <= 7200);
+      if (recentRaw.length > 0) {
+        const last = recentRaw[recentRaw.length - 1];
+        msgs.push(`Alert (${last.source || "system"} @ ${last.ts || ""}): ${last.detail || "failure recorded"}`);
+      } else if (ab.recent_alert_count > 0 && ab.latest_alert) {
+        msgs.push(`Alert (${ab.latest_alert.source || "system"} @ ${ab.latest_alert.ts || ""}) — unlock admin for details`);
+      }
+      if (msgs.length > 0) {
+        alertBanner.style.display = "flex";
+        setHtmlIfChanged(
+          alertBanner,
+          `<span class="alert-badge">ALERT</span><span>${msgs.map((m) => esc(m)).join(" · ")}</span>`
+        );
+      } else {
+        alertBanner.style.display = "none";
+      }
     }
 
     const hb = $("humans-banner");
@@ -1034,6 +1076,7 @@
         await postBrainApi("/api/brain/logout", {}, "Admin controls locked");
         adminUnlocked = false;
         updateAdminBtn();
+        connectStream();
         return;
       }
       const tok = window.prompt("Enter AZEROTH_WATCH_ADMIN_TOKEN (from hearthcore/.env):");
@@ -1048,6 +1091,15 @@
         adminUnlocked = true;
         updateAdminBtn();
         showBrainToast("Admin controls unlocked for this browser");
+        // Immediately fetch full admin snapshot & reconnect SSE with the new session cookie!
+        try {
+          const stRes = await fetch("/api/state", { cache: "no-store" });
+          if (stRes.ok) {
+            state.data = await stRes.json();
+            render(state.data);
+          }
+        } catch (_) {}
+        connectStream();
       } else {
         showBrainToast(data.error || "Invalid admin token", true);
       }
@@ -1202,6 +1254,36 @@
       qmPanel.style.display = "none";
     }
 
+    // Issue #65: AI vs Fallback A/B outcome & cost panel
+    const abPanel = $("ab-panel");
+    const abRep = ab.ab_report;
+    if (abPanel && abRep && abRep.by_source && Object.keys(abRep.by_source).length > 0) {
+      abPanel.style.display = "";
+      const hoPct = Number(abRep.holdout_pct || 0);
+      $("ab-holdout-badge").textContent = `Holdout ${hoPct}% · ${abRep.window_days || 14}d`;
+      const rec = abRep.recommendation || {};
+      $("ab-tuning-advice").textContent = rec.action || "";
+      const abRows = Object.entries(abRep.by_source)
+        .sort((a, b) => (b[1].sessions || 0) - (a[1].sessions || 0))
+        .map(([src, m]) => {
+          const pct = Math.round(Number(m.progress_rate || 0) * 100);
+          return `
+            <tr>
+              <td><b>${esc(src)}</b></td>
+              <td class="num mono">${Number(m.sessions || 0)}</td>
+              <td class="num mono" style="color:${pct >= 50 ? "var(--green)" : "var(--amber)"}">${pct}%</td>
+              <td class="num mono">${Number(m.stalled || 0)}</td>
+              <td class="num mono">${Number(m.avg_skillups || 0).toFixed(2)}</td>
+              <td class="num mono">$${Number(m.total_cost_usd || 0).toFixed(4)}</td>
+              <td class="num mono">$${Number(m.cost_per_session_usd || 0).toFixed(5)}</td>
+            </tr>`;
+        })
+        .join("");
+      setHtmlIfChanged($("ab-tbody"), abRows);
+    } else if (abPanel) {
+      abPanel.style.display = "none";
+    }
+
     const bySlug = {};
     for (const c of d.companions || []) bySlug[c.name.toLowerCase()] = c;
     const mem = ab.memory || {};
@@ -1209,6 +1291,9 @@
     const resCount = Object.keys(mem.active_reservations || {}).length;
 
     $("brain-active-badge").textContent = `${activeCnt} active · ${resCount} reserved orders${opAlerts.length ? ` · ⚠ ${opAlerts.length} stall alert${opAlerts.length > 1 ? "s" : ""}` : ""}`;
+    const emptyPlansMsg = ab.redacted
+      ? `<tr><td colspan="5" class="empty-note">🔒 Admin session locked or expired — click <b>🔒 Unlock Admin</b> above to view companion plans &amp; Claude decisions.</td></tr>`
+      : `<tr><td colspan="5" class="empty-note">No AI Brain session plans recorded yet.</td></tr>`;
     const plansHtml =
       activeList.length > 0
         ? activeList
@@ -1261,11 +1346,14 @@
                 </tr>`;
             })
             .join("")
-        : `<tr><td colspan="5" class="empty-note">No AI Brain session plans recorded yet.</td></tr>`;
+        : emptyPlansMsg;
     setHtmlIfChanged($("brain-plans-tbody"), plansHtml);
 
     const hist = ab.history || [];
-    $("brain-hist-badge").textContent = `${hist.length} recent`;
+    $("brain-hist-badge").textContent = ab.redacted ? "locked" : `${hist.length} recent`;
+    const emptyHistMsg = ab.redacted
+      ? `<div class="empty-note">🔒 Admin session locked or expired — click <b>🔒 Unlock Admin</b> above.</div>`
+      : `<div class="empty-note">No decisions logged yet.</div>`;
     const histHtml =
       hist.length > 0
         ? hist
@@ -1290,16 +1378,43 @@
                 </div>`;
             })
             .join("")
-        : `<div class="empty-note">No decisions logged yet.</div>`;
+        : emptyHistMsg;
     setHtmlIfChanged($("brain-history-list"), histHtml);
   }
 
   function render(d) {
+    if (d && typeof d.view_mode === "string") {
+      const nextAuth = d.view_mode === "admin";
+      if (nextAuth !== adminUnlocked) {
+        adminUnlocked = nextAuth;
+        updateAdminBtn();
+      }
+    }
     renderHeader(d);
     if (state.view === "overview") renderOverview(d);
     else if (state.view === "vault") renderVaultView(d);
     else if (state.view === "roster") renderRosterView(d);
     else if (state.view === "brain") renderBrainView(d);
+  }
+
+  let sseSource = null;
+  function connectStream() {
+    if (sseSource) {
+      try { sseSource.close(); } catch (_) {}
+      sseSource = null;
+    }
+    const es = new EventSource("/api/stream");
+    sseSource = es;
+    es.addEventListener("state", (ev) => {
+      try {
+        state.data = JSON.parse(ev.data);
+        $("sse-dot").classList.remove("stale");
+        render(state.data);
+      } catch (_) {}
+    });
+    es.onerror = () => {
+      $("sse-dot").classList.add("stale");
+    };
   }
 
   async function init() {
@@ -1311,17 +1426,7 @@
       }
     } catch (_) {}
 
-    const es = new EventSource("/api/stream");
-    es.addEventListener("state", (ev) => {
-      try {
-        state.data = JSON.parse(ev.data);
-        $("sse-dot").classList.remove("stale");
-        render(state.data);
-      } catch (_) {}
-    });
-    es.onerror = () => {
-      $("sse-dot").classList.add("stale");
-    };
+    connectStream();
   }
 
   init();

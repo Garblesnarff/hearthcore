@@ -271,6 +271,7 @@ class CoreTests(unittest.TestCase):
         }
         w = weights_for_cpp(plan, snap, xp_capped_catchup=True)
         self.assertLessEqual(w["quest_work"], 0.55)
+        self.assertGreaterEqual(w["quest_turnin"], 0.90)
         self.assertGreaterEqual(w["craft"], 1.45)
         self.assertGreaterEqual(w["gather"], 1.45)
-        self.assertLessEqual(w["travel"], 0.65)
+        self.assertGreaterEqual(w["travel"], 0.90)

@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -8,6 +9,10 @@ from .store import record
 
 
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     cli = argparse.ArgumentParser()
     commands = cli.add_subparsers(dest="command", required=True)
     commands.add_parser("roster")
@@ -28,6 +33,19 @@ def main():
     bt.add_argument("--character", help="Plan only a single companion slug")
 
     commands.add_parser("brain-status", help="Show active AI Brain session plans and today's API stats")
+    bd = commands.add_parser("brain-disable", help="Disable AI Brain live cycles and/or MySQL weight overrides")
+    bd.add_argument("--guid", type=int, default=None, help="Optional single character GUID to disable in MySQL")
+    bd.add_argument("--skip-db", action="store_true", help="Only write the local kill-switch flag file")
+    be = commands.add_parser("brain-enable", help="Re-enable AI Brain live cycles and/or MySQL weight overrides")
+    be.add_argument("--guid", type=int, default=None, help="Optional single character GUID to re-enable in MySQL")
+    be.add_argument("--skip-db", action="store_true", help="Only remove the local kill-switch flag file")
+
+    commands.add_parser("reconcile", help="Compare SQLite plans/journal against live MySQL proposals/overrides; non-zero on drift")
+    rep = commands.add_parser("replay", help="Offline no-network replay: recorded snapshot in -> validated plan & SQL out")
+    rep.add_argument("--character", required=True)
+    rep.add_argument("--snapshot", required=True)
+    rep.add_argument("--guid", type=int, default=1001)
+    rep.add_argument("--plan-id", type=int, default=1)
 
     commands.add_parser("supply-report", help="Compute 40-char Classic (1-300) profession material deficits vs Guild Bank")
 
@@ -53,14 +71,19 @@ def main():
             return 0
 
         if args.command == "brain-tick":
-            from .bridge import run_cycle
-            res = run_cycle(
-                provider=args.provider,
-                apply=not args.shadow,
-                force=args.force,
-                limit=args.limit,
-                character=args.character,
-            )
+            from .bridge import RunLockBusy, install_sigterm_handler, run_cycle
+            install_sigterm_handler()
+            try:
+                res = run_cycle(
+                    provider=args.provider,
+                    apply=not args.shadow,
+                    force=args.force,
+                    limit=args.limit,
+                    character=args.character,
+                )
+            except RunLockBusy as exc:
+                logging.getLogger("hearthcore").warning("brain-tick skipped cleanly: %s", exc)
+                return 0
             for item in res["planned"]:
                 err = f" err={item['error']}" if item["error"] else ""
                 print(
@@ -69,24 +92,56 @@ def main():
                     f"tok={item['tokens']}, {item['latency_ms']}ms){err}"
                 )
             t = res["summary"]["today"]
+            failed = res.get("failed") or []
             print(
-                f"Cycle done: planned={res['planned_count']} | today: ai_ok={t['ai_ok']} "
+                f"Cycle done: planned={res['planned_count']} failed={len(failed)} | today: ai_ok={t['ai_ok']} "
                 f"ai_err={t['ai_err']} fb={t['fallback']} tok={t['input_tokens']}in/{t['output_tokens']}out "
                 f"cap={res['summary']['daily_cap']}"
             )
-            return 0
+            for fitem in failed:
+                print(f"FAILED {fitem['name']}: {fitem['error']}", file=sys.stderr)
+            return 1 if failed else 0
 
         if args.command == "brain-status":
-            from .bridge import BrainStore, load_env
+            from .bridge import BRAIN_DB_PATH, BrainStore, is_brain_disabled, load_env
+            from .memory import MemoryEngine
             load_env()
-            s = BrainStore().summary(int(time.time()))
+            store = BrainStore()
+            s = store.summary(int(time.time()))
+            jstat = MemoryEngine(BRAIN_DB_PATH).journal_status()
             t = s["today"]
-            print(f"Hearthcore AI Brain | model={s['model']} effort={s['effort']} day={s['day']}")
+            flags = []
+            if is_brain_disabled():
+                flags.append("DISABLED")
+            if s.get("stale_alarm"):
+                flags.append(f"STALE>{s.get('stale_threshold_minutes')}m")
+            flag_str = f" [{' '.join(flags)}]" if flags else ""
+            print(f"Hearthcore AI Brain | model={s['model']} effort={s['effort']} day={s['day']}{flag_str}")
             print(
                 f"Today: ai_ok={t['ai_ok']} ai_err={t['ai_err']} fallback={t['fallback']} "
                 f"cap={s['daily_cap']} tokens={t['input_tokens']}in/{t['output_tokens']}out "
                 f"avg_latency={t['avg_latency_ms']}ms"
             )
+            print(
+                f"Event Journal: events={jstat['total_events']} cursor={jstat['cursor']} "
+                f"lag={jstat['journal_lag']} gap={jstat['gap_detected']}"
+            )
+            ab = s.get("ab_report") or {}
+            by_src = ab.get("by_source") or {}
+            if by_src:
+                parts = [
+                    f"{src}: n={v['sessions']} prog={v['progress_rate']*100:.0f}% $/sess=${v['cost_per_session_usd']:.4f}"
+                    for src, v in sorted(by_src.items())
+                ]
+                print(f"A/B Outcomes ({ab.get('window_days', 14)}d, holdout={ab.get('holdout_pct', 0)}%): " + " | ".join(parts))
+            from .bridge import RUNTIME_DIR
+            alerts_file = RUNTIME_DIR / "failure_alerts.log"
+            if alerts_file.is_file():
+                recent_alerts = alerts_file.read_text(encoding="utf-8").splitlines()[-5:]
+                if recent_alerts:
+                    print(f"Recent Failure Alerts ({len(recent_alerts)} shown from {alerts_file.name}):")
+                    for ln in recent_alerts:
+                        print(f"  ! {ln}")
             active = [v for v in s["plans"].values() if v["active"]]
             print(f"Active session plans ({len(active)}):")
             for v in sorted(active, key=lambda x: x["character_id"]):
@@ -95,6 +150,30 @@ def main():
                     f"  {v['character_id']:<12} [{v['source']:<9}] {v['primary_goal_id']:<28} "
                     f"({v['reason_code']}, {rem}m left) - {v['primary_desc']}"
                 )
+            return 0
+
+        if args.command == "reconcile":
+            from .bridge import load_env, reconcile_state
+            load_env()
+            report = reconcile_state()
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 0 if report["ok"] else 1
+
+        if args.command == "replay":
+            from .bridge import replay_snapshot
+            snap_raw = json.loads(Path(args.snapshot).read_text(encoding="utf-8"))
+            out = replay_snapshot(args.character, snap_raw, guid=args.guid, plan_id=args.plan_id)
+            print(json.dumps(out, indent=2, sort_keys=True))
+            return 0
+
+        if args.command in ("brain-disable", "brain-enable"):
+            from .bridge import set_brain_disabled
+            res = set_brain_disabled(
+                args.command == "brain-disable",
+                guid=args.guid,
+                skip_db=args.skip_db,
+            )
+            print(json.dumps(res, indent=2, sort_keys=True))
             return 0
 
         if args.command == "supply-report":
@@ -111,12 +190,17 @@ def main():
             return 0
 
         if args.command == "quartermaster-tick":
+            from .bridge import RunLockBusy
             from .quartermaster import run_quartermaster
-            res = run_quartermaster(
-                provider=args.provider,
-                apply=not args.shadow,
-                model=args.model,
-            )
+            try:
+                res = run_quartermaster(
+                    provider=args.provider,
+                    apply=not args.shadow,
+                    model=args.model,
+                )
+            except RunLockBusy as exc:
+                logging.getLogger("hearthcore").warning("quartermaster-tick skipped cleanly: %s", exc)
+                return 0
             p = res["plan"]
             m = res["meta"]
             print(f"[{res['source']}] model={m.get('model', res['source'])} ({m.get('latency_ms', 0)}ms, tok={m.get('input_tokens', 0)}/{m.get('output_tokens', 0)})")
@@ -146,8 +230,8 @@ def main():
                     "tick_p99": (st.get("ticks") or {}).get("p99"),
                 }
                 raid_stage = int((st.get("raid") or {}).get("stage") or 0)
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.getLogger("hearthcore").warning("Dashboard telemetry fetch failed (fail-closed): %s", exc)
             world_ctx = fetch_world_context()
             res = run_shadow_match_snapshot(
                 world_ctx, db_path=BRAIN_DB_PATH, runtime_dir=RUNTIME_DIR, vitals=vitals, raid_stage=raid_stage
@@ -186,9 +270,11 @@ def main():
         snap = snapshot(json.loads(Path(args.snapshot).read_text()), args.character)
         source = args.provider
         if source == "anthropic":
-            from .provider import anthropic
+            from .budget import BudgetLedger
+            from .provider import anthropic, default_budget_db_path
+            ledger = BudgetLedger(default_budget_db_path())
             try:
-                plan = anthropic(character, snap)
+                plan = anthropic(character, snap, budget=ledger, caller="cli_plan")
             except Invalid as e:
                 print("API plan rejected; using fallback: " + str(e), file=sys.stderr)
                 plan, source = fallback(character, snap), "fallback_after_api"

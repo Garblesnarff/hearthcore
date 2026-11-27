@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""Azeroth Watch — lightweight HTTP + SSE server with authenticated admin controls (zero external deps).
+"""Azeroth Watch — hardened HTTP + SSE server with authenticated admin & read-view protection.
 
-Security model (Issue #9):
-- Default CLI bind is 127.0.0.1 (safe local default); LAN family dashboard explicitly binds 0.0.0.0
-  in systemd while read-only GET/SSE endpoints stay separated from privileged POST endpoints.
-- ALL administrative POST endpoints (/api/brain/model, /api/brain/credit, /api/brain/run) require:
-  1. Strict Content-Length <= 4096 bytes and JSON Content-Type.
-  2. Same-Origin / CSRF check (rejects cross-origin Origin/Referer headers with 403).
-  3. Explicit authorization via X-Azeroth-Admin-Token header OR HttpOnly SameSite=Strict
-     HMAC-signed session cookie issued by POST /api/brain/auth (401 otherwise).
-  4. Rate limiting (15s run cooldown + 5/min auth brute-force protection).
-  5. Audit logging to runtime/admin_audit.log (zero secrets logged or returned).
+Security & robustness model (Issues #9, #71 & #72):
+- Default CLI bind is 127.0.0.1; LAN family dashboard explicitly binds 0.0.0.0 in systemd while
+  validating Host headers on EVERY route (DNS-rebinding protection) and setting a strict CSP.
+- Handler socket timeout (15s), bounded SSE client pool (MAX_SSE_CLIENTS=16 -> 503 when full),
+  and cached JSON serialization per (snapshot_version, authenticated) pair.
+- Constant-time UTF-8 safe token & cookie checks (never raise TypeError on non-ASCII), with
+  per-IP rate limiting across ALL auth failures (header, cookie, and login endpoint).
+- Server-side session store with short 12h TTL and real server-side revocation on logout.
+- Dashboard NEVER rewrites `.env` (which holds ANTHROPIC_API_KEY); mutable settings live in a
+  separate `runtime/dashboard_overrides.env` file created atomically with `os.open(..., 0o600)`.
+- Admin actions signal the collector thread (`request_refresh()`) instead of blocking the HTTP thread.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import hmac
 import http.cookies
 import http.server
@@ -25,27 +25,244 @@ import mimetypes
 import os
 import secrets
 import signal
+import socket
 import socketserver
 import subprocess
 import sys
 import threading
 import time
 import urllib.parse
+from pathlib import Path
 
 from collector import AzerothCollector
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
-HEARTHCORE_ENV = "/home/wonky/hearthcore/.env"
-AUDIT_LOG_PATH = "/home/wonky/hearthcore/runtime/admin_audit.log"
+
+
+def _default_hearthcore_root(base_dir: str | Path = BASE_DIR, home_dir: Path | None = None) -> Path:
+    env_root = os.getenv("HEARTHCORE_ROOT")
+    if env_root:
+        return Path(env_root)
+    parent = Path(base_dir).resolve().parent
+    # Only treat parent as the hearthcore repo root when it actually contains the Python package
+    # `hearthcore/__init__.py` (NOT when deployed as sibling ~/azeroth-watch next to ~/hearthcore!).
+    if (parent / "hearthcore" / "__init__.py").is_file():
+        return parent
+    if (parent / "hearthcore" / "hearthcore" / "__init__.py").is_file():
+        return parent / "hearthcore"
+    return (home_dir if home_dir is not None else Path.home()) / "hearthcore"
+
+
+HEARTHCORE_ENV = os.getenv("HEARTHCORE_ENV_PATH", str(_default_hearthcore_root() / ".env"))
+DASHBOARD_OVERRIDES_ENV = os.getenv(
+    "HEARTHCORE_DASHBOARD_OVERRIDES_PATH",
+    str(_default_hearthcore_root() / "runtime" / "dashboard_overrides.env"),
+)
+AUDIT_LOG_PATH = os.getenv("AZEROTH_WATCH_AUDIT_LOG", str(_default_hearthcore_root() / "runtime" / "admin_audit.log"))
 ALLOWED_MODELS = {"claude-haiku-5-5", "claude-sonnet-5-5"}
 MAX_POST_BYTES = 4096
+MAX_SSE_CLIENTS = int(os.getenv("AZEROTH_WATCH_MAX_SSE_CLIENTS", "16") or 16)
+HANDLER_TIMEOUT_SEC = float(os.getenv("AZEROTH_WATCH_SOCKET_TIMEOUT", "15.0") or 15.0)
 SESSION_COOKIE_NAME = "aw_admin_session"
-SESSION_TTL_SEC = 30 * 86400
+SESSION_TTL_SEC = 12 * 3600  # 12h short server-side revocable session (Issue #72)
+CSP_HEADER = (
+    "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+    "script-src 'self'; connect-src 'self'; frame-ancestors 'self'"
+)
 
 _CTL_LOCK = threading.Lock()
 _LAST_RUN_TS: dict[str, float] = {}
 _AUTH_FAILS: dict[str, list[float]] = {}
+
+# Explicit read-only kiosk allow-list (Issues #71 & #72)
+PUBLIC_TOP_KEYS = (
+    "generated_at",
+    "clock",
+    "hour",
+    "minute",
+    "db_ok",
+    "data_age_sec",
+    "realm",
+    "vitals",
+    "ticks",
+    "errors_bytes",
+    "slow_warnings",
+    "population",
+    "humans",
+    "raid",
+    "companions",
+    "professions",
+    "bank",
+    "ledger",
+    "events",
+    "work_orders",
+    "relationships",
+    "shifts",
+    "world_zones",
+    "map_slides",
+    "weekly_event",
+)
+PUBLIC_HUMAN_KEYS = (
+    "guid",
+    "name",
+    "level",
+    "class_id",
+    "class_name",
+    "class_color",
+    "race_id",
+    "gender",
+    "race",
+    "zone_id",
+    "zone",
+    "map_id",
+    "x",
+    "y",
+    "xp",
+    "xp_max",
+    "xp_pct",
+)
+
+
+def _safe_digest_eq(a: str, b: str) -> bool:
+    """UTF-8 constant-time comparison that never raises TypeError on non-ASCII input (Issue #72)."""
+    try:
+        return hmac.compare_digest(str(a).encode("utf-8"), str(b).encode("utf-8"))
+    except Exception:
+        return False
+
+
+def _discover_default_allowed_hosts() -> set[str]:
+    hosts = {"127.0.0.1", "localhost", "[::1]", "::1"}
+    try:
+        hn = socket.gethostname().strip().lower()
+        if hn:
+            hosts.add(hn)
+            hosts.add(f"{hn}.local")
+    except OSError:
+        pass
+    # Discover ALL local IPv4 interface addresses cleanly (never assumes 192.168.1.1 gateway!)
+    try:
+        res = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                parts = line.split()
+                if "inet" in parts:
+                    idx = parts.index("inet")
+                    if idx + 1 < len(parts):
+                        ip = parts[idx + 1].split("/", 1)[0].strip()
+                        if ip:
+                            hosts.add(ip)
+    except Exception:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            if ip:
+                hosts.add(ip)
+        finally:
+            s.close()
+    except OSError:
+        pass
+    extra = os.getenv("AZEROTH_WATCH_ALLOWED_HOSTS", "")
+    for item in extra.split(","):
+        tok = item.strip().lower()
+        if tok:
+            hosts.add(tok)
+    return hosts
+
+
+def _strip_host_port(host_header: str) -> str:
+    h = (host_header or "").strip().lower()
+    if not h:
+        return ""
+    if h.startswith("["):
+        end = h.find("]")
+        return h[: end + 1] if end != -1 else h
+    if ":" in h:
+        return h.split(":", 1)[0]
+    return h
+
+
+def _host_allowed(host_header: str, allowed_hosts: set[str]) -> bool:
+    host_only = _strip_host_port(host_header)
+    if not host_only:
+        return False
+    return host_only in allowed_hosts
+
+
+def project_snapshot(snap: dict | None, *, authenticated: bool, local_readonly: bool = False) -> dict:
+    """Apply explicit field allow-list for public kiosk vs local readonly vs authenticated admin view (Issue #71)."""
+    if not isinstance(snap, dict):
+        return {}
+    out: dict = {}
+    for k in PUBLIC_TOP_KEYS:
+        if k not in snap:
+            continue
+        if k == "humans" and isinstance(snap[k], list):
+            out["humans"] = [
+                {hk: h[hk] for hk in PUBLIC_HUMAN_KEYS if hk in h}
+                for h in snap[k]
+                if isinstance(h, dict)
+            ]
+        else:
+            out[k] = snap[k]
+
+    if authenticated or local_readonly:
+        if "ai_brain" in snap:
+            out["ai_brain"] = snap["ai_brain"]
+        out["view_mode"] = "admin" if authenticated else "local_readonly"
+    else:
+        ab = snap.get("ai_brain") if isinstance(snap.get("ai_brain"), dict) else {}
+        active_list = ab.get("active_list") if isinstance(ab.get("active_list"), list) else []
+        alerts = ab.get("failure_alerts") if isinstance(ab.get("failure_alerts"), list) else []
+        recent_cutoff = int(time.time()) - 7200
+        recent_alerts = [
+            a for a in alerts
+            if isinstance(a, dict) and (int(a.get("epoch") or 0) >= recent_cutoff or not a.get("epoch"))
+        ]
+        latest = recent_alerts[-1] if recent_alerts else None
+        out["ai_brain"] = {
+            "auth_required": True,
+            "redacted": True,
+            "active_plans_count": sum(1 for item in active_list if isinstance(item, dict) and item.get("active")),
+            "stale_alarm": bool(ab.get("stale_alarm")),
+            "recent_alert_count": len(recent_alerts),
+            "latest_alert": {
+                "ts": str(latest.get("ts") or ""),
+                "source": str(latest.get("source") or ""),
+                "severity": str(latest.get("severity") or "warning"),
+            } if latest else None,
+        }
+        out["view_mode"] = "kiosk"
+    return out
+
+
+def project_kiosk_summary(snap: dict | None) -> dict:
+    """Minimal read-only wall-display summary with zero PII, coordinates, logs, or API spend (Issue #71)."""
+    if not isinstance(snap, dict):
+        return {"view_mode": "kiosk_minimal", "db_ok": False}
+    realm = snap.get("realm") if isinstance(snap.get("realm"), dict) else {}
+    ticks = snap.get("ticks") if isinstance(snap.get("ticks"), dict) else {}
+    raid = snap.get("raid") if isinstance(snap.get("raid"), dict) else {}
+    ab = snap.get("ai_brain") if isinstance(snap.get("ai_brain"), dict) else {}
+    return {
+        "view_mode": "kiosk_minimal",
+        "generated_at": snap.get("generated_at"),
+        "db_ok": bool(snap.get("db_ok", False)),
+        "data_age_sec": int(snap.get("data_age_sec") or 0),
+        "realm_name": str(realm.get("name") or ""),
+        "population": snap.get("population") or {},
+        "tick_latest_ms": ticks.get("latest"),
+        "raid_stage": raid.get("stage"),
+        "weekly_event": str(snap.get("weekly_event") or ""),
+        "stale_alarm": bool(ab.get("stale_alarm")),
+    }
 
 
 def _read_env_value(key: str, env_path: str = HEARTHCORE_ENV) -> str:
@@ -67,15 +284,33 @@ def _read_env_value(key: str, env_path: str = HEARTHCORE_ENV) -> str:
     return ""
 
 
-def _update_hearthcore_env(key: str, value: str, env_path: str = HEARTHCORE_ENV) -> None:
-    """Safely update one key in hearthcore/.env (preserves chmod 600, never echoes secrets)."""
+def _atomic_write_0600(target_path: str, content: str) -> None:
+    """Atomically write file created directly with mode 0600 (zero umask window, Issue #72)."""
+    parent = os.path.dirname(target_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = f"{target_path}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.chmod(tmp, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+        os.replace(tmp, target_path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _update_env_file(key: str, value: str, target_path: str) -> None:
+    """Safely update one key in a dedicated 0600 settings file (never rewrites .env API keys, Issue #72)."""
     with _CTL_LOCK:
-        parent = os.path.dirname(env_path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
         lines = []
-        if os.path.isfile(env_path):
-            with open(env_path, "r", encoding="utf-8") as f:
+        if os.path.isfile(target_path):
+            with open(target_path, "r", encoding="utf-8") as f:
                 lines = f.read().splitlines()
         out = []
         found = False
@@ -87,41 +322,18 @@ def _update_hearthcore_env(key: str, value: str, env_path: str = HEARTHCORE_ENV)
                 out.append(ln)
         if not found:
             out.append(f"{key}={value}")
-        tmp = env_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write("\n".join(out) + "\n")
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, env_path)
+        _atomic_write_0600(target_path, "\n".join(out) + "\n")
 
 
-def ensure_admin_token(env_path: str = HEARTHCORE_ENV) -> str:
-    """Return configured admin token, generating and saving one (chmod 600) if absent."""
-    tok = _read_env_value("AZEROTH_WATCH_ADMIN_TOKEN", env_path=env_path)
-    if tok and len(tok) >= 16:
-        return tok
+def ensure_admin_token(env_path: str = HEARTHCORE_ENV, overrides_path: str = DASHBOARD_OVERRIDES_ENV) -> str:
+    """Return configured admin token; if absent, generate into dedicated 0600 overrides file."""
+    for p in (env_path, overrides_path):
+        tok = _read_env_value("AZEROTH_WATCH_ADMIN_TOKEN", env_path=p)
+        if tok and len(tok) >= 16:
+            return tok
     new_tok = secrets.token_urlsafe(24)
-    _update_hearthcore_env("AZEROTH_WATCH_ADMIN_TOKEN", new_tok, env_path=env_path)
+    _update_env_file("AZEROTH_WATCH_ADMIN_TOKEN", new_tok, overrides_path)
     return new_tok
-
-
-def _sign_session(token: str, issued_at: int) -> str:
-    msg = f"aw-admin:{issued_at}".encode("utf-8")
-    sig = hmac.new(token.encode("utf-8"), msg, hashlib.sha256).hexdigest()
-    return f"{issued_at}.{sig}"
-
-
-def _verify_session(cookie_val: str, token: str, now_ts: int | None = None) -> bool:
-    if not cookie_val or "." not in cookie_val or not token:
-        return False
-    parts = cookie_val.split(".", 1)
-    if not parts[0].isdigit():
-        return False
-    issued_at = int(parts[0])
-    now = int(now_ts if now_ts is not None else time.time())
-    if issued_at > now + 60 or (now - issued_at) > SESSION_TTL_SEC:
-        return False
-    expected = _sign_session(token, issued_at)
-    return hmac.compare_digest(cookie_val, expected)
 
 
 def _same_origin_ok(headers, host_header: str) -> bool:
@@ -172,19 +384,136 @@ def make_handler(
     *,
     admin_token: str | None = None,
     env_path: str = HEARTHCORE_ENV,
+    overrides_path: str | None = None,
     audit_path: str = AUDIT_LOG_PATH,
     systemctl_runner=None,
+    allowed_hosts: set[str] | None = None,
+    max_sse_clients: int = MAX_SSE_CLIENTS,
+    session_ttl_sec: int = SESSION_TTL_SEC,
+    require_auth_for_reads: bool | None = None,
+    trust_loopback_reads: bool | None = None,
 ):
-    token_secret = admin_token if admin_token is not None else ensure_admin_token(env_path)
+    # Separate mutable settings file so dashboard NEVER rewrites .env holding ANTHROPIC_API_KEY (Issue #72).
+    settings_path = overrides_path if overrides_path is not None else (
+        env_path if env_path != HEARTHCORE_ENV else DASHBOARD_OVERRIDES_ENV
+    )
+    token_secret = admin_token if admin_token is not None else ensure_admin_token(env_path, settings_path)
+    host_allowlist = set(allowed_hosts) if allowed_hosts is not None else _discover_default_allowed_hosts()
+    auth_reads = (
+        bool(require_auth_for_reads)
+        if require_auth_for_reads is not None
+        else (os.getenv("AZEROTH_WATCH_REQUIRE_AUTH_FOR_READS") or "0").strip().lower() in ("1", "true", "yes", "on")
+    )
+    local_reads_ok = (
+        bool(trust_loopback_reads)
+        if trust_loopback_reads is not None
+        else (os.getenv("AZEROTH_WATCH_TRUST_LOOPBACK_READS") or "0").strip().lower() in ("1", "true", "yes", "on")
+    )
+
+    # Per-server-instance server-side session store (revocable!), SSE counter, and serialization cache
+    state_lock = threading.Lock()
+    sessions: dict[str, float] = {}  # session_id -> expires_at_epoch
+    sse_active = {"count": 0}
+    ser_cache: dict[tuple[int, bool, int], bytes] = {}
+    auth_fails: dict[str, list[float]] = {}
+
+    def _is_rate_limited(ip: str) -> bool:
+        now_m = time.monotonic()
+        with state_lock:
+            fails = [t for t in auth_fails.get(ip, []) if now_m - t < 60.0]
+            auth_fails[ip] = fails
+            return len(fails) >= 5
+
+    def _record_auth_fail(ip: str) -> None:
+        now_m = time.monotonic()
+        with state_lock:
+            fails = [t for t in auth_fails.get(ip, []) if now_m - t < 60.0]
+            fails.append(now_m)
+            auth_fails[ip] = fails
+
+    def _issue_session() -> str:
+        sid = secrets.token_urlsafe(32)
+        exp = time.time() + float(session_ttl_sec)
+        with state_lock:
+            now_t = time.time()
+            # Prune expired sessions opportunistically
+            for k in [k for k, v in sessions.items() if v <= now_t]:
+                sessions.pop(k, None)
+            sessions[sid] = exp
+        return sid
+
+    def _validate_session(sid: str) -> bool:
+        if not sid or len(sid) < 16:
+            return False
+        now_t = time.time()
+        with state_lock:
+            exp = sessions.get(sid)
+            if exp is None:
+                return False
+            if exp <= now_t:
+                sessions.pop(sid, None)
+                return False
+            return True
+
+    def _revoke_session(sid: str) -> None:
+        if not sid:
+            return
+        with state_lock:
+            sessions.pop(sid, None)
+
+    def _cached_serialized_state(ver: int, snap: dict | None, authenticated: bool, local_readonly: bool = False) -> bytes:
+        # Bucket live data_age_sec every 5s so stale DB age NEVER freezes in cache while healthy traffic hits 100%!
+        age_sec = int((snap or {}).get("data_age_sec") or 0) if isinstance(snap, dict) else 0
+        age_bucket = age_sec // 5
+        key = (int(ver), bool(authenticated), bool(local_readonly), age_bucket)
+        with state_lock:
+            hit = ser_cache.get(key)
+            if hit is not None:
+                return hit
+        payload = json.dumps(
+            project_snapshot(snap, authenticated=authenticated, local_readonly=local_readonly),
+            separators=(",", ":"),
+        ).encode("utf-8")
+        with state_lock:
+            if len(ser_cache) > 16:
+                ser_cache.clear()
+            ser_cache[key] = payload
+        return payload
+
+    def _trigger_collector_refresh() -> None:
+        req_fn = getattr(collector, "request_refresh", None)
+        if callable(req_fn):
+            req_fn()
+        else:
+            collector.refresh_once()
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+
+        def setup(self):
+            super().setup()
+            try:
+                self.request.settimeout(HANDLER_TIMEOUT_SEC)
+            except OSError:
+                pass
 
         def log_message(self, fmt, *args):
             return
 
         def _client_ip(self) -> str:
             return str(self.client_address[0]) if self.client_address else "unknown"
+
+        def _extract_session_cookie(self) -> str:
+            raw_cookie = self.headers.get("Cookie") or ""
+            if not raw_cookie:
+                return ""
+            try:
+                c = http.cookies.SimpleCookie()
+                c.load(raw_cookie)
+                morsel = c.get(SESSION_COOKIE_NAME)
+                return str(morsel.value) if morsel else ""
+            except Exception:
+                return ""
 
         def _send_bytes(
             self,
@@ -193,6 +522,7 @@ def make_handler(
             body: bytes,
             cache: str = "no-store",
             extra_headers: list[tuple[str, str]] | None = None,
+            close_conn: bool = False,
         ):
             self.send_response(status)
             self.send_header("Content-Type", content_type)
@@ -200,30 +530,52 @@ def make_handler(
             self.send_header("Cache-Control", cache)
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "SAMEORIGIN")
+            self.send_header("Content-Security-Policy", CSP_HEADER)
+            if close_conn:
+                self.send_header("Connection", "close")
+                self.close_connection = True
             for hk, hv in (extra_headers or []):
                 self.send_header(hk, hv)
             self.end_headers()
             self.wfile.write(body)
 
-        def _is_authenticated(self) -> bool:
-            if not token_secret:
+        def _check_host_header(self) -> bool:
+            if not _host_allowed(self.headers.get("Host") or "", host_allowlist):
+                self._send_bytes(
+                    403,
+                    "application/json; charset=utf-8",
+                    b'{"ok":false,"error":"Host not allowed"}',
+                    close_conn=True,
+                )
                 return False
+            return True
+
+        def _is_authenticated(self, *, count_failure: bool = False) -> tuple[bool, bool]:
+            """Return (authenticated, rate_limited). Never raises on non-ASCII or malformed inputs."""
+            ip = self._client_ip()
+            if _is_rate_limited(ip):
+                return False, True
+            if not token_secret:
+                return False, False
             hdr_tok = (self.headers.get("X-Azeroth-Admin-Token") or "").strip()
-            if hdr_tok and hmac.compare_digest(hdr_tok, token_secret):
-                return True
-            raw_cookie = self.headers.get("Cookie") or ""
-            if raw_cookie:
-                c = http.cookies.SimpleCookie()
-                try:
-                    c.load(raw_cookie)
-                except Exception:
-                    return False
-                morsel = c.get(SESSION_COOKIE_NAME)
-                if morsel and _verify_session(morsel.value, token_secret):
-                    return True
-            return False
+            if hdr_tok:
+                if _safe_digest_eq(hdr_tok, token_secret):
+                    return True, False
+                if count_failure:
+                    _record_auth_fail(ip)
+                return False, False
+            sid = self._extract_session_cookie()
+            if sid:
+                if _validate_session(sid):
+                    return True, False
+                if count_failure:
+                    _record_auth_fail(ip)
+                return False, False
+            return False, False
 
         def do_GET(self):
+            if not self._check_host_header():
+                return
             path = self.path.split("?", 1)[0]
 
             if path == "/api/health":
@@ -232,38 +584,87 @@ def make_handler(
                 return
 
             if path == "/api/brain/auth-status":
-                body = json.dumps({"ok": True, "authenticated": self._is_authenticated()}).encode("utf-8")
+                is_auth, rate_lim = self._is_authenticated(count_failure=True)
+                if rate_lim:
+                    self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Too many failed attempts; wait 60s"}', close_conn=True)
+                    return
+                body = json.dumps({"ok": True, "authenticated": is_auth}).encode("utf-8")
+                self._send_bytes(200, "application/json; charset=utf-8", body)
+                return
+
+            if path == "/api/kiosk":
+                _ver, snap = collector.get_snapshot()
+                body = json.dumps(project_kiosk_summary(snap), separators=(",", ":")).encode("utf-8")
                 self._send_bytes(200, "application/json; charset=utf-8", body)
                 return
 
             if path == "/api/state":
-                _, snap = collector.get_snapshot()
-                body = json.dumps(snap, separators=(",", ":")).encode("utf-8")
+                is_auth, rate_lim = self._is_authenticated(count_failure=True)
+                if rate_lim:
+                    self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Too many failed attempts; wait 60s"}', close_conn=True)
+                    return
+                if auth_reads and not is_auth:
+                    self._send_bytes(401, "application/json; charset=utf-8", b'{"ok":false,"error":"Authentication required for /api/state (use /api/kiosk for minimal view)"}', close_conn=True)
+                    return
+                is_local_ro = bool(local_reads_ok and not auth_reads and self._client_ip() in ("127.0.0.1", "::1"))
+                ver, snap = collector.get_snapshot()
+                body = _cached_serialized_state(ver, snap, is_auth, local_readonly=is_local_ro)
                 self._send_bytes(200, "application/json; charset=utf-8", body)
                 return
 
             if path == "/api/stream":
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "keep-alive")
-                self.end_headers()
-                last_ver = -1
+                is_auth, rate_lim = self._is_authenticated(count_failure=True)
+                if rate_lim:
+                    self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Too many failed attempts; wait 60s"}', close_conn=True)
+                    return
+                if auth_reads and not is_auth:
+                    self._send_bytes(401, "application/json; charset=utf-8", b'{"ok":false,"error":"Authentication required for /api/stream"}', close_conn=True)
+                    return
+                is_local_ro = bool(local_reads_ok and not auth_reads and self._client_ip() in ("127.0.0.1", "::1"))
+                with state_lock:
+                    if sse_active["count"] >= max(1, int(max_sse_clients)):
+                        self._send_bytes(
+                            503,
+                            "application/json; charset=utf-8",
+                            b'{"ok":false,"error":"Too many active SSE clients"}',
+                            close_conn=True,
+                        )
+                        return
+                    sse_active["count"] += 1
                 try:
+                    stream_sid = self._extract_session_cookie()
+                    stream_used_cookie = bool(is_auth and stream_sid and not (self.headers.get("X-Azeroth-Admin-Token") or "").strip())
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "keep-alive")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("Content-Security-Policy", CSP_HEADER)
+                    self.end_headers()
+                    last_key = None
                     while True:
+                        # Re-check session revocation on active SSE streams so logout immediately stops admin view!
+                        if stream_used_cookie and not _validate_session(stream_sid):
+                            is_auth = False
+                            stream_used_cookie = False
                         ver, snap = collector.get_snapshot()
-                        if ver != last_ver and snap:
-                            payload = json.dumps(snap, separators=(",", ":"))
-                            msg = f"id: {ver}\nevent: state\ndata: {payload}\n\n".encode("utf-8")
+                        age_bucket = int((snap or {}).get("data_age_sec") or 0) // 5 if isinstance(snap, dict) else 0
+                        cur_key = (ver, is_auth, is_local_ro, age_bucket)
+                        if cur_key != last_key and snap:
+                            payload_b = _cached_serialized_state(ver, snap, is_auth, local_readonly=is_local_ro)
+                            msg = f"id: {ver}\nevent: state\ndata: ".encode("utf-8") + payload_b + b"\n\n"
                             self.wfile.write(msg)
                             self.wfile.flush()
-                            last_ver = ver
+                            last_key = cur_key
                         else:
                             self.wfile.write(b": ping\n\n")
                             self.wfile.flush()
                         time.sleep(2.5)
-                except (BrokenPipeError, ConnectionResetError, OSError):
+                except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
                     return
+                finally:
+                    with state_lock:
+                        sse_active["count"] = max(0, sse_active["count"] - 1)
 
             if path == "/" or path == "/index.html":
                 self._serve_static("index.html")
@@ -278,31 +679,33 @@ def make_handler(
             self._send_bytes(404, "text/plain; charset=utf-8", b"Not found")
 
         def do_POST(self):
+            if not self._check_host_header():
+                return
             path = self.path.split("?", 1)[0]
             ip = self._client_ip()
 
             # 1. Cross-Origin / CSRF defense
             if not _same_origin_ok(self.headers, self.headers.get("Host") or ""):
                 _audit_log(ip, path, 403, "cross_origin_denied", audit_path=audit_path)
-                self._send_bytes(403, "application/json; charset=utf-8", b'{"ok":false,"error":"Cross-origin request denied"}')
+                self._send_bytes(403, "application/json; charset=utf-8", b'{"ok":false,"error":"Cross-origin request denied"}', close_conn=True)
                 return
 
             # 2. Require application/json to prevent simple form CSRF
             ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
             if ctype != "application/json":
                 _audit_log(ip, path, 415, "invalid_content_type", audit_path=audit_path)
-                self._send_bytes(415, "application/json; charset=utf-8", b'{"ok":false,"error":"Content-Type must be application/json"}')
+                self._send_bytes(415, "application/json; charset=utf-8", b'{"ok":false,"error":"Content-Type must be application/json"}', close_conn=True)
                 return
 
-            # 3. Bound request size strictly
+            # 3. Bound request size strictly (Connection: close on rejection so body never poisons keep-alive)
             try:
                 raw_clen = int(self.headers.get("Content-Length", "0") or 0)
             except ValueError:
-                self._send_bytes(400, "application/json; charset=utf-8", b'{"ok":false,"error":"Invalid Content-Length"}')
+                self._send_bytes(400, "application/json; charset=utf-8", b'{"ok":false,"error":"Invalid Content-Length"}', close_conn=True)
                 return
             if raw_clen < 0 or raw_clen > MAX_POST_BYTES:
                 _audit_log(ip, path, 413, f"payload_too_large:{raw_clen}", audit_path=audit_path)
-                self._send_bytes(413, "application/json; charset=utf-8", b'{"ok":false,"error":"Request body too large"}')
+                self._send_bytes(413, "application/json; charset=utf-8", b'{"ok":false,"error":"Request body too large"}', close_conn=True)
                 return
 
             try:
@@ -311,28 +714,23 @@ def make_handler(
                 if not isinstance(body, dict):
                     raise ValueError("JSON object required")
             except Exception:
-                self._send_bytes(400, "application/json; charset=utf-8", b'{"ok":false,"error":"Invalid JSON"}')
+                self._send_bytes(400, "application/json; charset=utf-8", b'{"ok":false,"error":"Invalid JSON"}', close_conn=True)
                 return
 
-            # Auth login endpoint (rate-limited against brute force)
+            # Auth login endpoint (rate-limited + server-side revocable session store)
             if path == "/api/brain/auth":
-                now_m = time.monotonic()
-                with _CTL_LOCK:
-                    recent_fails = [t for t in _AUTH_FAILS.get(ip, []) if now_m - t < 60.0]
-                    _AUTH_FAILS[ip] = recent_fails
-                    if len(recent_fails) >= 5:
-                        _audit_log(ip, path, 429, "auth_rate_limited", audit_path=audit_path)
-                        self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Too many failed attempts; wait 60s"}')
-                        return
-                cand = str(body.get("token") or "").strip()
-                if not cand or not token_secret or not hmac.compare_digest(cand, token_secret):
-                    with _CTL_LOCK:
-                        _AUTH_FAILS.setdefault(ip, []).append(now_m)
-                    _audit_log(ip, path, 401, "auth_failed", audit_path=audit_path)
-                    self._send_bytes(401, "application/json; charset=utf-8", b'{"ok":false,"error":"Invalid admin token"}')
+                if _is_rate_limited(ip):
+                    _audit_log(ip, path, 429, "auth_rate_limited", audit_path=audit_path)
+                    self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Too many failed attempts; wait 60s"}', close_conn=True)
                     return
-                signed = _sign_session(token_secret, int(time.time()))
-                cookie_hdr = f"{SESSION_COOKIE_NAME}={signed}; HttpOnly; SameSite=Strict; Path=/api/brain; Max-Age={SESSION_TTL_SEC}"
+                cand = str(body.get("token") or "").strip()
+                if not cand or not token_secret or not _safe_digest_eq(cand, token_secret):
+                    _record_auth_fail(ip)
+                    _audit_log(ip, path, 401, "auth_failed", audit_path=audit_path)
+                    self._send_bytes(401, "application/json; charset=utf-8", b'{"ok":false,"error":"Invalid admin token"}', close_conn=True)
+                    return
+                sid = _issue_session()
+                cookie_hdr = f"{SESSION_COOKIE_NAME}={sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age={int(session_ttl_sec)}"
                 _audit_log(ip, path, 200, "auth_ok", audit_path=audit_path)
                 self._send_bytes(
                     200,
@@ -343,7 +741,9 @@ def make_handler(
                 return
 
             if path == "/api/brain/logout":
-                cookie_hdr = f"{SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/api/brain; Max-Age=0"
+                sid = self._extract_session_cookie()
+                _revoke_session(sid)
+                cookie_hdr = f"{SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
                 _audit_log(ip, path, 200, "logout", audit_path=audit_path)
                 self._send_bytes(
                     200,
@@ -353,10 +753,15 @@ def make_handler(
                 )
                 return
 
-            # 4. Require explicit authorization for ALL state-changing controls
-            if not self._is_authenticated():
+            # 4. Require explicit authorization for ALL state-changing controls (rate-limited!)
+            is_auth, rate_lim = self._is_authenticated(count_failure=True)
+            if rate_lim:
+                _audit_log(ip, path, 429, "auth_rate_limited", audit_path=audit_path)
+                self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Too many failed attempts; wait 60s"}', close_conn=True)
+                return
+            if not is_auth:
                 _audit_log(ip, path, 401, "unauthorized", audit_path=audit_path)
-                self._send_bytes(401, "application/json; charset=utf-8", b'{"ok":false,"error":"Admin authorization required"}')
+                self._send_bytes(401, "application/json; charset=utf-8", b'{"ok":false,"error":"Admin authorization required"}', close_conn=True)
                 return
 
             if path == "/api/brain/model":
@@ -364,8 +769,8 @@ def make_handler(
                 if model not in ALLOWED_MODELS:
                     self._send_bytes(400, "application/json; charset=utf-8", b'{"ok":false,"error":"Unsupported model"}')
                     return
-                _update_hearthcore_env("ANTHROPIC_MODEL", model, env_path=env_path)
-                collector.refresh_once()
+                _update_env_file("ANTHROPIC_MODEL", model, settings_path)
+                _trigger_collector_refresh()
                 _audit_log(ip, path, 200, f"model={model}", audit_path=audit_path)
                 resp = json.dumps({"ok": True, "model": model}).encode("utf-8")
                 self._send_bytes(200, "application/json; charset=utf-8", resp)
@@ -382,8 +787,8 @@ def make_handler(
                 _, snap = collector.get_snapshot()
                 spent_so_far = float(((snap or {}).get("ai_brain") or {}).get("balance", {}).get("spent_total_usd", 0.0))
                 new_baseline = round(rem + spent_so_far, 2)
-                _update_hearthcore_env("HEARTHCORE_CREDIT_USD", f"{new_baseline:.2f}", env_path=env_path)
-                collector.refresh_once()
+                _update_env_file("HEARTHCORE_CREDIT_USD", f"{new_baseline:.2f}", settings_path)
+                _trigger_collector_refresh()
                 _audit_log(ip, path, 200, f"credit_remaining={rem:.2f}", audit_path=audit_path)
                 resp = json.dumps({"ok": True, "remaining_usd": round(rem, 2)}).encode("utf-8")
                 self._send_bytes(200, "application/json; charset=utf-8", resp)
@@ -447,13 +852,17 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1; use 0.0.0.0 for LAN read-only dashboard)")
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--interval", type=float, default=4.0)
+    parser.add_argument("--require-auth-for-reads", action="store_true", help="Require admin auth on /api/state and /api/stream")
     args = parser.parse_args()
 
     ensure_admin_token()
     collector = AzerothCollector(poll_interval_s=args.interval)
     collector.start()
 
-    srv = ThreadingHTTPServer((args.host, args.port), make_handler(collector))
+    srv = ThreadingHTTPServer(
+        (args.host, args.port),
+        make_handler(collector, require_auth_for_reads=True if args.require_auth_for_reads else None),
+    )
 
     def shutdown(*_args):
         collector.stop()
@@ -465,7 +874,7 @@ def main():
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
 
-    print(f"Azeroth Watch listening on http://{args.host}:{args.port} (admin POST auth enabled)", flush=True)
+    print(f"Azeroth Watch listening on http://{args.host}:{args.port} (hardened Host/CSP/SSE/session auth enabled)", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

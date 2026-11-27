@@ -14,20 +14,23 @@ import os
 import subprocess
 import sys
 
-HEARTHCORE_DIR = "/home/wonky/hearthcore"
-DB_CONTAINER = "ac-database"
+HEARTHCORE_DIR = os.getenv("HEARTHCORE_DIR", os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+DB_CONTAINER = os.getenv("HEARTHCORE_DB_CONTAINER", "ac-database")
+DB_NAME = os.getenv("HEARTHCORE_DB_NAME", "acore_characters")
 GUILD_ID = 6
 
-# Mapping from hearthcore profile preference keys -> companion_weights keys used by CompanionBrain/CompanionDuty.
+# Canonical profile preference -> native CompanionBrain weight key mapping (Issue #60).
+# Must stay identical to hearthcore.bridge.PROFILE_PREF_TO_NATIVE_WEIGHTS.
 KEY_MAP = {
-    "quest": "quest",
-    "craft": "craft",
-    "gather": "gather",
-    "train": "train",
-    "bank": "bank",
-    "repair": "repair",
-    "travel": "travel",
-    "fish": "fish",
+    "quest": ("quest_work", "quest_turnin", "quest_hub", "quest_grind"),
+    "craft": ("craft",),
+    "gather": ("gather",),
+    "train": ("train",),
+    "bank": ("bank",),
+    "repair": ("repair", "sell"),
+    "travel": ("travel",),
+    "fish": ("fish",),
+    "rest": ("hearth",),
 }
 
 ALLIANCE_DEFAULT_RACE = {
@@ -79,40 +82,55 @@ def load_guild_chars():
     return chars
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--apply", action="store_true", help="Write active companion weights to companion_weights")
-    ap.add_argument("--dry-run", action="store_true", help="Preview only (default)")
-    args = ap.parse_args()
+def build_sync_sql(
+    profiles: list[dict],
+    existing: dict[str, dict],
+    *,
+    overwrite_manual: bool = False,
+    db_name: str | None = None,
+) -> tuple[list[str], list[tuple], list[str]]:
+    """Build SQL upsert statements for companion_weights without clobbering manual rows.
 
-    profiles = load_profiles()
-    existing = load_guild_chars()
-
-    print(f"=== Hearthcore Profiles ({len(profiles)} total) ===")
-    sql_lines = []
-    planned = []
+    Merge & ownership rules (Issue #60):
+    - `hearthcore-sync.py` (canonical baseline sync): updates ONLY rows where `source = 'hearthcore'`
+      unless `--overwrite-manual` is passed, so rows with `source = 'manual'` (or any non-hearthcore
+      source) are never clobbered.
+    - `CompanionBrain::ReloadWeights()` (C++ runtime merge): records `manualKeys` for canonical rows
+      where `source == 'manual'` and lets active `companion_weight_overrides` REPLACE all other keys.
+    """
+    target_db = db_name or DB_NAME
+    sql_lines: list[str] = []
+    planned: list[tuple] = []
+    report_lines: list[str] = []
 
     for p in profiles:
         name = p["name"]
-        slug = p["slug"]
-        status = p.get("status", "unknown")
         info = existing.get(name.lower())
         if info:
-            guid = info["guid"]
+            guid = int(info["guid"])
             prefs = p.get("preferences", {})
             mapped = []
-            for hk, ck in KEY_MAP.items():
+            for hk, ck_tuple in KEY_MAP.items():
                 if hk in prefs and prefs[hk] is not None:
-                    val = float(prefs[hk])
-                    val = max(0.5, min(1.5, val))
-                    mapped.append((ck, val))
-                    sql_lines.append(
-                        f"INSERT INTO acore_characters.companion_weights (`guid`, `key`, `value`, `source`) "
-                        f"VALUES ({guid}, '{ck}', {val:.2f}, 'hearthcore') "
-                        f"ON DUPLICATE KEY UPDATE `value` = VALUES(`value`), `source` = VALUES(`source`);"
-                    )
+                    val = max(0.5, min(1.5, float(prefs[hk])))
+                    for ck in ck_tuple:
+                        mapped.append((ck, val))
+                        if overwrite_manual:
+                            upd = "`value` = VALUES(`value`), `source` = VALUES(`source`)"
+                        else:
+                            upd = (
+                                "`value` = IF(`source` = 'hearthcore', VALUES(`value`), `value`), "
+                                "`source` = IF(`source` = 'hearthcore', VALUES(`source`), `source`)"
+                            )
+                        sql_lines.append(
+                            f"INSERT INTO `{target_db}`.companion_weights (`guid`, `key`, `value`, `source`) "
+                            f"VALUES ({guid}, '{ck}', {val:.2f}, 'hearthcore') "
+                            f"ON DUPLICATE KEY UPDATE {upd};"
+                        )
             pref_str = ", ".join(f"{k}={v:.2f}" for k, v in mapped if abs(v - 1.0) > 1e-6) or "all 1.0"
-            print(f"  [LIVE]    {name:<12} guid={guid:<5} lv={info['level']:<2} {p.get('class')}/{p.get('primary_spec')} -> {pref_str}")
+            report_lines.append(
+                f"  [LIVE]    {name:<12} guid={guid:<5} lv={info['level']:<2} {p.get('class')}/{p.get('primary_spec')} -> {pref_str}"
+            )
         else:
             cls = p.get("class") or "?"
             race = p.get("race") or f"(default {ALLIANCE_DEFAULT_RACE.get(cls, 'TBD')})"
@@ -120,7 +138,31 @@ def main():
             spec = p.get("primary_spec") or "TBD"
             role = p.get("primary_role") or "?"
             planned.append((name, race, gender, cls, spec, role, p.get("motivations", [])))
-            print(f"  [PLANNED] {name:<12} race={race:<20} gender={gender:<6} {cls}/{spec} ({role})")
+            report_lines.append(f"  [PLANNED] {name:<12} race={race:<20} gender={gender:<6} {cls}/{spec} ({role})")
+
+    return sql_lines, planned, report_lines
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--apply", action="store_true", help="Write active companion weights to companion_weights")
+    ap.add_argument("--dry-run", action="store_true", help="Preview only (default)")
+    ap.add_argument(
+        "--overwrite-manual",
+        action="store_true",
+        help="Explicitly allow overwriting non-hearthcore rows (e.g. source='manual', which C++ treats as manualKeys) in companion_weights",
+    )
+    args = ap.parse_args()
+
+    profiles = load_profiles()
+    existing = load_guild_chars()
+
+    print(f"=== Hearthcore Profiles ({len(profiles)} total) ===")
+    sql_lines, planned, report_lines = build_sync_sql(
+        profiles, existing, overwrite_manual=args.overwrite_manual
+    )
+    for line in report_lines:
+        print(line)
 
     if args.apply and sql_lines:
         run_sql("\n".join(sql_lines) + "\n")

@@ -1,16 +1,15 @@
 [Unit]
-Description=Temporary LAN WoW 3.3.5a Laptop Setup & Client Streamer (port 8788)
+Description=On-Demand LAN WoW 3.3.5a Laptop Setup & Client Streamer (port 8788, 30m limit)
 After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/wonky/wow-lan-share
-ExecStart=/usr/bin/python3 /home/wonky/wow-lan-share/serve.py
+WorkingDirectory=%h/wow-lan-share
+ExecStart=/usr/bin/python3 %h/wow-lan-share/serve.py
+RuntimeMaxSec=1800
 Nice=15
 CPUAffinity=0 1
 MemoryMax=128M
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=default.target
+Restart=no
+StandardOutput=journal
+StandardError=journal

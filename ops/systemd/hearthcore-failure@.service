@@ -1,0 +1,12 @@
+[Unit]
+Description=Hearthcore systemd failure alert dispatcher for %i
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/hearthcore
+EnvironmentFile=-%h/hearthcore/.env
+ExecStart=/usr/bin/python3 -m hearthcore.alerts send --severity critical --source systemd_failure --detail "Unit failed: %i"
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=yes
+UMask=0077

@@ -17,3 +17,22 @@ Planned extensions: trusted game-state bridge, persistent event memory and relat
 ## Persistent memory proposal
 
 See [Persistent memory and experience (v2)](PERSISTENT_MEMORY.md) and the [implementation checklist](MEMORY_IMPLEMENTATION.md). These documents describe a future event-driven memory subsystem; they do not change the standalone CLI or claim live integration.
+
+## Canonical Weight Namespace & Native Merge Rule (Issue #60)
+
+Profile preference keys in `characters/<slug>/profile.json` map to native `CompanionBrain.cpp` keys via one canonical mapping (`PROFILE_PREF_TO_NATIVE_WEIGHTS` in `hearthcore/bridge.py` and `KEY_MAP` in `ops/hearthcore-sync.py`):
+
+| Profile Preference Key | Native `CompanionBrain` Weight Key(s) |
+|---|---|
+| `quest` | `quest_work`, `quest_turnin`, `quest_hub`, `quest_grind` |
+| `craft` | `craft` |
+| `gather` | `gather` |
+| `fish` | `fish` |
+| `train` | `train` |
+| `bank` | `bank` |
+| `repair` | `repair`, `sell` |
+| `travel` | `travel` |
+| `rest` | `hearth` |
+
+- **Native merge rule (`CompanionBrain.cpp:523,555`):** Active, non-expired rows in `companion_weight_overrides` **REPLACE** baseline `companion_weights` values for each key present, **except** rows with `source == 'manual'` (`manualKeys`), which retain strict precedence.
+- **Persona preservation:** Because native overrides replace baseline keys, `weights_for_cpp()` starts from the companion's mapped `char_profile["preferences"]` baseline rather than `1.0`, so unmentioned persona traits persist throughout every session plan. `ops/hearthcore-sync.py` never overwrites manually tuned canonical rows (`source != 'hearthcore'`, including `source == 'manual'`) unless `--overwrite-manual` is explicitly passed.

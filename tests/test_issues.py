@@ -431,7 +431,7 @@ class IssueRegressionTests(unittest.TestCase):
     # Issue #9: Azeroth Watch admin auth, CSRF/Origin, size cap, audit log
     # ------------------------------------------------------------------
     def test_issue9_azeroth_watch_admin_auth_csrf_and_audit(self):
-        aw_dir = "/home/wonky/azeroth-watch"
+        aw_dir = str((Path(__file__).resolve().parent.parent / "azeroth-watch").resolve())
         if aw_dir not in sys.path:
             sys.path.insert(0, aw_dir)
         import server as aw_server  # type: ignore

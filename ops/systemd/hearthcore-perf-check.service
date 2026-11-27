@@ -1,0 +1,14 @@
+[Unit]
+Description=Hearthguard Phase 1/2 Performance Drift & Health Check
+OnFailure=hearthcore-failure@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/hearthcore
+ExecStart=%h/hearthcore/ops/perf-check.sh
+TimeoutStartSec=60
+NoNewPrivileges=yes
+UMask=0077
+Nice=15
+StandardOutput=journal
+StandardError=journal

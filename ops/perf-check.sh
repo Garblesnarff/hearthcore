@@ -3,13 +3,14 @@
 # Exits 0 if all keys match, 1 if any drifted (e.g. after a config rollback or setup.sh run).
 set -uo pipefail
 
-AC="/home/wonky/AzerothCore/azerothcore-wotlk"
+AC="${AZEROTHCORE_DIR:-$HOME/AzerothCore/azerothcore-wotlk}"
 ETC="$AC/env/dist/etc"
 MOD="$ETC/modules"
-WTF="/mnt/hdd/WoW335a/extracted/ChromieCraft_3.3.5a/WTF/Config.wtf"
-WOWSH="/home/wonky/bin/wow.sh"
-D3D9="/home/wonky/wine-wotlk/drive_c/windows/system32/d3d9.dll"
-ENVF="/home/wonky/AzerothCore/.env"
+WOW_CLIENT_DIR="${WOW_CLIENT_DIR:-/mnt/hdd/WoW335a/extracted/ChromieCraft_3.3.5a}"
+WTF="${WOW_CONFIG_WTF:-$WOW_CLIENT_DIR/WTF/Config.wtf}"
+WOWSH="${WOW_LAUNCHER_SH:-$HOME/bin/wow.sh}"
+D3D9="${WOW_DXVK_DLL:-$HOME/wine-wotlk/drive_c/windows/system32/d3d9.dll}"
+ENVF="${AZEROTHCORE_ENV:-$HOME/AzerothCore/.env}"
 
 DRIFT=0
 check_kv() {

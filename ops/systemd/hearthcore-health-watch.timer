@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Hearthcore Health & Staleness Watchdog every 10 minutes (Issue #59)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+RandomizedDelaySec=20s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

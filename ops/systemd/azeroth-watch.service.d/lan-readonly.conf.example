@@ -1,0 +1,10 @@
+# Optional systemd user drop-in for trusted family LAN dashboard viewing (Issue #71).
+# Install to: ~/.config/systemd/user/azeroth-watch.service.d/lan-readonly.conf
+#
+# By default, azeroth-watch.service binds 127.0.0.1 only.
+# Uncomment AZEROTH_WATCH_REQUIRE_AUTH_FOR_READS=1 to require the admin token/session cookie
+# on /api/state and /api/stream as well (while keeping minimal /api/kiosk available).
+[Service]
+# Environment=AZEROTH_WATCH_REQUIRE_AUTH_FOR_READS=1
+ExecStart=
+ExecStart=/usr/bin/taskset -c 0-1 /usr/bin/nice -n 15 /usr/bin/python3 %h/azeroth-watch/server.py --host 0.0.0.0 --port 8787 --interval 4.0

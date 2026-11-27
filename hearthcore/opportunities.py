@@ -13,12 +13,15 @@ Design guarantees (docs/PHASE_II_LIVING_GUILD.md Sections 5 & 10):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("hearthcore.opportunities")
 
 from .core import ROOT, profile, profiles
 from .dungeons import (
@@ -52,7 +55,7 @@ def check_resource_headroom(
     max_managed_groups: int = DEFAULT_MAX_GROUPS,
     prev_paused: bool = False,
 ) -> dict[str, Any]:
-    """Check Acer i5-7400 hardware headroom with hysteresis before admitting a new managed group."""
+    """Check Acer i5-7400 hardware headroom with FAIL-CLOSED telemetry & hysteresis (Issue #61)."""
     reasons: list[str] = []
     if active_managed_groups >= max_managed_groups:
         reasons.append(f"group_cap_reached:{active_managed_groups}/{max_managed_groups}")
@@ -61,19 +64,109 @@ def check_resource_headroom(
     ram_thresh = 640.0 if prev_paused else MIN_AVAIL_RAM_MIB
     tick_thresh = 38.0 if prev_paused else MAX_TICK_P99_MS
 
-    if mem_avail_mib is not None and mem_avail_mib < ram_thresh:
+    # Fail closed on missing telemetry (Issue #61): missing data means DO NOT ADMIT!
+    if mem_avail_mib is None:
+        reasons.append("missing_ram_telemetry")
+    elif mem_avail_mib < ram_thresh:
         reasons.append(f"low_ram_headroom:{mem_avail_mib:.0f}MiB<{ram_thresh:.0f}MiB")
-    if tick_p99_ms is not None and tick_p99_ms > tick_thresh:
+
+    if tick_p99_ms is None:
+        reasons.append("missing_tick_telemetry")
+    elif tick_p99_ms > tick_thresh:
         reasons.append(f"high_tick_p99:{tick_p99_ms:.1f}ms>{tick_thresh:.1f}ms")
 
+    admit_ok = len(reasons) == 0
     return {
-        "admit_ok": len(reasons) == 0,
+        "admit_ok": admit_ok,
+        "paused": not admit_ok,
+        "prev_paused": bool(prev_paused),
         "reasons": reasons,
         "active_managed_groups": active_managed_groups,
         "max_managed_groups": max_managed_groups,
         "mem_avail_mib": round(mem_avail_mib, 1) if mem_avail_mib is not None else None,
         "tick_p99_ms": round(tick_p99_ms, 1) if tick_p99_ms is not None else None,
     }
+
+
+def evaluate_persisted_headroom(
+    state_path: Path,
+    *,
+    mem_avail_mib: float | None,
+    tick_p99_ms: float | None,
+    active_managed_groups: int,
+    max_managed_groups: int = DEFAULT_MAX_GROUPS,
+    now_ts: int | None = None,
+) -> dict[str, Any]:
+    """Evaluate headroom using persisted hysteresis state on disk so pause/recover survives runs (Issue #61)."""
+    ts = int(now_ts if now_ts is not None else time.time())
+    prev_paused = False
+    try:
+        if state_path.is_file():
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            prev_paused = bool(saved.get("paused", False))
+    except Exception as exc:
+        logger.warning("Corrupt headroom state at %s (%s); failing closed", state_path, exc)
+        prev_paused = True  # fail closed on corrupt state
+
+    res = check_resource_headroom(
+        mem_avail_mib=mem_avail_mib,
+        tick_p99_ms=tick_p99_ms,
+        active_managed_groups=active_managed_groups,
+        max_managed_groups=max_managed_groups,
+        prev_paused=prev_paused,
+    )
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = state_path.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps({"paused": bool(res["paused"]), "updated_at": ts, "reasons": res["reasons"]}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        tmp.replace(state_path)
+    except OSError as exc:
+        logger.warning("Failed persisting headroom state to %s: %s", state_path, exc)
+    return res
+
+
+def admit_cooperative_opportunity(
+    coordinator: "OpportunityCoordinator",
+    opportunity_id: int,
+    *,
+    expected_revision: int,
+    state_path: Path,
+    mem_avail_mib: float | None,
+    tick_p99_ms: float | None,
+    active_managed_groups: int,
+    max_managed_groups: int = DEFAULT_MAX_GROUPS,
+    now_ts: int | None = None,
+) -> dict[str, Any]:
+    """Live cooperative admission path enforcing fail-closed persisted headroom & hysteresis (Issue #61)."""
+    hr = evaluate_persisted_headroom(
+        state_path,
+        mem_avail_mib=mem_avail_mib,
+        tick_p99_ms=tick_p99_ms,
+        active_managed_groups=active_managed_groups,
+        max_managed_groups=max_managed_groups,
+        now_ts=now_ts,
+    )
+    if not hr["admit_ok"]:
+        logger.warning(
+            "Cooperative opportunity #%s blocked by resource headroom: %s",
+            opportunity_id,
+            ",".join(hr["reasons"]),
+        )
+        return {
+            "ok": False,
+            "reason": "resource_headroom_blocked",
+            "headroom": hr,
+        }
+    res = coordinator.reserve_party(
+        opportunity_id,
+        expected_revision=expected_revision,
+        now_ts=now_ts,
+    )
+    res["headroom"] = hr
+    return res
 
 
 def adapt_work_orders_as_opportunities(work_orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -337,11 +430,18 @@ class OpportunityCoordinator:
                 return {"ok": False, "reason": "expired"}
 
             roles_needed: dict[str, int] = json.loads(str(opp["roles_json"]))
-            # Personas already reserved/accepted/active in ANY opportunity cannot be double-booked!
+            opp_is_shadow = int(opp["is_shadow"])
+            # Issue #15: Strict shadow/live isolation — shadow reservations NEVER block live slots and vice versa!
             busy_rows = conn.execute(
-                "SELECT DISTINCT persona_id FROM opportunity_interests "
-                "WHERE state IN ('reserved', 'accepted', 'active') AND (reserved_until = 0 OR reserved_until > ?)",
-                (ts,),
+                """
+                SELECT DISTINCT oi.persona_id
+                FROM opportunity_interests oi
+                JOIN opportunities o ON o.id = oi.opportunity_id
+                WHERE o.is_shadow = ?
+                  AND oi.state IN ('reserved', 'accepted', 'active')
+                  AND (oi.reserved_until = 0 OR oi.reserved_until > ?)
+                """,
+                (opp_is_shadow, ts),
             ).fetchall()
             busy_personas = {str(r["persona_id"]) for r in busy_rows}
 
@@ -432,6 +532,66 @@ class OpportunityCoordinator:
             conn.close()
 
 
+def _read_existing_enrollments_readonly(db_path: Path) -> dict[int, tuple[str, bool]]:
+    """Strictly read-only lookup of existing persona enrollments; NEVER creates or mutates db_path (Issue #15)."""
+    if not db_path.is_file():
+        return {}
+    out: dict[int, tuple[str, bool]] = {}
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3.0)
+        conn.row_factory = sqlite3.Row
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "companion_personas" not in tables or "companion_persona_characters" not in tables:
+            return {}
+        rows = conn.execute(
+            """
+            SELECT c.character_guid, p.persona_id, p.enrolled_coop
+            FROM companion_persona_characters c
+            JOIN companion_personas p ON p.persona_id = c.persona_id
+            """
+        ).fetchall()
+        for r in rows:
+            out[int(r["character_guid"])] = (str(r["persona_id"]), bool(int(r["enrolled_coop"])))
+    except sqlite3.Error as exc:
+        logger.warning("Read-only persona enrollment lookup failed for %s: %s", db_path, exc)
+        return {}
+    finally:
+        if conn is not None:
+            conn.close()
+    return out
+
+
+def read_shadow_artifact(path: Path, *, now_ts: int | None = None, max_age_sec: int = 3600) -> dict[str, Any]:
+    """Safely load and validate phase2_shadow.json, flagging missing, corrupted, or stale artifacts (Issue #15)."""
+    ts = int(now_ts if now_ts is not None else time.time())
+    if not path.is_file():
+        return {"ok": False, "status": "missing", "stale": True, "data": None}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or not raw.get("is_shadow"):
+            return {"ok": False, "status": "corrupted", "stale": True, "data": None}
+        upd = str(raw.get("updated_at") or "")
+        age_sec: int | None = None
+        stale = False
+        if upd:
+            dt = datetime.strptime(upd, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            age_sec = max(0, ts - int(dt.timestamp()))
+            stale = age_sec > int(max_age_sec)
+        else:
+            stale = True
+        return {
+            "ok": not stale,
+            "status": "stale" if stale else "fresh",
+            "stale": stale,
+            "age_sec": age_sec,
+            "data": raw,
+        }
+    except Exception as exc:
+        logger.warning("Failed reading shadow artifact %s: %s: %s", path, type(exc).__name__, exc)
+        return {"ok": False, "status": "corrupted", "stale": True, "data": None}
+
+
 def run_shadow_match_snapshot(
     world_ctx: dict[str, Any],
     *,
@@ -443,25 +603,35 @@ def run_shadow_match_snapshot(
 ) -> dict[str, Any]:
     """Pure shadow matchmaking pass over current live roster -> runtime/phase2_shadow.json ONLY.
 
-    Guarantees (Issue #7 + Card II-02/II-04):
-    - Never writes to MySQL, live reservations, live opportunities, or active_plans.json.
+    Guarantees (Issues #7 & #15 + Card II-02/II-04):
+    - STRICTLY READ-ONLY on db_path: NEVER mutates PersonaRegistry, opportunities, MySQL,
+      reservations, schedules, memory, or active_plans.json.
     - Protects core-wonky and core-logan by default (`enrolled_coop = False`).
-    - Clearly labels every output as `is_shadow = True`.
+    - Clearly labels every output as `is_shadow = True` and `synthetic_feasibility = True`.
     """
     ts = int(now_ts if now_ts is not None else time.time())
-    reg = PersonaRegistry(db_path)
+    existing_enrollments = _read_existing_enrollments_readonly(Path(db_path))
     companions = world_ctx.get("companions") or {}
-    reg.sync_from_companions(companions, now_ts=ts)
 
     known = set(profiles())
     v = vitals or {}
     mem_avail_mib = float(v["mem_avail_gib"]) * 1024.0 if v.get("mem_avail_gib") is not None else None
     tick_p99 = float(v["tick_p99"]) if v.get("tick_p99") is not None else None
+    # Issue #15: Shadow pass reads persisted headroom state READ-ONLY and NEVER writes headroom_state.json!
+    prev_paused = False
+    hr_path = runtime_dir / "headroom_state.json"
+    try:
+        if hr_path.is_file():
+            prev_paused = bool(json.loads(hr_path.read_text(encoding="utf-8")).get("paused", False))
+    except Exception as exc:
+        logger.warning("Corrupt headroom state at %s during shadow read (%s); assuming paused", hr_path, exc)
+        prev_paused = True
     headroom = check_resource_headroom(
         mem_avail_mib=mem_avail_mib,
         tick_p99_ms=tick_p99,
         active_managed_groups=0,
         max_managed_groups=DEFAULT_MAX_GROUPS,
+        prev_paused=prev_paused,
     )
 
     shadow_dungeons: list[dict[str, Any]] = []
@@ -470,11 +640,19 @@ def run_shadow_match_snapshot(
             continue
         pool_by_role: dict[str, list[dict[str, Any]]] = {"tank": [], "healer": [], "damage": []}
         excluded_core = 0
+        missing_identity = 0
         for slug, comp in sorted(companions.items()):
             if slug not in known or not comp.get("online"):
                 continue
-            prec = reg.persona_for_guid(int(comp["guid"]))
-            if prec and not prec.enrolled_coop:
+            guid = int(comp["guid"])
+            shift_group = str(comp.get("shift_group") or "")
+            if guid in existing_enrollments:
+                persona_id, enrolled_coop = existing_enrollments[guid]
+            else:
+                missing_identity += 1
+                persona_id = str(comp.get("persona_id") or persona_id_for_slug(slug))
+                enrolled_coop = shift_group.strip().lower() not in PROTECTED_OWNER_GROUPS
+            if not enrolled_coop:
                 excluded_core += 1
                 continue
             prof = profile(slug)
@@ -492,14 +670,14 @@ def run_shadow_match_snapshot(
                 continue
             primary_r = roles[0]
             pool_by_role[primary_r].append({
-                "persona_id": prec.persona_id if prec else persona_id_for_slug(slug),
+                "persona_id": persona_id,
                 "slug": slug,
                 "name": comp["name"],
                 "level": int(comp["level"]),
                 "role": primary_r,
             })
 
-        # Check whether a full 1T / 1H / 3D voluntary party is feasible right now
+        # Check whether a full 1T / 1H / 3D voluntary party is synthetically feasible right now
         roles_req = dict(spec.roles)
         shortfalls = {
             r: max(0, int(roles_req.get(r, 0)) - len(pool_by_role[r]))
@@ -512,16 +690,20 @@ def run_shadow_match_snapshot(
             "map_id": spec.map_id,
             "level_band": f"{spec.min_level}-{spec.max_level}",
             "pilot_enabled_live": spec.dungeon_id in enabled_dungeon_ids(),
+            "synthetic_feasibility": True,
             "eligible_counts": {r: len(pool_by_role[r]) for r in ("tank", "healer", "damage")},
             "shortfalls": shortfalls,
             "feasible_now": feasible,
             "excluded_protected_core": excluded_core,
+            "missing_identity_fallback_count": missing_identity,
             "candidates": pool_by_role,
         })
 
     out = {
         "updated_at": datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "is_shadow": True,
+        "synthetic_feasibility": True,
+        "mutated_live_state": False,
         "coop_enabled_live": coop_enabled(),
         "enabled_dungeons_live": sorted(enabled_dungeon_ids()),
         "headroom": headroom,
