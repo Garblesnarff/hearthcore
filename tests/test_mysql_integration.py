@@ -262,7 +262,7 @@ class MySQLIntegrationTests(unittest.TestCase):
         INSERT INTO `{db_name}`.character_skills VALUES (101, 164, 105, 150), (101, 186, 121, 150);
         INSERT INTO `{db_name}`.character_queststatus_rewarded VALUES (101, 1001), (101, 1002);
         INSERT INTO `{db_name}`.guild_bank_item VALUES (6, 9001);
-        INSERT INTO `{db_name}`.item_instance VALUES (9001, 2770, 40);
+        INSERT INTO `{db_name}`.item_instance (guid, itemEntry, count) VALUES (9001, 2770, 40);
         INSERT INTO `{db_name}`.companion_events (guid, event_type, summary, partner_guid, zone_id, created_at)
             VALUES (101, 'level_up', 'Brannoc reached 33', 0, 10, 1800000000);
         """
