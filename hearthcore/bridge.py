@@ -50,6 +50,12 @@ def install_sigterm_handler() -> None:
 
 from .budget import BudgetExceeded, BudgetLedger, InvalidWithUsage, ProviderBackoffError
 from .core import Invalid, ROOT, fallback, profile, profiles, snapshot, validate
+from .dungeons import (
+    ALL_ROLE_SPELL_IDS,
+    CLASS_ID_TO_NAME,
+    INVTYPE_SHIELD,
+    faction_from_race,
+)
 from .guides import LEVELING_ORDER_CATALOG, ORDER_BY_ENTRY, SKILL_NAMES, best_farm_hint
 from .memory import (
     MemoryEngine,
@@ -352,14 +358,25 @@ def fetch_remote_max_revision(*, sql_exec=None) -> int:
     return 0
 
 
-def read_live_context() -> dict[str, Any]:
-    """Read fresh weekly_event and live zone overrides from live_positions.json if present."""
-    ctx: dict[str, Any] = {"weekly_event": "", "live_by_guid": {}}
+def read_live_context(*, now_ts: float | None = None, max_age_sec: float = 30.0) -> dict[str, Any]:
+    """Read fresh weekly_event, live positions, and optional native combat/group/LFG telemetry if present."""
+    now = float(now_ts if now_ts is not None else time.time())
+    ctx: dict[str, Any] = {
+        "weekly_event": "",
+        "live_by_guid": {},
+        "live_pos_ts": None,
+        "live_pos_age_sec": None,
+        "live_pos_fresh": False,
+    }
     try:
         st = LIVE_POS_FILE.stat()
-        if time.time() - st.st_mtime < 30.0:
+        age_sec = max(0.0, now - float(st.st_mtime))
+        ctx["live_pos_age_sec"] = round(age_sec, 2)
+        if age_sec < float(max_age_sec):
             raw = json.loads(LIVE_POS_FILE.read_text(encoding="utf-8"))
             ctx["weekly_event"] = str(raw.get("weekly_event") or "")
+            ctx["live_pos_ts"] = int(raw["t"]) if raw.get("t") is not None else int(st.st_mtime)
+            ctx["live_pos_fresh"] = True
             for u in raw.get("units", []):
                 ctx["live_by_guid"][int(u["g"])] = u
     except FileNotFoundError:
@@ -453,20 +470,71 @@ def sync_event_journal(
     return last_info
 
 
+def _strict_int(val: Any) -> int | None:
+    """Parse an integer strictly; returns None for None, '', 'NULL', or non-integer values."""
+    if val is None or isinstance(val, bool):
+        return None
+    s = str(val).strip()
+    if not s or s.upper() == "NULL":
+        return None
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _opt_bool(val: Any) -> bool | None:
+    """Parse an optional boolean strictly; returns None if absent/null."""
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    s = str(val).strip().lower()
+    if s in ("1", "true", "yes"):
+        return True
+    if s in ("0", "false", "no"):
+        return False
+    return None
+
+
 def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = None) -> dict[str, Any]:
     """Query live MySQL for companions, skills, quests, ledger ops, work orders, proposals, and events."""
     live = read_live_context()
     ts = int(now_ts if now_ts is not None else time.time())
+    telemetry_errors: list[str] = []
+    world_db = (os.getenv("HEARTHCORE_WORLD_DB_NAME") or "acore_world").strip() or "acore_world"
+    if not re.match(r"^[A-Za-z0-9_]+$", world_db):
+        world_db = "acore_world"
 
-    comp_rows = run_sql("""
-        SELECT c.guid, c.name, c.level, c.zone, c.map, c.money, c.online,
-               COALESCE(cs.shift_group, ''), c.xp
-        FROM companion_schedule cs
-        JOIN characters c ON c.name = cs.name
-        ORDER BY c.online DESC, c.name;
-    """)
+    # Attempt to include activeTalentGroup for dual-spec talent/spell filtering; degrade cleanly if absent
+    has_active_talent_group = False
+    try:
+        comp_rows = run_sql("""
+            SELECT c.guid, c.name, c.level, c.zone, c.map, c.money, c.online,
+                   COALESCE(cs.shift_group, ''), c.xp, c.race, c.class,
+                   cs.start_hour, cs.end_hour, cs.days_mask, cs.always_online,
+                   c.activeTalentGroup
+            FROM companion_schedule cs
+            JOIN characters c ON c.name = cs.name
+            ORDER BY c.online DESC, c.name;
+        """)
+        has_active_talent_group = True
+    except Exception as exc:
+        logger.debug("characters.activeTalentGroup unavailable (%s); querying base columns", exc)
+        comp_rows = run_sql("""
+            SELECT c.guid, c.name, c.level, c.zone, c.map, c.money, c.online,
+                   COALESCE(cs.shift_group, ''), c.xp, c.race, c.class,
+                   cs.start_hour, cs.end_hour, cs.days_mask, cs.always_online
+            FROM companion_schedule cs
+            JOIN characters c ON c.name = cs.name
+            ORDER BY c.online DESC, c.name;
+        """)
+
     companions: dict[str, dict[str, Any]] = {}
     guid_to_slug: dict[int, str] = {}
+    active_talent_group_by_guid: dict[int, int] = {}
     for r in comp_rows:
         if len(r) < 9:
             continue
@@ -474,12 +542,64 @@ def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = No
         name = r[1]
         slug = name.lower()
         lp = live["live_by_guid"].get(guid)
-        zid = int(lp["z"]) if lp else int(r[3])
-        mid = int(lp["m"]) if lp else int(r[4])
+        zid = _strict_int(lp.get("z")) if isinstance(lp, dict) and lp.get("z") is not None else int(r[3])
+        mid = _strict_int(lp.get("m")) if isinstance(lp, dict) and lp.get("m") is not None else int(r[4])
+        if zid is None:
+            zid = int(r[3])
+        if mid is None:
+            mid = int(r[4])
+        race_id = _strict_int(r[9]) if len(r) >= 11 else None
+        class_id = _strict_int(r[10]) if len(r) >= 11 else None
+        class_name = CLASS_ID_TO_NAME.get(class_id, "") if class_id else ""
+        faction = faction_from_race(race_id)
+
+        # Strict schedule parsing (P1-8: never invent 0..24 / 127 on NULL or malformed values!)
+        schedule_info: dict[str, Any] | None = None
+        if len(r) >= 15:
+            sh = _strict_int(r[11])
+            eh = _strict_int(r[12])
+            dm = _strict_int(r[13])
+            ao = _strict_int(r[14])
+            if sh is not None and eh is not None and dm is not None and ao is not None:
+                schedule_info = {
+                    "shift_group": str(r[7] or ""),
+                    "start_hour": sh,
+                    "end_hour": eh,
+                    "days_mask": dm,
+                    "always_online": ao == 1,
+                }
+            else:
+                telemetry_errors.append(f"invalid_schedule_row:{slug}")
+        if has_active_talent_group and len(r) >= 16:
+            atg = _strict_int(r[15])
+            if atg is not None:
+                active_talent_group_by_guid[guid] = atg
+
+        live_telem: dict[str, Any] = {
+            "class_id": class_id,
+            "class_name": class_name or None,
+            "spec_tab": None,
+            "talent_spells": None,
+            "known_spells": None,
+            "equipped": None,
+            "native_role_mask": None,
+            "native_lfg_eligible": None,
+            "native_lfg_lock_reason": "",
+            "in_combat": None,
+            "in_lfg_queue": None,
+            "in_lfg_queue_dungeons": [],
+            "is_dead": None,
+            "live_pos_fresh": bool(live.get("live_pos_fresh")),
+            "live_pos_age_sec": live.get("live_pos_age_sec"),
+        }
         companions[slug] = {
             "guid": guid,
             "name": name,
             "slug": slug,
+            "race_id": race_id,
+            "class_id": class_id,
+            "class_name": class_name or None,
+            "faction": faction,
             "level": int(r[2]),
             "xp": int(r[8]),
             "zone_id": zid,
@@ -488,6 +608,13 @@ def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = No
             "gold": round(int(r[5]) / 10000.0, 2),
             "online": (int(r[6]) == 1) or (guid in live["live_by_guid"]),
             "shift_group": r[7],
+            "schedule": schedule_info,
+            "locked_maps": None,
+            "locked_instances": None,
+            "group_id": None,
+            "in_group": None,
+            "live_telemetry": live_telem,
+            "telemetry_observed_at": ts,
             "skills": {},
             "orders_delivered": 0,
             "quests_rewarded": 0,
@@ -495,13 +622,67 @@ def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = No
             "recent_events": [],
             "social_bonds": [],
         }
+        # P1-7: Guard EVERY optional live_positions.json field cleanly (malformed entry -> None + error, never crash!)
         if isinstance(lp, dict):
-            if lp.get("xp_cap_level") is not None:
-                companions[slug]["xp_cap_level"] = int(lp["xp_cap_level"])
-            if lp.get("xp_eligible") is not None:
-                companions[slug]["xp_eligible"] = bool(lp["xp_eligible"])
-            if lp.get("owner_name"):
-                companions[slug]["owner_name"] = str(lp["owner_name"])
+            try:
+                xc = _strict_int(lp.get("xp_cap_level"))
+                if xc is not None:
+                    companions[slug]["xp_cap_level"] = xc
+                xe = _opt_bool(lp.get("xp_eligible"))
+                if xe is not None:
+                    companions[slug]["xp_eligible"] = xe
+                if lp.get("owner_name"):
+                    companions[slug]["owner_name"] = str(lp["owner_name"])
+
+                if "d" in lp or "dead" in lp or "hp" in lp:
+                    d_val = _opt_bool(lp.get("d") if "d" in lp else lp.get("dead"))
+                    hp_val = _strict_int(lp.get("hp")) if "hp" in lp else None
+                    if d_val is not None:
+                        live_telem["is_dead"] = d_val
+                    elif hp_val is not None:
+                        live_telem["is_dead"] = (hp_val == 0)
+
+                if "combat" in lp or "in_combat" in lp:
+                    live_telem["in_combat"] = _opt_bool(lp.get("combat") if "combat" in lp else lp.get("in_combat"))
+
+                if "grp" in lp or "group_id" in lp:
+                    raw_g = lp.get("grp") if "grp" in lp else lp.get("group_id")
+                    lgid = _strict_int(raw_g)
+                    if lgid is not None:
+                        companions[slug]["group_id"] = lgid
+                        companions[slug]["in_group"] = lgid > 0
+
+                if "lfg" in lp or "in_lfg_queue" in lp:
+                    live_telem["in_lfg_queue"] = _opt_bool(lp.get("in_lfg_queue") if "in_lfg_queue" in lp else lp.get("lfg"))
+
+                if isinstance(lp.get("lfg_dungeons"), list):
+                    parsed_d = []
+                    for item in lp["lfg_dungeons"]:
+                        iv = _strict_int(item)
+                        if iv is not None:
+                            parsed_d.append(iv)
+                    live_telem["in_lfg_queue_dungeons"] = parsed_d
+
+                if "roles" in lp or "native_role_mask" in lp:
+                    rm = _strict_int(lp.get("native_role_mask") if "native_role_mask" in lp else lp.get("roles"))
+                    if rm is not None:
+                        live_telem["native_role_mask"] = rm
+
+                st_val = _strict_int(lp.get("spec_tab"))
+                if st_val is not None:
+                    live_telem["spec_tab"] = st_val
+
+                if "lfg_eligible" in lp or "native_lfg_eligible" in lp:
+                    raw_el = lp.get("native_lfg_eligible") if "native_lfg_eligible" in lp else lp.get("lfg_eligible")
+                    live_telem["native_lfg_eligible"] = _opt_bool(raw_el)
+
+                if lp.get("lfg_lock_reason") or lp.get("native_lfg_lock_reason"):
+                    live_telem["native_lfg_lock_reason"] = str(
+                        lp.get("native_lfg_lock_reason") or lp.get("lfg_lock_reason") or ""
+                    )
+            except Exception as exc:
+                telemetry_errors.append(f"malformed_live_pos:{slug}:{type(exc).__name__}")
+                logger.warning("Malformed live_positions entry for %s: %s", slug, exc)
         guid_to_slug[guid] = slug
 
     all_guids = [str(c["guid"]) for c in companions.values()]
@@ -543,6 +724,144 @@ def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = No
                 sl = guid_to_slug.get(int(r[0]))
                 if sl:
                     companions[sl]["ledger_ops"] = int(r[1])
+
+        # Issue #14: Live permanent instance lockouts keyed by (map, difficulty) (fail-closed -> None)
+        try:
+            lock_rows = run_sql(
+                f"SELECT ci.guid, i.map, i.difficulty, i.resettime "
+                f"FROM character_instance ci JOIN instance i ON i.id = ci.instance "
+                f"WHERE ci.guid IN ({glist}) AND ci.permanent = 1 AND (i.resettime = 0 OR i.resettime > {int(ts)});"
+            )
+            for c in companions.values():
+                c["locked_maps"] = []
+                c["locked_instances"] = []
+            for r in lock_rows:
+                if len(r) >= 3:
+                    sl = guid_to_slug.get(_int_or(r[0], 0))
+                    if sl:
+                        m_id = _int_or(r[1], 0)
+                        diff = _int_or(r[2], 0)
+                        if m_id > 0:
+                            pair = (m_id, diff)
+                            if pair not in companions[sl]["locked_instances"]:
+                                companions[sl]["locked_instances"].append(pair)
+                            if diff == 0 and m_id not in companions[sl]["locked_maps"]:
+                                companions[sl]["locked_maps"].append(m_id)
+        except Exception as exc:
+            telemetry_errors.append(f"lockouts:{type(exc).__name__}")
+            logger.warning("Failed reading character_instance lockouts (fail-closed -> None): %s", exc)
+
+        # Issue #14: Live group membership (never copy group_member.roles into native_role_mask!)
+        try:
+            grp_rows = run_sql(
+                f"SELECT memberGuid, guid FROM group_member WHERE memberGuid IN ({glist});"
+            )
+            for c in companions.values():
+                if c["group_id"] is None:
+                    c["group_id"] = 0
+                if c["in_group"] is None:
+                    c["in_group"] = False
+            for r in grp_rows:
+                if len(r) >= 2:
+                    sl = guid_to_slug.get(_int_or(r[0], 0))
+                    if sl:
+                        gid = _int_or(r[1], 0)
+                        companions[sl]["group_id"] = gid
+                        companions[sl]["in_group"] = gid > 0
+        except Exception as exc:
+            telemetry_errors.append(f"group_member:{type(exc).__name__}")
+            logger.warning("Failed reading group_member (fail-closed -> None): %s", exc)
+
+        # Issue #14: Live active-spec talent spells (filtered by activeTalentGroup specMask!)
+        try:
+            tal_rows = run_sql(
+                f"SELECT guid, spell, specMask FROM character_talent WHERE guid IN ({glist});"
+            )
+            for c in companions.values():
+                c["live_telemetry"]["talent_spells"] = []
+            for r in tal_rows:
+                if len(r) >= 3:
+                    g_id = _int_or(r[0], 0)
+                    sl = guid_to_slug.get(g_id)
+                    if not sl:
+                        continue
+                    sp_mask = _int_or(r[2], 1)
+                    active_bit = 1 << active_talent_group_by_guid.get(g_id, 0)
+                    if sp_mask == 0 or (sp_mask & active_bit):
+                        companions[sl]["live_telemetry"]["talent_spells"].append(_int_or(r[1], 0))
+        except Exception as exc:
+            telemetry_errors.append(f"character_talent:{type(exc).__name__}")
+            logger.warning("Failed reading character_talent (fail-closed -> None): %s", exc)
+
+        # Issue #14: Live active-spec role-defining spells (compact IN filter; fail-closed -> None)
+        try:
+            role_spells_csv = ",".join(str(s) for s in sorted(ALL_ROLE_SPELL_IDS))
+            sp_rows = run_sql(
+                f"SELECT guid, spell, specMask FROM character_spell "
+                f"WHERE guid IN ({glist}) AND spell IN ({role_spells_csv});"
+            )
+            for c in companions.values():
+                c["live_telemetry"]["known_spells"] = []
+            for r in sp_rows:
+                if len(r) >= 3:
+                    g_id = _int_or(r[0], 0)
+                    sl = guid_to_slug.get(g_id)
+                    if not sl:
+                        continue
+                    sp_mask = _int_or(r[2], 1)
+                    active_bit = 1 << active_talent_group_by_guid.get(g_id, 0)
+                    if sp_mask == 0 or (sp_mask & active_bit):
+                        companions[sl]["live_telemetry"]["known_spells"].append(_int_or(r[1], 0))
+        except Exception as exc:
+            telemetry_errors.append(f"character_spell:{type(exc).__name__}")
+            logger.warning("Failed reading character_spell (fail-closed -> None): %s", exc)
+
+        # Issue #14: Live equipped gear (slot 15 = main hand ONLY, slot 16 shield, durability; fail-closed -> None)
+        try:
+            eq_rows = run_sql(
+                f"SELECT ci.guid, ci.slot, ii.durability, COALESCE(it.MaxDurability, 0), COALESCE(it.InventoryType, 0) "
+                f"FROM character_inventory ci "
+                f"JOIN item_instance ii ON ii.guid = ci.item "
+                f"LEFT JOIN `{world_db}`.item_template it ON it.entry = ii.itemEntry "
+                f"WHERE ci.guid IN ({glist}) AND ci.bag = 0 AND ci.slot BETWEEN 0 AND 18;"
+            )
+            eq_acc: dict[str, dict[str, Any]] = {
+                sl: {
+                    "equipped_slots": 0,
+                    "has_main_hand": False,
+                    "has_shield": False,
+                    "broken_slots": 0,
+                    "min_durability_pct": None,
+                }
+                for sl in companions
+            }
+            for r in eq_rows:
+                if len(r) < 5:
+                    continue
+                sl = guid_to_slug.get(_int_or(r[0], 0))
+                if not sl:
+                    continue
+                slot = _int_or(r[1], -1)
+                dur = _int_or(r[2], 0)
+                max_dur = _int_or(r[3], 0)
+                inv_type = _int_or(r[4], 0)
+                acc = eq_acc[sl]
+                acc["equipped_slots"] += 1
+                if slot == 15:
+                    acc["has_main_hand"] = True
+                if slot == 16 and inv_type == INVTYPE_SHIELD:
+                    acc["has_shield"] = True
+                if max_dur > 0:
+                    pct = round(min(100.0, max(0.0, (dur / float(max_dur)) * 100.0)), 1)
+                    if dur <= 0:
+                        acc["broken_slots"] += 1
+                    cur_min = acc["min_durability_pct"]
+                    acc["min_durability_pct"] = pct if cur_min is None else min(cur_min, pct)
+            for sl, acc in eq_acc.items():
+                companions[sl]["live_telemetry"]["equipped"] = acc
+        except Exception as exc:
+            telemetry_errors.append(f"equipment:{type(exc).__name__}")
+            logger.warning("Failed reading equipped gear telemetry (fail-closed -> None): %s", exc)
 
     # Sync durable event journal with fair cursor-based pagination (Issues #4 & #57)
     if mem is not None and guid_to_slug:
@@ -655,8 +974,12 @@ def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = No
     # Live Quartermaster directives with freshness check (Issues #7 & #61)
     qm_focus, qm_mats_by_skill, qm_meta = load_fresh_quartermaster_directives(QUARTERMASTER_PATH, now_ts=ts)
 
-    return {
+    world_ctx = {
         "observed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "telemetry_observed_at": ts,
+        "telemetry_errors": telemetry_errors,
+        "live_pos_fresh": bool(live.get("live_pos_fresh")),
+        "live_pos_age_sec": live.get("live_pos_age_sec"),
         "weekly_event": live["weekly_event"],
         "companions": companions,
         "work_orders": work_orders,
@@ -669,6 +992,17 @@ def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = No
         "qm_directives_meta": qm_meta,
         "proposals_by_plan_id": proposals_by_plan_id,
     }
+    # Export per-companion level lead/cap status cleanly (Issue #14 & #23)
+    for comp in companions.values():
+        cap_st = _xp_cap_prof_catchup_state(comp, world_ctx)
+        comp["level_lead_state"] = {
+            "companion_level_lead": companion_level_lead,
+            "owner_cap_level": int(cap_st["cap_level"]),
+            "at_level_cap": bool(cap_st["at_cap"]),
+            "near_level_cap": bool(cap_st["near_cap"]),
+            "xp_eligible": comp.get("xp_eligible"),
+        }
+    return world_ctx
 
 
 def load_companion_level_lead(conf_path: Path | None = None) -> int:

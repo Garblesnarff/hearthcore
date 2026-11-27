@@ -50,6 +50,9 @@ This is a living skill updated continuously after every Claude Opus 5.5 High QA 
 - **Verify artifact SHA-256 digests and duration/method allowlists** in admission summaries (`benchmark_summary_for_admission`), never trusting `all_correctness_passed` alone.
 - **Separate HTTP poll latency from SQL latency:** Never label HTTP `/api/state` round-trip time as `sql_query_ms`.
 - **Make benchmark tests 100% hermetic:** Patch `/proc`, `brain.db`, and config directory lookups so tests never read live host state.
+- **Never coerce unknown `None` telemetry with `bool(x)` or permissive defaults:** `bool(None)` silently turns unknown `in_combat`/`in_lfg_queue`/`is_dead` into "all clear" (`False`), and permissive defaults like `available_minutes=90` hide fail-open bugs. Test with exact bridge-shaped `None` fixtures and require explicit fail-closed checks on every live-state field.
+- **Un-nest multi-stage reporting funnels & validate volunteer/party invariants:** Report independent sets (`eligible`, `available`, `willing`, `queued`, `matched`) so transient blockers don't erase queued/willing members; respect volunteer role choices, single-faction party rules, and joint party-level shift windows (slowest traveler).
+- **Always add a positive baseline control assertion before negative mutation loops in tests**, and hash read-only SQLite files before/after to prove zero mutation.
 
 ### Concurrency, Locks & Control Planes
 - **NEVER acquire `_CTL_LOCK` inside a block that already holds `_CTL_LOCK`:** `_audit_log()` acquires `_CTL_LOCK` (non-reentrant). Always release `_CTL_LOCK` before calling `_audit_log()` or `_send_bytes()`.

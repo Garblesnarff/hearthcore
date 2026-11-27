@@ -26,13 +26,75 @@ from hearthcore.readiness import evaluate_raid_roster
 
 
 def _make_roster() -> dict:
+    # Realistic live telemetry fixture (Issue #14: unknown telemetry must never claim feasible)
+    sched_open = {"shift_group": "early-birds", "start_hour": 0, "end_hour": 24, "days_mask": 127, "always_online": True}
     return {
-        "brannoc": {"guid": 101, "name": "Brannoc", "slug": "brannoc", "level": 32, "online": True, "shift_group": "core-wonky", "zone": "Ironforge"},
-        "ironbulwark": {"guid": 201, "name": "Ironbulwark", "slug": "ironbulwark", "level": 24, "online": True, "shift_group": "early-birds", "zone": "Stormwind City"},
-        "aelindra": {"guid": 202, "name": "Aelindra", "slug": "aelindra", "level": 24, "online": True, "shift_group": "early-birds", "zone": "Stormwind City"},
-        "alaric": {"guid": 203, "name": "Alaric", "slug": "alaric", "level": 23, "online": True, "shift_group": "early-birds", "zone": "Stormwind City"},
-        "pipwick": {"guid": 204, "name": "Pipwick", "slug": "pipwick", "level": 23, "online": True, "shift_group": "early-birds", "zone": "Stormwind City"},
-        "nightstep": {"guid": 205, "name": "Nightstep", "slug": "nightstep", "level": 23, "online": True, "shift_group": "prime-time", "zone": "Stormwind City"},
+        "brannoc": {
+            "guid": 101, "name": "Brannoc", "slug": "brannoc", "level": 32, "online": True,
+            "shift_group": "core-wonky", "zone": "Ironforge", "zone_id": 1537, "map_id": 0,
+            "race_id": 4, "class_id": 1, "faction": "alliance", "schedule": sched_open,
+            "locked_maps": [], "in_group": False, "willing_dungeons": ["stockade_n"],
+            "live_telemetry": {
+                "class_id": 1, "spec_tab": 2, "known_spells": [71, 355],
+                "equipped": {"has_main_hand": True, "has_shield": True, "broken_slots": 0, "min_durability_pct": 100.0},
+                "native_role_mask": 0x02, "native_lfg_eligible": True, "in_combat": False, "in_lfg_queue": False, "is_dead": False,
+            },
+        },
+        "ironbulwark": {
+            "guid": 201, "name": "Ironbulwark", "slug": "ironbulwark", "level": 24, "online": True,
+            "shift_group": "early-birds", "zone": "Stormwind City", "zone_id": 1519, "map_id": 0,
+            "race_id": 3, "class_id": 2, "faction": "alliance", "schedule": sched_open,
+            "locked_maps": [], "in_group": False, "willing_dungeons": ["stockade_n"],
+            "live_telemetry": {
+                "class_id": 2, "spec_tab": 1, "known_spells": [25780, 635],
+                "equipped": {"has_main_hand": True, "has_shield": True, "broken_slots": 0, "min_durability_pct": 100.0},
+                "native_role_mask": 0x02, "native_lfg_eligible": True, "in_combat": False, "in_lfg_queue": False, "is_dead": False,
+            },
+        },
+        "aelindra": {
+            "guid": 202, "name": "Aelindra", "slug": "aelindra", "level": 24, "online": True,
+            "shift_group": "early-birds", "zone": "Stormwind City", "zone_id": 1519, "map_id": 0,
+            "race_id": 4, "class_id": 5, "faction": "alliance", "schedule": sched_open,
+            "locked_maps": [], "in_group": False, "willing_dungeons": ["stockade_n"],
+            "live_telemetry": {
+                "class_id": 5, "spec_tab": 1, "known_spells": [2061, 2054],
+                "equipped": {"has_main_hand": True, "has_shield": False, "broken_slots": 0, "min_durability_pct": 100.0},
+                "native_role_mask": 0x04, "native_lfg_eligible": True, "in_combat": False, "in_lfg_queue": False, "is_dead": False,
+            },
+        },
+        "alaric": {
+            "guid": 203, "name": "Alaric", "slug": "alaric", "level": 23, "online": True,
+            "shift_group": "early-birds", "zone": "Stormwind City", "zone_id": 1519, "map_id": 0,
+            "race_id": 1, "class_id": 8, "faction": "alliance", "schedule": sched_open,
+            "locked_maps": [], "in_group": False, "willing_dungeons": ["stockade_n"],
+            "live_telemetry": {
+                "class_id": 8, "spec_tab": 2, "known_spells": [],
+                "equipped": {"has_main_hand": True, "has_shield": False, "broken_slots": 0, "min_durability_pct": 100.0},
+                "native_role_mask": 0x08, "native_lfg_eligible": True, "in_combat": False, "in_lfg_queue": False, "is_dead": False,
+            },
+        },
+        "pipwick": {
+            "guid": 204, "name": "Pipwick", "slug": "pipwick", "level": 23, "online": True,
+            "shift_group": "early-birds", "zone": "Stormwind City", "zone_id": 1519, "map_id": 0,
+            "race_id": 7, "class_id": 9, "faction": "alliance", "schedule": sched_open,
+            "locked_maps": [], "in_group": False, "willing_dungeons": ["stockade_n"],
+            "live_telemetry": {
+                "class_id": 9, "spec_tab": 0, "known_spells": [],
+                "equipped": {"has_main_hand": True, "has_shield": False, "broken_slots": 0, "min_durability_pct": 100.0},
+                "native_role_mask": 0x08, "native_lfg_eligible": True, "in_combat": False, "in_lfg_queue": False, "is_dead": False,
+            },
+        },
+        "nightstep": {
+            "guid": 205, "name": "Nightstep", "slug": "nightstep", "level": 23, "online": True,
+            "shift_group": "prime-time", "zone": "Stormwind City", "zone_id": 1519, "map_id": 0,
+            "race_id": 4, "class_id": 4, "faction": "alliance", "schedule": sched_open,
+            "locked_maps": [], "in_group": False, "willing_dungeons": ["stockade_n"],
+            "live_telemetry": {
+                "class_id": 4, "spec_tab": 1, "known_spells": [],
+                "equipped": {"has_main_hand": True, "has_shield": False, "broken_slots": 0, "min_durability_pct": 100.0},
+                "native_role_mask": 0x08, "native_lfg_eligible": True, "in_combat": False, "in_lfg_queue": False, "is_dead": False,
+            },
+        },
     }
 
 
@@ -75,44 +137,51 @@ class Phase2Tests(unittest.TestCase):
 
         # Live pilot defaults OFF!
         ok_live, reason_live = check_character_eligibility(
-            level=24, faction="alliance", viable_roles=["tank"], dungeon=stockade, allow_pilot_shadow=False
+            level=24, faction="alliance", viable_roles=["tank"], dungeon=stockade,
+            available_minutes=90, locked_maps=set(), allow_pilot_shadow=False,
         )
         self.assertFalse(ok_live)
         self.assertIn("dungeon_disabled", reason_live)
 
         # Unsupported dungeon rejected even in shadow
         ok_unsup, reason_unsup = check_character_eligibility(
-            level=24, faction="alliance", viable_roles=["tank"], dungeon=sfk, allow_pilot_shadow=True
+            level=24, faction="alliance", viable_roles=["tank"], dungeon=sfk,
+            available_minutes=90, locked_maps=set(), allow_pilot_shadow=True,
         )
         self.assertFalse(ok_unsup)
         self.assertIn("dungeon_unsupported", reason_unsup)
 
         # Faction mismatch, lockout, level range, insufficient schedule rejected
         ok_fac, r_fac = check_character_eligibility(
-            level=24, faction="horde", viable_roles=["tank"], dungeon=stockade, allow_pilot_shadow=True
+            level=24, faction="horde", viable_roles=["tank"], dungeon=stockade,
+            available_minutes=90, locked_maps=set(), allow_pilot_shadow=True,
         )
         self.assertFalse(ok_fac)
         self.assertIn("faction_mismatch", r_fac)
 
         ok_lock, r_lock = check_character_eligibility(
-            level=24, faction="alliance", viable_roles=["tank"], dungeon=stockade, locked_maps={34}, allow_pilot_shadow=True
+            level=24, faction="alliance", viable_roles=["tank"], dungeon=stockade,
+            available_minutes=90, locked_maps={34}, allow_pilot_shadow=True,
         )
         self.assertFalse(ok_lock)
         self.assertIn("instance_locked", r_lock)
 
         ok_lvl, _ = check_character_eligibility(
-            level=10, faction="alliance", viable_roles=["tank"], dungeon=stockade, allow_pilot_shadow=True
+            level=10, faction="alliance", viable_roles=["tank"], dungeon=stockade,
+            available_minutes=90, locked_maps=set(), allow_pilot_shadow=True,
         )
         self.assertFalse(ok_lvl)
 
         ok_win, _ = check_character_eligibility(
-            level=24, faction="alliance", viable_roles=["tank"], dungeon=stockade, available_minutes=20, allow_pilot_shadow=True
+            level=24, faction="alliance", viable_roles=["tank"], dungeon=stockade,
+            available_minutes=20, locked_maps=set(), allow_pilot_shadow=True,
         )
         self.assertFalse(ok_win)
 
         # Valid alliance pilot candidate in shadow passes
         ok_good, _ = check_character_eligibility(
-            level=24, faction="alliance", viable_roles=["tank"], dungeon=stockade, available_minutes=90, allow_pilot_shadow=True
+            level=24, faction="alliance", viable_roles=["tank"], dungeon=stockade,
+            available_minutes=90, locked_maps=set(), allow_pilot_shadow=True,
         )
         self.assertTrue(ok_good)
 
@@ -188,7 +257,7 @@ class Phase2Tests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             tp = Path(tmp)
-            world = {"companions": _make_roster(), "work_orders": []}
+            world = {"companions": _make_roster(), "work_orders": [], "telemetry_observed_at": 1_800_000_000}
             res = run_shadow_match_snapshot(
                 world, db_path=tp / "brain.db", runtime_dir=tp / "rt",
                 vitals={"mem_avail_gib": 1.0, "tick_p99": 22.0}, raid_stage=0, now_ts=1_800_000_000,

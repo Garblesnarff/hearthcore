@@ -122,10 +122,16 @@ class MySQLIntegrationTests(unittest.TestCase):
         CREATE TABLE IF NOT EXISTS acore_characters.character_queststatus_rewarded (guid INT, quest INT);
         CREATE TABLE IF NOT EXISTS acore_characters.guild_bank_item (guildid INT, item_guid INT);
         CREATE TABLE IF NOT EXISTS acore_characters.guild_member (guildid INT, guid INT);
-        CREATE TABLE IF NOT EXISTS acore_characters.item_instance (guid INT, itemEntry INT, count INT);
+        CREATE TABLE IF NOT EXISTS acore_characters.item_instance (guid INT, itemEntry INT, count INT, durability INT DEFAULT 100);
+        CREATE TABLE IF NOT EXISTS acore_characters.character_instance (guid INT, instance INT, permanent TINYINT, extended TINYINT);
+        CREATE TABLE IF NOT EXISTS acore_characters.instance (id INT PRIMARY KEY, map SMALLINT, resettime INT, difficulty TINYINT);
+        CREATE TABLE IF NOT EXISTS acore_characters.group_member (guid INT, memberGuid INT PRIMARY KEY, memberFlags TINYINT, subgroup TINYINT, roles TINYINT);
+        CREATE TABLE IF NOT EXISTS acore_characters.character_talent (guid INT, spell INT, specMask TINYINT);
+        CREATE TABLE IF NOT EXISTS acore_characters.character_spell (guid INT, spell INT, specMask TINYINT);
+        CREATE TABLE IF NOT EXISTS acore_characters.character_inventory (guid INT, bag INT, slot TINYINT, item INT);
         CREATE TABLE IF NOT EXISTS acore_auth.account (id INT PRIMARY KEY, username VARCHAR(32), verifier VARBINARY(32));
         CREATE TABLE IF NOT EXISTS acore_auth.realmlist (id INT PRIMARY KEY, name VARCHAR(32), address VARCHAR(32), port INT, flag INT);
-        CREATE TABLE IF NOT EXISTS acore_world.item_template (entry INT PRIMARY KEY, name VARCHAR(64));
+        CREATE TABLE IF NOT EXISTS acore_world.item_template (entry INT PRIMARY KEY, name VARCHAR(64), MaxDurability INT DEFAULT 100, InventoryType TINYINT DEFAULT 0);
         CREATE TABLE IF NOT EXISTS acore_world.quest_template (ID INT PRIMARY KEY, QuestLevel INT, LogTitle VARCHAR(128));
         CREATE TABLE IF NOT EXISTS acore_world.player_xp_for_level (level INT PRIMARY KEY, Experience INT);
         INSERT IGNORE INTO acore_auth.account (id, username, verifier) VALUES (1, 'Tester', UNHEX('AABBCC'));
@@ -234,6 +240,7 @@ class MySQLIntegrationTests(unittest.TestCase):
         DROP TABLE IF EXISTS `{db_name}`.characters;
         CREATE TABLE `{db_name}`.characters (
             guid INT PRIMARY KEY, account INT NOT NULL, name VARCHAR(32) NOT NULL,
+            race TINYINT UNSIGNED NOT NULL DEFAULT 1, class TINYINT UNSIGNED NOT NULL DEFAULT 1,
             level TINYINT UNSIGNED NOT NULL, zone INT NOT NULL, map INT NOT NULL,
             money INT NOT NULL, online TINYINT NOT NULL, xp INT NOT NULL
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -242,27 +249,54 @@ class MySQLIntegrationTests(unittest.TestCase):
         );
         CREATE TABLE IF NOT EXISTS `{db_name}`.character_queststatus_rewarded (guid INT NOT NULL, quest INT NOT NULL);
         CREATE TABLE IF NOT EXISTS `{db_name}`.guild_bank_item (guildid INT NOT NULL, item_guid INT NOT NULL);
-        CREATE TABLE IF NOT EXISTS `{db_name}`.item_instance (guid INT NOT NULL, itemEntry INT NOT NULL, count INT NOT NULL);
+        DROP TABLE IF EXISTS `{db_name}`.item_instance;
+        CREATE TABLE `{db_name}`.item_instance (guid INT PRIMARY KEY, itemEntry INT NOT NULL, count INT NOT NULL, durability INT NOT NULL DEFAULT 100);
+        DROP TABLE IF EXISTS `{db_name}`.character_instance;
+        CREATE TABLE `{db_name}`.character_instance (guid INT NOT NULL, instance INT NOT NULL, permanent TINYINT NOT NULL DEFAULT 0, extended TINYINT NOT NULL DEFAULT 0);
+        DROP TABLE IF EXISTS `{db_name}`.instance;
+        CREATE TABLE `{db_name}`.instance (id INT PRIMARY KEY, map SMALLINT NOT NULL, resettime INT NOT NULL, difficulty TINYINT NOT NULL DEFAULT 0);
+        DROP TABLE IF EXISTS `{db_name}`.group_member;
+        CREATE TABLE `{db_name}`.group_member (guid INT NOT NULL, memberGuid INT PRIMARY KEY, memberFlags TINYINT NOT NULL DEFAULT 0, subgroup TINYINT NOT NULL DEFAULT 0, roles TINYINT NOT NULL DEFAULT 0);
+        DROP TABLE IF EXISTS `{db_name}`.character_talent;
+        CREATE TABLE `{db_name}`.character_talent (guid INT NOT NULL, spell INT NOT NULL, specMask TINYINT NOT NULL DEFAULT 1);
+        DROP TABLE IF EXISTS `{db_name}`.character_spell;
+        CREATE TABLE `{db_name}`.character_spell (guid INT NOT NULL, spell INT NOT NULL, specMask TINYINT NOT NULL DEFAULT 1);
+        DROP TABLE IF EXISTS `{db_name}`.character_inventory;
+        CREATE TABLE `{db_name}`.character_inventory (guid INT NOT NULL, bag INT NOT NULL, slot TINYINT NOT NULL, item INT NOT NULL);
+        CREATE DATABASE IF NOT EXISTS acore_world;
+        DROP TABLE IF EXISTS acore_world.item_template;
+        CREATE TABLE acore_world.item_template (entry INT PRIMARY KEY, name VARCHAR(64), MaxDurability INT DEFAULT 100, InventoryType TINYINT DEFAULT 0);
 
         TRUNCATE TABLE `{db_name}`.characters;
         TRUNCATE TABLE `{db_name}`.character_skills;
         TRUNCATE TABLE `{db_name}`.character_queststatus_rewarded;
         TRUNCATE TABLE `{db_name}`.guild_bank_item;
         TRUNCATE TABLE `{db_name}`.item_instance;
+        TRUNCATE TABLE `{db_name}`.character_instance;
+        TRUNCATE TABLE `{db_name}`.instance;
+        TRUNCATE TABLE `{db_name}`.group_member;
+        TRUNCATE TABLE `{db_name}`.character_talent;
+        TRUNCATE TABLE `{db_name}`.character_spell;
+        TRUNCATE TABLE `{db_name}`.character_inventory;
         TRUNCATE TABLE `{db_name}`.companion_schedule;
         TRUNCATE TABLE `{db_name}`.companion_relationships;
         TRUNCATE TABLE `{db_name}`.companion_ledger;
 
         INSERT IGNORE INTO acore_auth.account (id, username, verifier) VALUES (1, 'WONKY', UNHEX('00')), (2, 'COMPBOT', UNHEX('00'));
-        INSERT INTO `{db_name}`.characters VALUES
-            (1, 1, 'Wonky', 30, 10, 0, 500000, 1, 12000),
-            (101, 2, 'Brannoc', 33, 10, 0, 250000, 1, 0);
+        INSERT INTO `{db_name}`.characters (guid, account, name, race, class, level, zone, map, money, online, xp) VALUES
+            (1, 1, 'Wonky', 1, 2, 30, 10, 0, 500000, 1, 12000),
+            (101, 2, 'Brannoc', 4, 1, 33, 10, 0, 250000, 1, 0);
         INSERT INTO `{db_name}`.companion_schedule (name, shift_group, start_hour, end_hour, days_mask, always_online, note)
             VALUES ('Brannoc', 'core-wonky', 0, 24, 127, 1, 'Core tank');
         INSERT INTO `{db_name}`.character_skills VALUES (101, 164, 105, 150), (101, 186, 121, 150);
         INSERT INTO `{db_name}`.character_queststatus_rewarded VALUES (101, 1001), (101, 1002);
         INSERT INTO `{db_name}`.guild_bank_item VALUES (6, 9001);
-        INSERT INTO `{db_name}`.item_instance (guid, itemEntry, count) VALUES (9001, 2770, 40);
+        INSERT INTO `{db_name}`.item_instance (guid, itemEntry, count, durability) VALUES (9001, 2770, 40, 0), (9002, 990001, 1, 95);
+        INSERT INTO `{db_name}`.character_inventory (guid, bag, slot, item) VALUES (101, 0, 16, 9002);
+        INSERT INTO acore_world.item_template (entry, name, MaxDurability, InventoryType) VALUES (990001, 'Test Shield', 100, 14);
+        INSERT INTO `{db_name}`.character_spell (guid, spell, specMask) VALUES (101, 71, 1), (101, 355, 1);
+        INSERT INTO `{db_name}`.instance (id, map, resettime, difficulty) VALUES (77, 34, 1900000000, 0);
+        INSERT INTO `{db_name}`.character_instance (guid, instance, permanent, extended) VALUES (101, 77, 1, 0);
         INSERT INTO `{db_name}`.companion_events (guid, event_type, summary, partner_guid, zone_id, created_at)
             VALUES (101, 'level_up', 'Brannoc reached 33', 0, 10, 1800000000);
         """
@@ -280,8 +314,15 @@ class MySQLIntegrationTests(unittest.TestCase):
             mem = MemoryEngine(db_p)
             wctx = fetch_world_context(mem=mem, now_ts=1_800_000_050)
             self.assertIn("brannoc", wctx["companions"])
-            self.assertEqual(wctx["companions"]["brannoc"]["skills"][186], (121, 150))
-            self.assertEqual(wctx["companions"]["brannoc"]["quests_rewarded"], 2)
+            br = wctx["companions"]["brannoc"]
+            self.assertEqual(br["skills"][186], (121, 150))
+            self.assertEqual(br["quests_rewarded"], 2)
+            self.assertEqual(br["faction"], "alliance")
+            self.assertEqual(br["class_name"], "warrior")
+            self.assertEqual(br["locked_maps"], [34])
+            self.assertTrue(br["schedule"]["always_online"])
+            self.assertIn(71, br["live_telemetry"]["known_spells"])
+            self.assertTrue(br["live_telemetry"]["equipped"]["has_shield"])
             self.assertEqual(wctx["owner_levels"]["wonky"], 30)
             self.assertEqual(mem.journal_status()["total_events"], 1)
 
