@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, time as dt_time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -519,6 +519,101 @@ def compute_schedule_remaining_minutes(
         rem = (end_h * 60) - cur_min
         return rem, "in_overnight_shift"
     return 0, "outside_scheduled_shift"
+
+
+def enumerate_schedule_windows(
+    schedule: dict[str, Any] | None,
+    *,
+    start_ts: int,
+    horizon_hours: int = 48,
+    tz=None,
+) -> tuple[list[tuple[int, int]], str]:
+    """Enumerate future scheduled online windows [win_start, win_end] within [start_ts, start_ts + horizon_hours].
+
+    Matches CompanionBotMgr::IsScheduledOnline semantics (daytime, overnight, full-day, always_online)
+    using DST-safe calendar arithmetic. Fail-closed on missing or malformed schedule telemetry.
+    """
+    if not isinstance(schedule, dict):
+        return [], "missing_schedule_telemetry"
+
+    h_hours = int(horizon_hours)
+    if h_hours <= 0:
+        return [], "invalid_horizon"
+
+    s_ts = int(start_ts)
+    end_horizon_ts = s_ts + (h_hours * 3600)
+
+    always_raw = schedule.get("always_online")
+    if always_raw is True or always_raw == 1:
+        return [(s_ts, end_horizon_ts)], "always_online"
+
+    if (
+        schedule.get("start_hour") is None
+        or schedule.get("end_hour") is None
+        or schedule.get("days_mask") is None
+    ):
+        return [], "missing_schedule_telemetry"
+
+    try:
+        start_h = int(schedule["start_hour"])
+        end_h = int(schedule["end_hour"])
+        days_mask = int(schedule["days_mask"])
+    except (TypeError, ValueError):
+        return [], "invalid_schedule_telemetry"
+
+    if not (0 <= start_h <= 23 and 0 <= end_h <= 24 and 0 <= days_mask <= 127):
+        return [], "invalid_schedule_telemetry"
+    if days_mask == 0:
+        return [], "schedule_disabled"
+
+    use_tz = configured_schedule_tz(tz)
+    base_dt = datetime.fromtimestamp(s_ts, tz=use_tz)
+    base_date = base_dt.date()
+    span_days = (h_hours // 24) + 2
+
+    def _local_ts(d: date, hour: int) -> int:
+        if hour == 24:
+            dt_obj = datetime.combine(d + timedelta(days=1), dt_time(0, 0), tzinfo=use_tz)
+        else:
+            dt_obj = datetime.combine(d, dt_time(hour, 0), tzinfo=use_tz)
+        return int(dt_obj.timestamp())
+
+    raw_intervals: list[tuple[int, int]] = []
+    # Start at day_offset=-1 to capture overnight shifts that began yesterday and extend past midnight
+    for day_offset in range(-1, span_days + 1):
+        d = base_date + timedelta(days=day_offset)
+        c_wday = (d.weekday() + 1) % 7  # Sunday=0 .. Saturday=6
+        if (days_mask & (1 << c_wday)) == 0:
+            continue
+
+        if start_h == end_h or (start_h == 0 and end_h == 24):
+            w_start = _local_ts(d, 0)
+            w_end = _local_ts(d, 24)
+        elif start_h < end_h:
+            w_start = _local_ts(d, start_h)
+            w_end = _local_ts(d, end_h)
+        else:
+            # Overnight shift: start_h today -> end_h tomorrow
+            w_start = _local_ts(d, start_h)
+            w_end = _local_ts(d + timedelta(days=1), end_h)
+
+        clamped_start = max(s_ts, w_start)
+        clamped_end = min(end_horizon_ts, w_end)
+        if clamped_end > clamped_start:
+            raw_intervals.append((clamped_start, clamped_end))
+
+    if not raw_intervals:
+        return [], "no_windows_in_horizon"
+
+    raw_intervals.sort()
+    merged: list[tuple[int, int]] = [raw_intervals[0]]
+    for ws, we in raw_intervals[1:]:
+        prev_s, prev_e = merged[-1]
+        if ws <= prev_e:
+            merged[-1] = (prev_s, max(prev_e, we))
+        else:
+            merged.append((ws, we))
+    return merged, "ok"
 
 
 def estimate_travel_and_prep_minutes(
