@@ -187,7 +187,11 @@ local function cfg()
 	local c = LoganReadsPC.coach
 	if c.on == nil then c.on = false end
 	if c.keys == nil then c.keys = false end
-	if c.frame == nil then c.frame = true end
+	if c.frame == nil then c.frame = false end
+	if not c.v2CleanFrame then
+		c.frame = false
+		c.v2CleanFrame = true
+	end
 	if c.scaleFrame == nil then c.scaleFrame = false end -- taint-free red glow ON by default; TargetFrame scaling opt-in
 	if c.arrows == nil then c.arrows = false end
 	if c.marks == nil then c.marks = false end
@@ -668,6 +672,7 @@ local function buildBig()
 	big.name:SetTextColor(1, 1, 1, 1)
 
 	buildKeyboard(f)
+	f:Hide()
 end
 
 local function showBig(entry)
