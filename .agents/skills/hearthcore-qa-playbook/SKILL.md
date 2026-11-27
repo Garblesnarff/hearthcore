@@ -84,3 +84,21 @@ This is a living skill updated continuously after every Claude Opus 5.5 High QA 
 - **Avoid `exec()` for loading sibling modules** — use `importlib.util`.
 - **Frontend polling vs user edits:** Every editable control (textareas, selects, checkboxes, sliders) needs a dirty flag so periodic refreshes never clobber in-progress user changes, and action buttons need a `busy` guard against double-click duplicates.
 - **Tighten test assertions:** Parse real SQL `VALUES(...)` tuples instead of broad substring matches like `", 0, "`, and assert exact expected revisions/statuses rather than loose inequalities.
+
+### C++ / AzerothCore Mod-Playerbots (Repo-Only Zero-Downtime Pattern)
+- **Extract pure C++17 `*Logic.h` headers & compile with `-std=c++17 -DNDEBUG -Wall -Wextra -Werror`:** Put complex state machines, parsers, admission/authorization/drain rules in self-contained C++17 headers (`Companion*Logic.h`) tested via compiled native test binaries in `tests/test_issue*.py`. NEVER put side effects inside `assert()` — use an `-DNDEBUG`-safe `CHECK(expr)` macro so release builds execute identical checks.
+- **Verify exact installed AzerothCore header visibility & signatures before writing `.cpp` code:** Never assume an upstream TrinityCore/MaNGOS helper exists or is `public`; check `/home/wonky/AzerothCore/azerothcore-wotlk/` directly.
+- **`Map::IsDungeon()` returns `true` for RAIDS too:** Always use `Map::IsNonRaidDungeon()` for 5-player dungeon guards.
+- **`Group::GetGUID().GetRawValue()` is deterministic from counter (cannot detect real group-ID reuse):** Track a monotonic `uint64` lifecycle `groupToken` via `GroupScript::OnCreate` / `OnDisband` (`GROUPHOOK_ON_CREATE`, `GROUPHOOK_ON_DISBAND`) to catch recycled group IDs.
+- **Map-thread safety (ZERO blocking DB I/O, ZERO file writes, ZERO cross-map reads):**
+  - Never run `CharacterDatabase.Query` / `DirectExecute` or persist hysteresis JSON files from map threads (`TickBot` / `LfgActions`); queue mutations (`gPendingCoopBinds`/`Disbands`/`Exits`, `gHysteresisPersistDirty`) and flush exclusively on the world thread (`CompanionBrain::Update` / `FlushCoopGroupMutations`).
+  - Never read `peer->GetMap()` across map threads; iterate `bot->GetMap()->GetPlayers()` for same-map peer combat checks.
+  - Never hold a mutex across `ObjectAccessor`, `sGroupMgr`, or DB calls; avoid recursive lock acquisition (`gLeadMutex` vs `gStateMutex`).
+- **Async WoW packet semantics (`LeaveOrDisbandGroup` & `SMSG_LFG_PROPOSAL_UPDATE`):**
+  - `PlayerbotAI::LeaveOrDisbandGroup()` queues `CMSG_GROUP_DISBAND` asynchronously — NEVER release group/opportunity commitments before actual `GroupScript::OnRemoveMember` / `OnDisband` confirms departure (and guard `OnRemoveMember` against `group->isLFGGroup(true) && method == GROUP_REMOVEMETHOD_KICK` vote-kick initiation!).
+  - `SMSG_LFG_PROPOSAL_UPDATE` encodes dungeon entries as `(id | type << 24)` — ALWAYS mask `& 0x00FFFFFFu` before `sLFGDungeonStore.LookupEntry(...)`, and check `proposal.state == LFG_PROPOSAL_INITIATING` (`0`) so `SUCCESS`/`FAILED` updates don't re-trigger accept/decline packets!
+- **Separate admission mode from accepted group ownership & probe DB BEFORE flushing:**
+  - Never infer DB row closure from a time-filtered / `LIMIT`-capped reload query (`RunExpired` groups would get swept mid-pull right at expiry); query owned IDs directly via `SELECT id, state WHERE id IN (...)`.
+  - Probe DB health BEFORE flushing pending exits/disbands; distinguish missing rows (`SELECT 1` succeeds) from real DB outages; cap unconfirmable exit retries (`COOP_EXIT_MAX_RETRIES`) so one bad row never wedges unrelated disbands.
+  - Keep per-member recall/shift-end deadlines separate from group-level drain deadlines so a single offline recalled bot can never sweep healthy groupmates out of ownership.
+  - Guard startup race (`IsCoopBootProbeDone()`) so `TickBot` never stray-disbands a pre-existing committed bot-only group before the first world-thread boot probe runs (never holding human-led groups).
