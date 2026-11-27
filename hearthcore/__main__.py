@@ -244,8 +244,11 @@ def main():
             print(f"Phase II Shadow Match | coop_live={res['coop_enabled_live']} | headroom_ok={res['headroom']['admit_ok']} ({res['headroom']['reasons'] or 'OK'})")
             for d in res["shadow_dungeons"]:
                 print(
-                    f"  {d['name']:<16} (Lv {d['level_band']}) eligible={d['eligible_counts']} "
-                    f"feasible={d['feasible_now']} shortfalls={d['shortfalls']} live_enabled={d['pilot_enabled_live']}"
+                    f"  {d['name']:<16} (LFG#{d.get('lfg_dungeon_id', 0)} Lv {d['level_band']} rec {d.get('recommended_level_band', '')}) "
+                    f"eligible={d['eligible_counts']} avail={d.get('available_counts')} "
+                    f"willing={d.get('willing_counts')} queued={d.get('queued_counts')} "
+                    f"matched={d.get('matched_counts')} feasible={d['feasible_now']} "
+                    f"roster_feasible={d.get('roster_feasible_now')} live_enabled={d['pilot_enabled_live']}"
                 )
             return 0
 

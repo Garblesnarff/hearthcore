@@ -17,6 +17,7 @@ import logging
 import os
 import sqlite3
 import time
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,8 +31,12 @@ from .dungeons import (
     DUNGEON_CATALOG,
     DungeonSpec,
     check_character_eligibility,
+    classify_level_band,
+    compute_schedule_remaining_minutes,
     enabled_dungeon_ids,
-    infer_viable_roles,
+    estimate_travel_and_prep_minutes,
+    evaluate_live_role_capability,
+    faction_from_race,
 )
 from .identity import PROTECTED_OWNER_GROUPS, PersonaRegistry, persona_id_for_slug
 
@@ -385,8 +390,14 @@ class OpportunityCoordinator:
         realm_id: int = 1,
         incarnation: int = 1,
         now_ts: int | None = None,
+        eligibility: dict[str, Any] | None = None,
     ) -> bool:
-        """Record voluntary character interest if opportunity is recruiting at expected_revision."""
+        """Record voluntary character interest if opportunity is recruiting at expected_revision.
+
+        When `eligibility` is provided, strictly validates AC1 live eligibility (wrong role, stale/
+        offline/locked/short shift, wrong faction, protected core, disabled/unsupported dungeon,
+        unknown live state) BEFORE writing to the database.
+        """
         ts = int(now_ts if now_ts is not None else time.time())
         conn = self._conn()
         try:
@@ -398,6 +409,23 @@ class OpportunityCoordinator:
             if int(opp["recruit_until"]) <= ts or int(available_until) <= ts:
                 conn.execute("ROLLBACK")
                 return False
+            if eligibility is not None:
+                spec = DUNGEON_BY_ID.get(str(opp["dungeon_id"]))
+                if spec is None:
+                    conn.execute("ROLLBACK")
+                    return False
+                ev = validate_candidate_for_dungeon(
+                    eligibility,
+                    spec,
+                    required_role=role,
+                    allow_pilot_shadow=bool(int(opp["is_shadow"])),
+                    raid_stage=int(eligibility.get("raid_stage") or 0),
+                    now_ts=ts,
+                    tz=eligibility.get("tz"),
+                )
+                if not ev["available"]:
+                    conn.execute("ROLLBACK")
+                    return False
             conn.execute(
                 """
                 INSERT INTO opportunity_interests (
@@ -431,6 +459,63 @@ class OpportunityCoordinator:
             raise
         finally:
             conn.close()
+
+    def admit_candidate(
+        self,
+        *,
+        opportunity_id: int,
+        expected_revision: int,
+        persona_id: str,
+        character_guid: int,
+        character_slug: str,
+        role: str,
+        reason_code: str,
+        candidate: dict[str, Any],
+        raid_stage: int = 0,
+        now_ts: int | None = None,
+        tz=None,
+    ) -> dict[str, Any]:
+        """Strict fail-closed AC1 admission gate + voluntary interest registration (Issue #14).
+
+        Rejects wrong role, stale/offline/locked/short shift, wrong faction, protected core,
+        ineligible/disabled dungeon, or unknown live telemetry before touching opportunity_interests.
+        """
+        ts = int(now_ts if now_ts is not None else time.time())
+        opp = self.get_opportunity(opportunity_id)
+        if not opp:
+            return {"ok": False, "reason": "not_found"}
+        spec = DUNGEON_BY_ID.get(str(opp["dungeon_id"]))
+        if spec is None:
+            return {"ok": False, "reason": f"unknown_dungeon:{opp['dungeon_id']}"}
+
+        ev = validate_candidate_for_dungeon(
+            candidate,
+            spec,
+            required_role=role,
+            allow_pilot_shadow=bool(opp["is_shadow"]),
+            raid_stage=raid_stage,
+            now_ts=ts,
+            tz=tz,
+        )
+        if not ev["available"]:
+            return {"ok": False, "reason": ev["reason"], "evaluation": ev}
+
+        avail_mins = int(ev["available_minutes"])
+        avail_until = ts + max(60, avail_mins * 60)
+        ok = self.express_interest(
+            opportunity_id=opportunity_id,
+            expected_revision=expected_revision,
+            persona_id=persona_id,
+            character_guid=character_guid,
+            character_slug=character_slug,
+            role=role,
+            reason_code=reason_code,
+            available_until=avail_until,
+            now_ts=ts,
+        )
+        if not ok:
+            return {"ok": False, "reason": "opportunity_not_recruiting_or_revision_mismatch"}
+        return {"ok": True, "reason": "admitted", "role": role.lower(), "available_until": avail_until}
 
     def withdraw_interest(self, opportunity_id: int, persona_id: str, reason: str = "withdrawn", now_ts: int | None = None) -> dict[str, Any]:
         ts = int(now_ts if now_ts is not None else time.time())
@@ -1289,32 +1374,562 @@ class OpportunityCoordinator:
 
 def _read_existing_enrollments_readonly(db_path: Path) -> dict[int, tuple[str, bool]]:
     """Strictly read-only lookup of existing persona enrollments; NEVER creates or mutates db_path (Issue #15)."""
+    ctx = _read_shadow_db_context_readonly(db_path, now_ts=int(time.time()))
+    return {
+        guid: (rec["persona_id"], rec["enrolled_coop"])
+        for guid, rec in ctx["enrollments"].items()
+    }
+
+
+def _read_shadow_db_context_readonly(db_path: Path, *, now_ts: int) -> dict[str, Any]:
+    """Strictly read-only lookup of persona enrollments, paused characters, and unexpired live interests.
+
+    Guarantees (Issues #14 & #15):
+    - NEVER creates or mutates db_path.
+    - Maps ALL persona_characters rows (regardless of `active`) so inactive alts NEVER mint new personas!
+    - Filters expired interests (`available_until > now_ts`) and expired opportunities.
+    - Separates `active` in-run interests into `busy_personas` (excluded from `queued` and `available`).
+    - Fails closed (`ok=False`, `errors=[...]`) on any SQLite read error on an existing db_path!
+    """
+    out: dict[str, Any] = {
+        "ok": True,
+        "errors": [],
+        "enrollments": {},         # guid -> {"persona_id", "enrolled_coop", "state", "char_active"}
+        "paused_slugs": set(),     # slugs currently paused in brain.db
+        "busy_personas": set(),    # persona_ids reserved/accepted/active in live opportunities
+        "queued_by_dungeon": {},   # dungeon_id -> {persona_id -> {"character_guid", "role", "state"}}
+    }
     if not db_path.is_file():
-        return {}
-    out: dict[int, tuple[str, bool]] = {}
+        return out
     conn: sqlite3.Connection | None = None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3.0)
+        quoted = urllib.parse.quote(str(db_path.resolve()), safe="/")
+        conn = sqlite3.connect(f"file:{quoted}?mode=ro", uri=True, timeout=3.0)
         conn.row_factory = sqlite3.Row
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-        if "companion_personas" not in tables or "companion_persona_characters" not in tables:
-            return {}
-        rows = conn.execute(
-            """
-            SELECT c.character_guid, p.persona_id, p.enrolled_coop
-            FROM companion_persona_characters c
-            JOIN companion_personas p ON p.persona_id = c.persona_id
-            """
-        ).fetchall()
-        for r in rows:
-            out[int(r["character_guid"])] = (str(r["persona_id"]), bool(int(r["enrolled_coop"])))
+
+        # P1-6: Read ALL persona_characters links (NO `WHERE c.active = 1`) so inactive alts stay bound to their persona!
+        for p_tbl, pc_tbl in (
+            ("personas", "persona_characters"),
+            ("companion_personas", "companion_persona_characters"),
+        ):
+            if p_tbl in tables and pc_tbl in tables:
+                rows = conn.execute(
+                    f"""
+                    SELECT c.character_guid, c.active, p.persona_id, p.enrolled_coop, p.state
+                    FROM {pc_tbl} c
+                    JOIN {p_tbl} p ON p.persona_id = c.persona_id
+                    ORDER BY c.incarnation ASC
+                    """
+                ).fetchall()
+                for r in rows:
+                    out["enrollments"][int(r["character_guid"])] = {
+                        "persona_id": str(r["persona_id"]),
+                        "enrolled_coop": bool(int(r["enrolled_coop"])),
+                        "state": str(r["state"] or "active").lower(),
+                        "char_active": bool(int(r["active"])),
+                    }
+
+        if "paused_characters" in tables:
+            for r in conn.execute("SELECT character_id FROM paused_characters WHERE paused = 1").fetchall():
+                out["paused_slugs"].add(str(r["character_id"]).strip().lower())
+
+        if "opportunities" in tables and "opportunity_interests" in tables:
+            opp_cols = {r[1] for r in conn.execute("PRAGMA table_info(opportunities)").fetchall()}
+            has_confirm = "confirm_until" in opp_cols
+            opp_ttl_clause = (
+                "((o.state = 'recruiting' AND o.recruit_until > ?) "
+                "OR (o.state IN ('assembling','confirmed') AND (o.confirm_until = 0 OR o.confirm_until > ?)) "
+                "OR o.state IN ('active','cancelling'))"
+                if has_confirm
+                else "((o.state = 'recruiting' AND o.recruit_until > ?) OR o.state IN ('assembling','confirmed','active','cancelling'))"
+            )
+            params: tuple[Any, ...] = (int(now_ts), int(now_ts), int(now_ts)) if has_confirm else (int(now_ts), int(now_ts))
+            rows = conn.execute(
+                f"""
+                SELECT o.dungeon_id, o.state AS opp_state, oi.persona_id, oi.character_guid, oi.role, oi.state
+                FROM opportunity_interests oi
+                JOIN opportunities o ON o.id = oi.opportunity_id
+                WHERE o.is_shadow = 0
+                  AND {opp_ttl_clause}
+                  AND oi.state IN ('interested', 'reserved', 'accepted', 'active')
+                  AND (oi.state = 'active' OR oi.available_until > ?)
+                """,
+                params,
+            ).fetchall()
+            for r in rows:
+                did = str(r["dungeon_id"])
+                pid = str(r["persona_id"])
+                st = str(r["state"])
+                opp_st = str(r["opp_state"])
+                # Active runs & cancelling runs are BUSY (not available/queued for a new party!)
+                if st == "active" or opp_st in ("active", "cancelling"):
+                    out["busy_personas"].add(pid)
+                    continue
+                out["queued_by_dungeon"].setdefault(did, {})[pid] = {
+                    "character_guid": int(r["character_guid"]),
+                    "role": str(r["role"]).strip().lower(),
+                    "state": st,
+                }
+                if st in ("reserved", "accepted"):
+                    out["busy_personas"].add(pid)
     except sqlite3.Error as exc:
-        logger.warning("Read-only persona enrollment lookup failed for %s: %s", db_path, exc)
-        return {}
+        out["ok"] = False
+        out["errors"].append(f"{type(exc).__name__}: {exc}")
+        logger.warning("Read-only shadow DB context lookup failed for %s: %s", db_path, exc)
     finally:
         if conn is not None:
             conn.close()
     return out
+
+
+def validate_candidate_for_dungeon(
+    comp: dict[str, Any],
+    spec: DungeonSpec,
+    *,
+    required_role: str | None = None,
+    allow_pilot_shadow: bool = True,
+    raid_stage: int = 0,
+    now_ts: int,
+    tz=None,
+    max_telemetry_age_sec: int = 300,
+    world_ctx: dict[str, Any] | None = None,
+    char_profile: dict[str, Any] | None = None,
+    enrolled_coop: bool | None = None,
+    persona_state: str = "active",
+    char_active: bool = True,
+    paused: bool = False,
+    queued_here_native: bool = False,
+    queued_elsewhere: bool = False,
+) -> dict[str, Any]:
+    """Single source of truth for Stage 1 (hard eligibility) and Stage 2 (current availability) (Issue #14).
+
+    Fail-closed: unknown faction, schedule, lockouts, live spec/role, combat, group, queue, alive,
+    equipment, native LFG eligibility, or stale telemetry NEVER passes!
+    """
+    shift_group = str(comp.get("shift_group") or "").strip().lower()
+    # Hard protected-core override (P2: never auto-admit core-wonky / core-logan even if DB row stale!)
+    is_protected_core = shift_group in PROTECTED_OWNER_GROUPS
+    eff_enrolled = (not is_protected_core) if enrolled_coop is None else (bool(enrolled_coop) and not is_protected_core)
+
+    def _fail(stage: str, reason: str, *, unknown: bool = False, **extra: Any) -> dict[str, Any]:
+        return {
+            "eligible": stage != "eligible",
+            "available": False,
+            "reason": reason,
+            "unknown_telemetry": unknown,
+            "is_protected_core": is_protected_core,
+            **extra,
+        }
+
+    if not eff_enrolled:
+        return _fail("eligible", "protected_core_excluded")
+    if persona_state != "active":
+        return _fail("eligible", "quarantined_persona")
+    if not char_active:
+        return _fail("eligible", "inactive_persona_character")
+    if not comp.get("online"):
+        return _fail("eligible", "offline")
+
+    # Telemetry freshness check (fail-closed if missing or stale)
+    telem_fresh_explicit = comp.get("telemetry_fresh")
+    if telem_fresh_explicit is not None:
+        telem_fresh = bool(telem_fresh_explicit)
+    else:
+        obs_ts = _parse_observed_timestamp(world_ctx or {}, comp)
+        if obs_ts is None:
+            telem_fresh = False
+        else:
+            age = int(now_ts) - obs_ts
+            telem_fresh = (0 <= age <= int(max_telemetry_age_sec))
+        if world_ctx and world_ctx.get("live_pos_fresh") is False and comp.get("telemetry_fresh") is None:
+            telem_fresh = False
+    if not telem_fresh:
+        return _fail("eligible", "stale_or_missing_telemetry", unknown=True)
+
+    lvl = int(comp.get("level") or 0)
+    band = classify_level_band(lvl, spec)
+
+    faction = comp.get("faction")
+    if not faction and comp.get("race_id") is not None:
+        faction = faction_from_race(comp.get("race_id"))
+
+    # Prefer difficulty-aware locked_instances when present, else locked_maps
+    raw_locks = comp.get("locked_instances") if comp.get("locked_instances") is not None else comp.get("locked_maps")
+    locked_maps = list(raw_locks) if raw_locks is not None else None
+
+    live_telem = comp.get("live_telemetry") if isinstance(comp.get("live_telemetry"), dict) else None
+    role_eval = evaluate_live_role_capability(
+        char_profile, level=lvl, live_telemetry=live_telem, allow_profile_fallback=False
+    )
+    if not role_eval["known"]:
+        reason = role_eval["reasons"][0] if role_eval["reasons"] else "missing_live_role_telemetry"
+        return _fail("eligible", reason, unknown=True, band=band, role_eval=role_eval)
+
+    native_lfg_elig = (live_telem or {}).get("native_lfg_eligible")
+    native_lfg_lock = str((live_telem or {}).get("native_lfg_lock_reason") or "")
+    ll_state = comp.get("level_lead_state") if isinstance(comp.get("level_lead_state"), dict) else {}
+    level_lead_blocked = bool(ll_state.get("at_level_cap")) or (comp.get("xp_eligible") is False)
+
+    # Stage 1: Hard legal/capability/policy eligibility (independent of transient combat/group/dead/gear/shift)
+    elig_ok, elig_reason = check_character_eligibility(
+        level=lvl,
+        faction=faction,
+        viable_roles=role_eval["viable_roles"],
+        dungeon=spec,
+        available_minutes=9999,  # real schedule window validated in Stage 2!
+        locked_maps=locked_maps,
+        raid_stage=raid_stage,
+        allow_pilot_shadow=allow_pilot_shadow,
+        online=True,
+        telemetry_fresh=True,
+        enrolled_coop=True,
+        require_known_lockouts=True,
+        require_known_live_state=False,  # transient live-state checks run in Stage 2 so eligible stays accurate!
+        in_combat=False,
+        in_group=False,
+        in_lfg_queue=False,
+        is_dead=False,
+        paused=False,
+        native_lfg_eligible=True if native_lfg_elig is None else native_lfg_elig,
+        native_lfg_lock_reason=native_lfg_lock,
+        equipment_known=True,
+        level_lead_blocked=level_lead_blocked,
+        required_role=required_role,
+    )
+    if not elig_ok:
+        is_unk = elig_reason in ("unknown_faction", "unknown_lockout_telemetry")
+        return _fail("eligible", elig_reason, unknown=is_unk, band=band, role_eval=role_eval)
+
+    # Stage 2: Actual live state, equipment/prep, schedule window, combat/group/queue/native-LFG
+    equipped = (live_telem or {}).get("equipped") if isinstance((live_telem or {}).get("equipped"), dict) else None
+    is_dead_raw = (live_telem or {}).get("is_dead")
+    in_combat_raw = (live_telem or {}).get("in_combat")
+    in_group_raw = comp.get("in_group")
+    in_lfg_raw = (live_telem or {}).get("in_lfg_queue")
+
+    travel_prep = estimate_travel_and_prep_minutes(
+        spec,
+        current_map_id=comp.get("map_id"),
+        current_zone_id=comp.get("zone_id"),
+        equipped=equipped,
+        is_dead=is_dead_raw,
+    )
+
+    if comp.get("available_minutes") is not None:
+        avail_mins: int | None = int(comp["available_minutes"])
+        sched_reason = "explicit_available_minutes"
+    else:
+        avail_mins, sched_reason = compute_schedule_remaining_minutes(
+            comp.get("schedule"), now_ts=now_ts, tz=tz
+        )
+
+    # If in_lfg_queue is None -> fail closed; if queued HERE natively, not blocked by queued_elsewhere
+    eff_in_lfg: bool | None = None if in_lfg_raw is None else bool(queued_elsewhere)
+
+    avail_ok, avail_reason = check_character_eligibility(
+        level=lvl,
+        faction=faction,
+        viable_roles=role_eval["viable_roles"],
+        dungeon=spec,
+        available_minutes=avail_mins,
+        locked_maps=locked_maps,
+        raid_stage=raid_stage,
+        allow_pilot_shadow=allow_pilot_shadow,
+        online=True,
+        telemetry_fresh=True,
+        enrolled_coop=True,
+        require_known_lockouts=True,
+        require_known_live_state=True,
+        in_combat=in_combat_raw,
+        in_group=in_group_raw,
+        in_lfg_queue=eff_in_lfg,
+        is_dead=is_dead_raw,
+        paused=paused,
+        native_lfg_eligible=native_lfg_elig,
+        native_lfg_lock_reason=native_lfg_lock,
+        equipment_known=(equipped is not None),
+        level_lead_blocked=level_lead_blocked,
+        blocking_prep_needs=travel_prep["blocking_prep_needs"],
+        travel_minutes_override=travel_prep["travel_minutes"],
+        prep_minutes=travel_prep["prep_minutes"],
+        required_role=required_role,
+    )
+    is_unk_stage2 = avail_reason.startswith("unknown_")
+    return {
+        "eligible": True,
+        "available": avail_ok,
+        "reason": "available" if avail_ok else avail_reason,
+        "unknown_telemetry": is_unk_stage2,
+        "is_protected_core": False,
+        "faction": faction,
+        "band": band,
+        "role_eval": role_eval,
+        "available_minutes": avail_mins,
+        "schedule_status": sched_reason,
+        "travel_prep": travel_prep,
+        "near_level_cap": bool(ll_state.get("near_level_cap")),
+    }
+
+
+def _match_party_roles(
+    candidates: list[dict[str, Any]],
+    required_roles: dict[str, int],
+) -> dict[str, Any]:
+    """Primary-first augmenting-path bipartite role assignment over distinct personas & characters.
+
+    Guarantees (Issue #14):
+    - Never assigns the same `persona_id` or `character_guid` to more than one slot.
+    - Respects each candidate's `volunteered_roles` when present (a volunteer who signed up for DPS
+      is NEVER silently reassigned to tank or healer!).
+    - Attempts primary-role assignments first, then verified `flex_roles` for remaining slots.
+    """
+    unique_cands: list[dict[str, Any]] = []
+    seen_p: set[str] = set()
+    seen_g: set[int] = set()
+    for c in candidates:
+        pid = str(c["persona_id"])
+        guid = int(c["character_guid"])
+        if pid in seen_p or guid in seen_g:
+            continue
+        seen_p.add(pid)
+        seen_g.add(guid)
+        unique_cands.append(c)
+
+    slots: list[str] = []
+    for role_name in ("tank", "healer", "damage"):
+        slots.extend([role_name] * max(0, int(required_roles.get(role_name, 0))))
+
+    slot_owner: list[int | None] = [None] * len(slots)
+    cand_slot: dict[int, int] = {}
+
+    def _can_fill(cand_idx: int, role_name: str, allow_flex: bool) -> bool:
+        c = unique_cands[cand_idx]
+        vol_roles = c.get("volunteered_roles")
+        if vol_roles is not None and role_name not in vol_roles:
+            return False
+        if c.get("primary_role") == role_name:
+            return True
+        return allow_flex and (role_name in (c.get("flex_roles") or ()))
+
+    def _try_assign(slot_idx: int, allow_flex: bool, visited: set[int]) -> bool:
+        role_needed = slots[slot_idx]
+        cand_order = sorted(
+            range(len(unique_cands)),
+            key=lambda i: (
+                0 if unique_cands[i].get("primary_role") == role_needed else 1,
+                unique_cands[i]["slug"],
+            ),
+        )
+        for ci in cand_order:
+            if ci in visited or not _can_fill(ci, role_needed, allow_flex):
+                continue
+            visited.add(ci)
+            prev_slot = cand_slot.get(ci)
+            if prev_slot is None or _try_assign(prev_slot, allow_flex, visited):
+                slot_owner[slot_idx] = ci
+                cand_slot[ci] = slot_idx
+                return True
+        return False
+
+    for s_idx in range(len(slots)):
+        if slot_owner[s_idx] is None:
+            _try_assign(s_idx, allow_flex=False, visited=set())
+
+    for s_idx in range(len(slots)):
+        if slot_owner[s_idx] is None:
+            _try_assign(s_idx, allow_flex=True, visited=set())
+
+    party: list[dict[str, Any]] = []
+    matched_counts: dict[str, int] = {"tank": 0, "healer": 0, "damage": 0}
+    used_flex: list[dict[str, Any]] = []
+    for s_idx, role_name in enumerate(slots):
+        ci = slot_owner[s_idx]
+        if ci is None:
+            continue
+        c = unique_cands[ci]
+        is_flex = c.get("primary_role") != role_name
+        matched_counts[role_name] = matched_counts.get(role_name, 0) + 1
+        entry = {
+            "persona_id": c["persona_id"],
+            "character_guid": c["character_guid"],
+            "slug": c["slug"],
+            "name": c["name"],
+            "level": c["level"],
+            "faction": c.get("faction"),
+            "assigned_role": role_name,
+            "primary_role": c.get("primary_role"),
+            "used_flex": is_flex,
+            "lfg_role_mask": c.get("lfg_role_mask", 0),
+            "available_minutes": c.get("available_minutes"),
+            "travel_minutes": c.get("travel_minutes", 0),
+            "prep_minutes": c.get("prep_minutes", 0),
+        }
+        party.append(entry)
+        if is_flex:
+            used_flex.append({"slug": c["slug"], "primary_role": c.get("primary_role"), "assigned_role": role_name})
+
+    shortfalls = {
+        r: max(0, int(required_roles.get(r, 0)) - matched_counts.get(r, 0))
+        for r in ("tank", "healer", "damage")
+    }
+    return {
+        "complete": all(v == 0 for v in shortfalls.values()) and len(slots) > 0,
+        "party": party,
+        "matched_counts": matched_counts,
+        "shortfalls": shortfalls,
+        "used_flex_roles": used_flex,
+        "party_shift_window_ok": True,
+    }
+
+
+def _match_single_faction_party(
+    candidates: list[dict[str, Any]],
+    spec: DungeonSpec,
+) -> dict[str, Any]:
+    """Match a single-faction party AND enforce party-wide shift window (P1-3 + P2 mixed-faction fix!).
+
+    A dungeon party cannot mix Alliance and Horde, and cannot start until its slowest traveler arrives:
+      `min(avail_i) >= spec.estimated_minutes + max(travel_i + prep_i) + 10`.
+    """
+    roles_req = dict(spec.roles)
+    factions = ("alliance", "horde") if spec.faction == "both" else (spec.faction,)
+
+    best: dict[str, Any] | None = None
+    for fac in factions:
+        pool = [c for c in candidates if str(c.get("faction") or "").lower() == fac]
+        cur_pool = list(pool)
+        match = _match_party_roles(cur_pool, roles_req)
+
+        # Party-level shift-window check: if slowest traveler leaves someone with too little time, drop bottleneck & retry
+        while match["complete"] and match["party"]:
+            max_overhead = max(
+                int(m.get("travel_minutes") or 0) + int(m.get("prep_minutes") or 0)
+                for m in match["party"]
+            )
+            needed_total = int(spec.estimated_minutes) + max_overhead + 10
+            bottlenecks = [
+                m for m in match["party"]
+                if m.get("available_minutes") is None or int(m["available_minutes"]) < needed_total
+            ]
+            if not bottlenecks:
+                break
+            # Try excluding either the tightest-shift member or the slowest traveler and pick whichever yields a complete party
+            tightest_pid = min(bottlenecks, key=lambda m: int(m.get("available_minutes") or 0))["persona_id"]
+            slowest_pid = max(
+                match["party"],
+                key=lambda m: int(m.get("travel_minutes") or 0) + int(m.get("prep_minutes") or 0),
+            )["persona_id"]
+            alt_a = _match_party_roles([c for c in cur_pool if c["persona_id"] != tightest_pid], roles_req)
+            alt_b = _match_party_roles([c for c in cur_pool if c["persona_id"] != slowest_pid], roles_req)
+            if alt_b["complete"] and not alt_a["complete"]:
+                cur_pool = [c for c in cur_pool if c["persona_id"] != slowest_pid]
+                match = alt_b
+            else:
+                cur_pool = [c for c in cur_pool if c["persona_id"] != tightest_pid]
+                match = alt_a
+            if not match["complete"]:
+                match["party_shift_window_ok"] = False
+                break
+
+        if best is None or (match["complete"] and not best["complete"]) or (
+            match["complete"] == best["complete"] and len(match["party"]) > len(best["party"])
+        ):
+            best = match
+
+    if best is None:
+        return _match_party_roles([], roles_req)
+    return best
+
+
+def _parse_observed_timestamp(world_ctx: dict[str, Any], comp: dict[str, Any]) -> int | None:
+    """Resolve telemetry observation unix timestamp (None if unknown -> fail closed)."""
+    if comp.get("telemetry_observed_at") is not None:
+        try:
+            return int(comp["telemetry_observed_at"])
+        except (TypeError, ValueError):
+            return None
+    if world_ctx.get("telemetry_observed_at") is not None:
+        try:
+            return int(world_ctx["telemetry_observed_at"])
+        except (TypeError, ValueError):
+            return None
+    obs_str = str(comp.get("observed_at") or world_ctx.get("observed_at") or "").strip()
+    if obs_str:
+        try:
+            dt = datetime.strptime(obs_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except ValueError:
+            return None
+    return None
+
+
+def _count_by_primary_role(items: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {"tank": 0, "healer": 0, "damage": 0}
+    for it in items:
+        pr = str(it.get("primary_role") or "")
+        if pr in counts:
+            counts[pr] += 1
+    return counts
+
+
+def _extract_volunteer_choice(
+    slug: str,
+    persona_id: str,
+    comp: dict[str, Any],
+    spec: DungeonSpec,
+    *,
+    volunteer_choices: dict[str, Any] | None,
+    queued_map: dict[str, dict[str, Any]],
+) -> tuple[bool, set[str] | None]:
+    """Return `(is_willing, volunteered_roles_or_None)` from EXPLICIT volunteer choices ONLY.
+
+    NEVER fabricates volunteer choice from the eligible roster!
+    When a volunteer chose specific role(s) (e.g. via opportunity_interests.role or a dict mapping
+    dungeon_id -> [roles]), returns that exact set so the matcher never reassigns them to an unwanted role.
+    """
+    chosen_roles: set[str] = set()
+    is_willing = False
+
+    if persona_id in queued_map:
+        is_willing = True
+        qr = str(queued_map[persona_id].get("role") or "").strip().lower()
+        if qr in ("tank", "healer", "damage"):
+            chosen_roles.add(qr)
+
+    accepted_keys = {spec.dungeon_id, str(spec.lfg_dungeon_id), spec.lfg_dungeon_id}
+
+    def _consume_spec(val: Any) -> None:
+        nonlocal is_willing
+        if isinstance(val, (list, tuple, set, frozenset)):
+            if any(x in accepted_keys for x in val):
+                is_willing = True
+        elif isinstance(val, dict):
+            for k in (spec.dungeon_id, spec.lfg_dungeon_id, str(spec.lfg_dungeon_id)):
+                if k in val and val[k]:
+                    is_willing = True
+                    v = val[k]
+                    if isinstance(v, str) and v.strip().lower() in ("tank", "healer", "damage"):
+                        chosen_roles.add(v.strip().lower())
+                    elif isinstance(v, (list, tuple, set, frozenset)):
+                        for r in v:
+                            rl = str(r).strip().lower()
+                            if rl in ("tank", "healer", "damage"):
+                                chosen_roles.add(rl)
+
+    _consume_spec(comp.get("willing_dungeons"))
+    if isinstance(comp.get("willing_roles"), (list, tuple, set, frozenset)) and is_willing:
+        for r in comp["willing_roles"]:
+            rl = str(r).strip().lower()
+            if rl in ("tank", "healer", "damage"):
+                chosen_roles.add(rl)
+
+    if isinstance(volunteer_choices, dict):
+        for key in (slug, persona_id):
+            if key in volunteer_choices:
+                _consume_spec(volunteer_choices[key])
+
+    return is_willing, (chosen_roles if chosen_roles else None)
 
 
 def read_shadow_artifact(path: Path, *, now_ts: int | None = None, max_age_sec: int = 3600) -> dict[str, Any]:
@@ -1355,17 +1970,32 @@ def run_shadow_match_snapshot(
     vitals: dict[str, Any] | None = None,
     raid_stage: int = 0,
     now_ts: int | None = None,
+    tz=None,
+    max_telemetry_age_sec: int = 300,
+    volunteer_choices: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Pure shadow matchmaking pass over current live roster -> runtime/phase2_shadow.json ONLY.
 
-    Guarantees (Issues #7 & #15 + Card II-02/II-04):
+    Guarantees (Issues #7, #14 & #15 + Cards II-02/II-03/II-04):
     - STRICTLY READ-ONLY on db_path: NEVER mutates PersonaRegistry, opportunities, MySQL,
       reservations, schedules, memory, or active_plans.json.
-    - Protects core-wonky and core-logan by default (`enrolled_coop = False`).
-    - Clearly labels every output as `is_shadow = True` and `synthetic_feasibility = True`.
+    - Uses ACTUAL faction, ACTUAL schedule remaining minutes, ACTUAL instance lockouts,
+      ACTUAL live role capability (spec/talents/spells/equipment/native role mask),
+      ACTUAL combat/group/queue/alive/paused/staleness/native-LFG/level-lead/travel-prep status.
+    - Fail-closed: unknown telemetry or unreadable brain.db NEVER claims feasible.
+    - Protects core-wonky and core-logan unconditionally (`enrolled_coop = False`).
+    - Explicitly distinguishes `eligible`, `available`, `willing`, `queued`, `willing_and_available`,
+      and `matched` as independent non-conflated sets (actual volunteer choice strictly separated!).
+    - Respects volunteer role choice, single-faction parties, party-wide shift window, and distinct personas.
     """
     ts = int(now_ts if now_ts is not None else time.time())
-    existing_enrollments = _read_existing_enrollments_readonly(Path(db_path))
+    db_ctx = _read_shadow_db_context_readonly(Path(db_path), now_ts=ts)
+    db_ok = bool(db_ctx["ok"])
+    db_errors = list(db_ctx["errors"])
+    existing_enrollments = db_ctx["enrollments"]
+    paused_slugs = db_ctx["paused_slugs"]
+    busy_personas = db_ctx["busy_personas"]
+    queued_by_dungeon = db_ctx["queued_by_dungeon"]
     companions = world_ctx.get("companions") or {}
 
     known = set(profiles())
@@ -1393,63 +2023,280 @@ def run_shadow_match_snapshot(
     for spec in DUNGEON_CATALOG:
         if not spec.supported:
             continue
+
+        eligible_list: list[dict[str, Any]] = []
+        available_list: list[dict[str, Any]] = []
+        willing_list: list[dict[str, Any]] = []
+        queued_list: list[dict[str, Any]] = []
+        willing_available_list: list[dict[str, Any]] = []
         pool_by_role: dict[str, list[dict[str, Any]]] = {"tank": [], "healer": [], "damage": []}
+
         excluded_core = 0
         missing_identity = 0
+        unknown_telemetry = 0
+        excluded_reasons: dict[str, int] = {}
+        band_breakdown = {"legal_entry": 0, "lfg_queue_eligible": 0, "recommended": 0}
+        seen_guids: set[int] = set()
+        seen_personas: set[str] = set()
+        queued_map = queued_by_dungeon.get(spec.dungeon_id, {})
+
+        def _bump(reason_key: str) -> None:
+            k = reason_key.split(":", 1)[0]
+            excluded_reasons[k] = excluded_reasons.get(k, 0) + 1
+
+        if not db_ok:
+            _bump("brain_db_unreadable")
+
         for slug, comp in sorted(companions.items()):
-            if slug not in known or not comp.get("online"):
-                continue
             guid = int(comp["guid"])
-            shift_group = str(comp.get("shift_group") or "")
+            if slug not in known and guid not in existing_enrollments:
+                _bump("unknown_profile")
+                continue
+            if not comp.get("online"):
+                _bump("offline")
+                continue
+
+            if guid in seen_guids:
+                _bump("duplicate_character")
+                continue
+            seen_guids.add(guid)
+
+            shift_group = str(comp.get("shift_group") or "").strip().lower()
             if guid in existing_enrollments:
-                persona_id, enrolled_coop = existing_enrollments[guid]
+                rec = existing_enrollments[guid]
+                persona_id = rec["persona_id"]
+                enrolled_coop = rec["enrolled_coop"]
+                persona_state = rec["state"]
+                char_active = rec["char_active"]
             else:
                 missing_identity += 1
                 persona_id = str(comp.get("persona_id") or persona_id_for_slug(slug))
-                enrolled_coop = shift_group.strip().lower() not in PROTECTED_OWNER_GROUPS
-            if not enrolled_coop:
+                enrolled_coop = shift_group not in PROTECTED_OWNER_GROUPS
+                persona_state = str(comp.get("persona_state") or "active").lower()
+                char_active = True
+
+            # Hard protected-core override
+            if not enrolled_coop or shift_group in PROTECTED_OWNER_GROUPS:
                 excluded_core += 1
+                _bump("protected_core_excluded")
                 continue
-            prof = profile(slug)
-            roles = infer_viable_roles(prof, int(comp["level"]))
-            ok, _reason = check_character_eligibility(
-                level=int(comp["level"]),
-                faction="alliance",
-                viable_roles=roles,
-                dungeon=spec,
-                raid_stage=raid_stage,
-                available_minutes=90,
-                allow_pilot_shadow=True,
+            if persona_state != "active":
+                _bump("quarantined_persona")
+                continue
+            if not char_active:
+                _bump("inactive_persona_character")
+                continue
+
+            # Single-active-character per persona across all stages (no duplicate persona!)
+            if persona_id in seen_personas:
+                _bump("duplicate_persona")
+                continue
+
+            live_telem = comp.get("live_telemetry") if isinstance(comp.get("live_telemetry"), dict) else None
+            in_lfg_raw = (live_telem or {}).get("in_lfg_queue")
+            in_lfg_dungeons = {int(x) for x in ((live_telem or {}).get("in_lfg_queue_dungeons") or [])}
+            queued_here_native = (in_lfg_raw is True) and (spec.lfg_dungeon_id in in_lfg_dungeons)
+            queued_here_opp = persona_id in queued_map
+            queued_elsewhere = (
+                ((in_lfg_raw is True) and not queued_here_native)
+                or (persona_id in busy_personas and not queued_here_opp)
             )
-            if not ok:
+            is_paused = (slug in paused_slugs) or bool(comp.get("paused"))
+            prof = profile(slug) if slug in known else None
+
+            ev = validate_candidate_for_dungeon(
+                comp,
+                spec,
+                allow_pilot_shadow=True,
+                raid_stage=raid_stage,
+                now_ts=ts,
+                tz=tz,
+                max_telemetry_age_sec=max_telemetry_age_sec,
+                world_ctx=world_ctx,
+                char_profile=prof,
+                enrolled_coop=enrolled_coop,
+                persona_state=persona_state,
+                char_active=char_active,
+                paused=is_paused,
+                queued_here_native=queued_here_native,
+                queued_elsewhere=queued_elsewhere,
+            )
+
+            if not ev["eligible"]:
+                if ev["unknown_telemetry"]:
+                    unknown_telemetry += 1
+                _bump(ev["reason"])
                 continue
-            primary_r = roles[0]
-            pool_by_role[primary_r].append({
+
+            seen_personas.add(persona_id)
+            band = ev["band"]
+            if band["legal_entry"]:
+                band_breakdown["legal_entry"] += 1
+            if band["lfg_queue_eligible"]:
+                band_breakdown["lfg_queue_eligible"] += 1
+            if band["in_recommended_band"]:
+                band_breakdown["recommended"] += 1
+
+            role_eval = ev["role_eval"]
+            travel_prep = ev["travel_prep"]
+
+            is_willing, volunteered_roles = _extract_volunteer_choice(
+                slug,
+                persona_id,
+                comp,
+                spec,
+                volunteer_choices=volunteer_choices,
+                queued_map=queued_map,
+            )
+            if queued_here_native:
+                is_willing = True
+
+            # Validate volunteer's chosen role(s) against verified live capability (P1-1!)
+            vol_role_mismatch = False
+            if is_willing and volunteered_roles is not None:
+                valid_vol_roles = volunteered_roles & set(role_eval["viable_roles"])
+                if not valid_vol_roles:
+                    vol_role_mismatch = True
+                    _bump("volunteered_role_not_capable")
+                else:
+                    volunteered_roles = valid_vol_roles
+
+            cand_rec = {
                 "persona_id": persona_id,
+                "character_guid": guid,
                 "slug": slug,
                 "name": comp["name"],
                 "level": int(comp["level"]),
-                "role": primary_r,
-            })
+                "faction": ev["faction"],
+                "class_name": role_eval["class_name"],
+                "role": role_eval["primary_role"],
+                "primary_role": role_eval["primary_role"],
+                "flex_roles": list(role_eval["flex_roles"]),
+                "viable_roles": list(role_eval["viable_roles"]),
+                "volunteered_roles": sorted(volunteered_roles) if volunteered_roles is not None else None,
+                "lfg_role_mask": role_eval["lfg_role_mask"],
+                "band_status": band["band_status"],
+                "in_recommended_band": band["in_recommended_band"],
+                "available_minutes": ev["available_minutes"],
+                "schedule_status": ev["schedule_status"],
+                "travel_minutes": travel_prep["travel_minutes"],
+                "prep_minutes": travel_prep["prep_minutes"],
+                "prep_needs": travel_prep["prep_needs"],
+                "near_level_cap": ev.get("near_level_cap", False),
+            }
 
-        # Check whether a full 1T / 1H / 3D voluntary party is synthetically feasible right now
-        roles_req = dict(spec.roles)
-        shortfalls = {
-            r: max(0, int(roles_req.get(r, 0)) - len(pool_by_role[r]))
-            for r in ("tank", "healer", "damage")
-        }
-        feasible = all(v == 0 for v in shortfalls.values())
+            # Stage 1: Eligible (hard legal/capability/policy gates passed)
+            eligible_list.append(cand_rec)
+
+            # Stage 3 & 4 (UN-NESTED per P1-2!): willing & queued recorded independently of transient combat/shift!
+            if is_willing and not vol_role_mismatch:
+                willing_list.append(cand_rec)
+            elif not is_willing:
+                _bump("not_willing")
+
+            if queued_here_opp or queued_here_native:
+                queued_list.append({
+                    **cand_rec,
+                    "queue_source": "native_lfg" if queued_here_native else "opportunity_interest",
+                    "queue_state": "queued" if queued_here_native else queued_map[persona_id]["state"],
+                })
+
+            # Stage 2: Available right now (fails closed if brain.db unreadable OR any Stage 2 check fails!)
+            if not db_ok:
+                continue
+            if not ev["available"]:
+                if ev["unknown_telemetry"]:
+                    unknown_telemetry += 1
+                _bump(ev["reason"])
+                continue
+
+            available_list.append(cand_rec)
+            if cand_rec["primary_role"] in pool_by_role:
+                pool_by_role[cand_rec["primary_role"]].append(cand_rec)
+
+            if is_willing and not vol_role_mismatch:
+                willing_available_list.append(cand_rec)
+
+        # Stage 5: Single-faction distinct-persona role matching with party-level shift-window check
+        if db_ok:
+            volunteer_match = _match_single_faction_party(willing_available_list, spec)
+            roster_match = _match_single_faction_party(available_list, spec)
+        else:
+            volunteer_match = _match_party_roles([], dict(spec.roles))
+            roster_match = _match_party_roles([], dict(spec.roles))
+
+        if not volunteer_match.get("party_shift_window_ok", True):
+            _bump("party_shift_window_insufficient")
+
+        feasible_now = bool(db_ok and volunteer_match["complete"])
+        roster_feasible_now = bool(db_ok and roster_match["complete"])
+
         shadow_dungeons.append({
             "dungeon_id": spec.dungeon_id,
+            "lfg_dungeon_id": spec.lfg_dungeon_id,
             "name": spec.name,
             "map_id": spec.map_id,
             "level_band": f"{spec.min_level}-{spec.max_level}",
+            "legal_level_band": f"{spec.legal_min_level}-{spec.legal_max_level}",
+            "lfg_level_band": f"{spec.min_level}-{spec.max_level}",
+            "recommended_level_band": f"{spec.recommended_min}-{spec.recommended_max}",
+            "band_breakdown": band_breakdown,
             "pilot_enabled_live": spec.dungeon_id in enabled_dungeon_ids(),
             "synthetic_feasibility": True,
-            "eligible_counts": {r: len(pool_by_role[r]) for r in ("tank", "healer", "damage")},
-            "shortfalls": shortfalls,
-            "feasible_now": feasible,
+            "eligible_counts": _count_by_primary_role(eligible_list),
+            "available_counts": _count_by_primary_role(available_list),
+            "willing_counts": _count_by_primary_role(willing_list),
+            "queued_counts": _count_by_primary_role(queued_list),
+            "matched_counts": volunteer_match["matched_counts"],
+            "shortfalls": volunteer_match["shortfalls"],
+            "roster_shortfalls": roster_match["shortfalls"],
+            "feasible_now": feasible_now,
+            "volunteer_feasible_now": feasible_now,
+            "roster_feasible_now": roster_feasible_now,
+            "used_flex_roles": volunteer_match["used_flex_roles"],
+            "roster_used_flex_roles": roster_match["used_flex_roles"],
+            "stages": {
+                "eligible": {
+                    "count": len(eligible_list),
+                    "by_primary_role": _count_by_primary_role(eligible_list),
+                    "personas": [c["persona_id"] for c in eligible_list],
+                    "members": eligible_list,
+                },
+                "available": {
+                    "count": len(available_list),
+                    "by_primary_role": _count_by_primary_role(available_list),
+                    "personas": [c["persona_id"] for c in available_list],
+                    "members": available_list,
+                },
+                "willing": {
+                    "count": len(willing_list),
+                    "by_primary_role": _count_by_primary_role(willing_list),
+                    "personas": [c["persona_id"] for c in willing_list],
+                    "members": willing_list,
+                },
+                "willing_and_available": {
+                    "count": len(willing_available_list),
+                    "by_primary_role": _count_by_primary_role(willing_available_list),
+                    "personas": [c["persona_id"] for c in willing_available_list],
+                },
+                "queued": {
+                    "count": len(queued_list),
+                    "by_primary_role": _count_by_primary_role(queued_list),
+                    "personas": [c["persona_id"] for c in queued_list],
+                    "members": queued_list,
+                },
+                "matched": {
+                    "count": len(volunteer_match["party"]),
+                    "complete": volunteer_match["complete"],
+                    "by_role": volunteer_match["matched_counts"],
+                    "personas": [m["persona_id"] for m in volunteer_match["party"]],
+                    "party": volunteer_match["party"],
+                    "used_flex_roles": volunteer_match["used_flex_roles"],
+                },
+            },
             "excluded_protected_core": excluded_core,
+            "excluded_reasons": excluded_reasons,
+            "unknown_telemetry_count": unknown_telemetry,
             "missing_identity_fallback_count": missing_identity,
             "candidates": pool_by_role,
         })
@@ -1462,6 +2309,10 @@ def run_shadow_match_snapshot(
         "coop_enabled_live": coop_enabled(),
         "enabled_dungeons_live": sorted(enabled_dungeon_ids()),
         "headroom": headroom,
+        "db_ok": db_ok,
+        "db_errors": db_errors,
+        "telemetry_errors": list(world_ctx.get("telemetry_errors") or []),
+        "shared_pool_note": "Per-dungeon feasibility evaluates the shared roster independently; simultaneous runs cannot share personas.",
         "work_order_opportunities": len(adapt_work_orders_as_opportunities(world_ctx.get("work_orders") or [])),
         "shadow_dungeons": shadow_dungeons,
     }
