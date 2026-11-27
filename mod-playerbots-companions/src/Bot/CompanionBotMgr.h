@@ -74,8 +74,11 @@ public:
     void RepairHeirlooms(Player* bot, std::vector<std::string>& report);
     // Any thread. True when the player is the configured owner.
     bool IsOwner(Player const* player) const;
-    // Any thread. True when the low GUID is the configured owner's.
+    // Any thread. True when the low GUID is the configured owner's (primary or secondary).
     bool IsOwnerLow(uint32 lowGuid) const { return _ownerLow.load() != 0 && lowGuid == _ownerLow.load(); }
+    bool IsAnyOwnerLow(uint32 lowGuid) const;
+    // Any thread. True when a group member slot (online OR offline) belongs to a configured companion.
+    bool IsCompanionSlot(ObjectGuid guid, std::string const& slotName) const;
     // Any thread. True when the companion is in a group with the owner.
     bool IsGroupedWithOwner(Player const* bot) const;
     // Phase II (Card II-05): true ONLY when AiPlayerbot.Companion.Coop.Enabled=1, this bot holds an

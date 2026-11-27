@@ -18,6 +18,7 @@
 #include "CompanionQuest.h"
 #include "CompanionTransport.h"
 #include "DatabaseEnv.h"
+#include "Group.h"
 #include "GuildBankAction.h"
 #include "GuildMgr.h"
 #include "MapMgr.h"
@@ -1081,4 +1082,29 @@ public:
     }
 };
 
-void AddPlayerbotsCommandscripts() { new playerbots_commandscript(); }
+class CompanionCoopGroupScript : public GroupScript
+{
+public:
+    CompanionCoopGroupScript()
+        : GroupScript("CompanionCoopGroupScript", {GROUPHOOK_ON_CREATE, GROUPHOOK_ON_DISBAND})
+    {
+    }
+
+    void OnCreate(Group* group, Player* /*leader*/) override
+    {
+        if (group)
+            CompanionBrain::OnNativeGroupCreated(group);
+    }
+
+    void OnDisband(Group* group) override
+    {
+        if (group)
+            CompanionBrain::OnNativeGroupDisbanded(group);
+    }
+};
+
+void AddPlayerbotsCommandscripts()
+{
+    new playerbots_commandscript();
+    new CompanionCoopGroupScript();
+}

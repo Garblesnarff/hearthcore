@@ -6,6 +6,7 @@
 
 #include "CompanionBrain.h"
 #include "CompanionClassStrategy.h"
+#include "CompanionCoopAuthLogic.h"
 #include "CompanionDuty.h"
 #include "CompanionCraft.h"
 #include "CompanionLife.h"
@@ -21,15 +22,18 @@
 #include "DatabaseEnv.h"
 #include "GameTime.h"
 #include "Group.h"
+#include "GroupMgr.h"
 #include "Item.h"
 #include "ItemTemplate.h"
 #include "ItemUsageValue.h"
 #include "Log.h"
+#include "Map.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "Playerbots.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotAIConfig.h"
+#include "StringFormat.h"
 
 namespace
 {
@@ -55,15 +59,33 @@ CompanionWorkOrderLogic::BoundedIdSet gCompletedPropIds;        // prevents stal
 bool gPropMissingLogged = false;
 bool gOverrideMissingLogged = false;
 
-struct CoopMembership
+std::mutex gCoopMutex;
+CompanionCoopAuth::Registry gCoopRegistry;  // Issue #11: exact native group & roster authorization registry
+bool gCoopSchemaMissingLogged = false;
+
+std::mutex gGroupTokenMutex;
+std::unordered_map<Group const*, uint64> gGroupTokens;
+uint64 gNextGroupToken = 1;
+
+struct PendingCoopBind
 {
     uint64 opportunityId = 0;
-    uint32 targetMapId = 0;
-    uint32 groupId = 0;
-    uint32 expiresAt = 0;
+    uint32 revision = 0;
+    uint32 previousGroupId = 0;
+    uint32 instanceId = 0;
+    bool isLfgRebind = false;
+    CompanionCoopAuth::NativeGroupSnapshot snap;
 };
-std::mutex gCoopMutex;
-std::unordered_map<uint32, CoopMembership> gCoopMembers;  // lowGuid -> active authorized coop run
+struct PendingCoopDisband
+{
+    uint32 groupId = 0;
+    std::vector<CompanionCoopAuth::Registry::DisbandTransition> transitions;
+};
+std::mutex gCoopQueueMutex;
+std::unordered_map<uint64, PendingCoopBind> gPendingCoopBinds;  // oppId -> latest queued bind
+std::vector<PendingCoopDisband> gPendingCoopDisbands;
+std::unordered_map<uint64, uint32> gFailedBindCooldown;         // oppId -> unix time when retry allowed
+constexpr uint32 COOP_BIND_FAIL_BACKOFF_SEC = 15;
 
 // WotLK 3.3.5a (1-450) profession leveling-guide materials whitelist (Mining/BS, Eng, JC, Herb/Alch, Inscription,
 // Skinning/LW, Tailoring, Enchanting, First Aid, and guide-standard Cooking meats/fish).
@@ -326,6 +348,8 @@ void CompanionBrain::Update(uint32 elapsed)
 {
     if (!_defaultsLoaded)
         LoadDefaults();
+
+    FlushCoopGroupMutations();
 
     _timer += elapsed;
     _proposalTimer += elapsed;
@@ -774,52 +798,353 @@ bool CompanionBrain::CoopEnabled()
     return sConfigMgr->GetOption<bool>("AiPlayerbot.Companion.Coop.Enabled", false, false);
 }
 
+uint64 CompanionBrain::GroupTokenFor(Group const* group)
+{
+    if (!group)
+        return 0;
+    std::lock_guard<std::mutex> lock(gGroupTokenMutex);
+    auto it = gGroupTokens.find(group);
+    if (it != gGroupTokens.end())
+        return it->second;
+    uint64 const token = gNextGroupToken++;
+    gGroupTokens.emplace(group, token);
+    return token;
+}
+
+uint64 CompanionBrain::OnNativeGroupCreated(Group const* group)
+{
+    if (!group)
+        return 0;
+    std::lock_guard<std::mutex> lock(gGroupTokenMutex);
+    uint64 const token = gNextGroupToken++;
+    gGroupTokens[group] = token;
+    return token;
+}
+
+void CompanionBrain::OnNativeGroupDisbanded(Group const* group)
+{
+    if (!group)
+        return;
+    uint32 const groupId = group->GetGUID().GetCounter();
+    uint64 token = 0;
+    {
+        std::lock_guard<std::mutex> lock(gGroupTokenMutex);
+        auto it = gGroupTokens.find(group);
+        if (it != gGroupTokens.end())
+        {
+            token = it->second;
+            gGroupTokens.erase(it);
+        }
+    }
+    if (!groupId || !CoopEnabled())
+        return;
+
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    std::vector<CompanionCoopAuth::Registry::DisbandTransition> transitions;
+    {
+        std::lock_guard<std::mutex> lock(gCoopMutex);
+        (void)gCoopRegistry.OnGroupDisbanded(groupId, token, now, &transitions);
+    }
+
+    // ALWAYS purge any queued bind targeting this disbanded group (even if it hadn't committed to registry yet!)
+    // and queue DB cleanup when transitions occurred or a pending bind existed for this groupId.
+    std::lock_guard<std::mutex> lock(gCoopQueueMutex);
+    bool removedPending = false;
+    for (auto it = gPendingCoopBinds.begin(); it != gPendingCoopBinds.end();)
+    {
+        if (it->second.snap.groupId == groupId)
+        {
+            it = gPendingCoopBinds.erase(it);
+            removedPending = true;
+        }
+        else
+            ++it;
+    }
+    if (!transitions.empty() || removedPending)
+        gPendingCoopDisbands.push_back(PendingCoopDisband{groupId, std::move(transitions)});
+}
+
+void CompanionBrain::FlushCoopGroupMutations()
+{
+    if (!CoopEnabled())
+    {
+        std::lock_guard<std::mutex> lock(gCoopQueueMutex);
+        gPendingCoopBinds.clear();
+        gPendingCoopDisbands.clear();
+        gFailedBindCooldown.clear();
+        return;
+    }
+
+    std::vector<PendingCoopDisband> disbands;
+    std::vector<PendingCoopBind> binds;
+    {
+        std::lock_guard<std::mutex> lock(gCoopQueueMutex);
+        if (gPendingCoopDisbands.empty() && gPendingCoopBinds.empty())
+            return;
+        disbands.swap(gPendingCoopDisbands);
+        binds.reserve(gPendingCoopBinds.size());
+        for (auto& [oppId, req] : gPendingCoopBinds)
+            binds.push_back(std::move(req));
+        gPendingCoopBinds.clear();
+    }
+
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    uint32 const graceSec = sConfigMgr->GetOption<uint32>("AiPlayerbot.Companion.Coop.ExitGraceMinutes", 10, false) * 60;
+
+    for (PendingCoopDisband const& d : disbands)
+    {
+        if (!d.groupId)
+            continue;
+        for (auto const& tr : d.transitions)
+        {
+            if (tr.aborted)
+            {
+                CharacterDatabase.DirectExecute(Acore::StringFormat(
+                    "UPDATE companion_opportunities SET group_guid = 0, state = 'aborted', "
+                    "outcome_reason = 'native_group_disbanded' "
+                    "WHERE id = {} AND group_guid = {} AND is_shadow = 0 AND state IN ('assembling', 'active')",
+                    tr.opportunityId, d.groupId));
+            }
+            else
+            {
+                // Pre-made group disbanded prior to dungeon entry (e.g. transitioning to native LFG group):
+                // revert to 'assembling' with group_guid = 0 (bounded by LFG_REBIND_GRACE_SEC in registry).
+                CharacterDatabase.DirectExecute(Acore::StringFormat(
+                    "UPDATE companion_opportunities SET group_guid = 0, state = 'assembling' "
+                    "WHERE id = {} AND group_guid = {} AND is_shadow = 0 AND state IN ('assembling', 'active')",
+                    tr.opportunityId, d.groupId));
+            }
+        }
+        // Fallback sweep for any remaining row still referencing this disbanded group_guid (no zombie active+0!).
+        CharacterDatabase.DirectExecute(Acore::StringFormat(
+            "UPDATE companion_opportunities SET group_guid = 0, state = 'aborted', "
+            "outcome_reason = 'native_group_disbanded' "
+            "WHERE group_guid = {} AND is_shadow = 0 AND state IN ('assembling', 'active')",
+            d.groupId));
+        LOG_INFO("playerbots", "[CompanionCoop] Cleared DB group_guid {} after native group disband", d.groupId);
+    }
+
+    for (PendingCoopBind const& req : binds)
+    {
+        if (!req.opportunityId || !req.snap.groupId)
+            continue;
+
+        // Verify the native Group still exists with the EXACT same monotonic lifecycle token before touching DB!
+        Group const* liveGrp = sGroupMgr->GetGroupByGUID(req.snap.groupId);
+        if (!liveGrp || GroupTokenFor(liveGrp) != req.snap.groupToken)
+        {
+            LOG_INFO("playerbots",
+                     "[CompanionCoop] Dropped stale queued bind for opp #{} (group {} already disbanded)",
+                     req.opportunityId, req.snap.groupId);
+            continue;
+        }
+
+        std::string const groupGuard =
+            req.isLfgRebind && req.previousGroupId != 0
+                ? Acore::StringFormat("(group_guid = 0 OR group_guid = {} OR group_guid = {})", req.previousGroupId,
+                                      req.snap.groupId)
+                : Acore::StringFormat("(group_guid = 0 OR group_guid = {})", req.snap.groupId);
+
+        // Single atomic guarded UPDATE (Issue #11): checks revision, kind, non-shadow, non-expired, group_guid
+        // ownership, AND verifies zero OTHER non-expired active/assembling opportunities own this group_guid.
+        CharacterDatabase.DirectExecute(Acore::StringFormat(
+            "UPDATE companion_opportunities SET group_guid = {}, state = 'active' "
+            "WHERE id = {} AND revision = {} AND is_shadow = 0 AND kind = 'dungeon_run' "
+            "AND state IN ('assembling', 'active') "
+            "AND (recruit_until + estimated_minutes * 60 + {}) > {} "
+            "AND {} "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM ("
+            "    SELECT id FROM companion_opportunities "
+            "    WHERE group_guid = {} AND id <> {} AND is_shadow = 0 "
+            "    AND state IN ('assembling', 'active') "
+            "    AND (recruit_until + estimated_minutes * 60 + {}) > {}"
+            "  ) AS active_conflict"
+            ")",
+            req.snap.groupId, req.opportunityId, req.revision, graceSec, now, groupGuard, req.snap.groupId,
+            req.opportunityId, graceSec, now));
+
+        QueryResult confirm = CharacterDatabase.Query(Acore::StringFormat(
+            "SELECT group_guid, state, revision FROM companion_opportunities WHERE id = {}", req.opportunityId));
+        bool dbConfirmed = false;
+        std::string dbState;
+        if (confirm)
+        {
+            Field* cf = confirm->Fetch();
+            uint32 const dbGroupId = cf[0].Get<uint32>();
+            dbState = cf[1].Get<std::string>();
+            uint32 const dbRev = cf[2].Get<uint32>();
+            dbConfirmed =
+                (dbGroupId == req.snap.groupId && dbRev == req.revision && CompanionCoopAuth::IsActiveRunState(dbState));
+        }
+
+        if (!dbConfirmed)
+        {
+            std::lock_guard<std::mutex> lock(gCoopQueueMutex);
+            gFailedBindCooldown[req.opportunityId] = now + COOP_BIND_FAIL_BACKOFF_SEC;
+            LOG_WARN("playerbots",
+                     "[CompanionCoop] Atomic DB bind rejected for opportunity #{} (rev {}, group {})",
+                     req.opportunityId, req.revision, req.snap.groupId);
+            continue;
+        }
+
+        std::string bindReason;
+        bool boundOk = false;
+        {
+            std::lock_guard<std::mutex> lock(gCoopMutex);
+            boundOk = gCoopRegistry.BindNativeGroup(req.opportunityId, req.revision, req.snap, req.instanceId, now,
+                                                    dbState == "active", req.isLfgRebind, &bindReason);
+        }
+        if (boundOk)
+        {
+            std::lock_guard<std::mutex> lock(gCoopQueueMutex);
+            gFailedBindCooldown.erase(req.opportunityId);
+            LOG_INFO("playerbots",
+                     "[CompanionCoop] {} opportunity #{} (rev {}) to native {}group {} ({} members)",
+                     req.isLfgRebind ? "Rebound" : "Bound", req.opportunityId, req.revision,
+                     req.snap.isLfg ? "LFG " : "", req.snap.groupId, req.snap.members.size());
+        }
+        else
+        {
+            // Roll back DB group_guid so a rejected registry bind never leaves an orphaned group_guid in MySQL!
+            CharacterDatabase.DirectExecute(Acore::StringFormat(
+                "UPDATE companion_opportunities SET group_guid = {}, state = 'assembling' "
+                "WHERE id = {} AND revision = {} AND group_guid = {}",
+                req.previousGroupId, req.opportunityId, req.revision, req.snap.groupId));
+            std::lock_guard<std::mutex> lock(gCoopQueueMutex);
+            gFailedBindCooldown[req.opportunityId] = now + COOP_BIND_FAIL_BACKOFF_SEC;
+            LOG_WARN("playerbots",
+                     "[CompanionCoop] Registry bind rejected after DB update for opp #{} ({}); rolled back DB",
+                     req.opportunityId, bindReason);
+        }
+    }
+}
+
 void CompanionBrain::ReloadCoopMemberships()
 {
     if (!CoopEnabled())
     {
         std::lock_guard<std::mutex> lock(gCoopMutex);
-        if (!gCoopMembers.empty())
-            gCoopMembers.clear();
+        if (!gCoopRegistry.Runs().empty())
+            gCoopRegistry.Clear();
         return;
     }
 
+    FlushCoopGroupMutations();
+
     QueryResult probe = CharacterDatabase.Query(
         "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() "
-        "AND table_name IN ('companion_opportunities', 'companion_opportunity_interests')");
-    if (!probe || probe->Fetch()[0].Get<uint64>() < 2)
+        "AND table_name IN ('companion_opportunities', 'companion_opportunity_interests', "
+        "'companion_personas', 'companion_persona_characters')");
+    if (!probe || probe->Fetch()[0].Get<uint64>() < 4)
+    {
+        if (!gCoopSchemaMissingLogged)
+        {
+            gCoopSchemaMissingLogged = true;
+            LOG_WARN("playerbots",
+                     "[CompanionCoop] Cooperative authorization disabled: required Phase II tables missing");
+        }
+        std::lock_guard<std::mutex> lock(gCoopMutex);
+        gCoopRegistry.Clear();
         return;
+    }
+
+    uint64 startGen = 0;
+    {
+        std::lock_guard<std::mutex> lock(gCoopMutex);
+        startGen = gCoopRegistry.BindGeneration();
+    }
 
     uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
     uint32 const graceSec = sConfigMgr->GetOption<uint32>("AiPlayerbot.Companion.Coop.ExitGraceMinutes", 10, false) * 60;
-    std::unordered_map<uint32, CoopMembership> next;
+    uint32 const assemblyGraceSec = sConfigMgr->GetOption<uint32>(
+        "AiPlayerbot.Companion.Coop.AssemblyGraceSeconds", CompanionCoopAuth::DEFAULT_ASSEMBLY_GRACE_SEC, false);
 
-    QueryResult res = CharacterDatabase.Query(
-        "SELECT o.id, o.dungeon_map_id, o.group_guid, o.recruit_until, o.estimated_minutes, i.character_guid "
+    // Issue #11: Filter expiry in SQL, exclude zombie active rows with group_guid=0, limit by OPPORTUNITIES
+    // (never truncating a roster mid-group!), use EXISTS for persona_characters (preventing duplicate rows across
+    // incarnations), load roles_json to verify exact required headcount/roles, and NEVER select 'reserved' rows.
+    std::unordered_map<uint64, CompanionCoopAuth::AuthorizedRun> runsByOpp;
+    QueryResult res = CharacterDatabase.Query(Acore::StringFormat(
+        "SELECT o.id, o.revision, o.dungeon_map_id, o.difficulty, o.group_guid, o.state, "
+        "o.recruit_until, o.estimated_minutes, o.is_shadow, o.roles_json, "
+        "i.character_guid, i.role, i.state, i.opportunity_revision, "
+        "p.enrolled_coop, p.state, "
+        "EXISTS(SELECT 1 FROM companion_persona_characters pc "
+        "  WHERE pc.persona_id = i.persona_id AND pc.character_guid = i.character_guid AND pc.active = 1) "
         "FROM companion_opportunities o "
-        "JOIN companion_opportunity_interests i ON i.opportunity_id = o.id "
-        "WHERE o.is_shadow = 0 AND o.state IN ('assembling', 'active') "
-        "AND i.state IN ('reserved', 'accepted', 'active') LIMIT 25");
+        "JOIN ("
+        "  SELECT id FROM companion_opportunities "
+        "  WHERE is_shadow = 0 AND kind = 'dungeon_run' "
+        "  AND (state = 'assembling' OR (state = 'active' AND group_guid > 0)) "
+        "  AND (recruit_until + estimated_minutes * 60 + {}) > {} "
+        "  ORDER BY id ASC LIMIT 50"
+        ") active_ops ON active_ops.id = o.id "
+        "JOIN companion_opportunity_interests i ON i.opportunity_id = o.id AND i.opportunity_revision = o.revision "
+        "LEFT JOIN companion_personas p ON p.persona_id = i.persona_id "
+        "WHERE i.state IN ('accepted', 'active') "
+        "ORDER BY o.id ASC, i.character_guid ASC",
+        graceSec, now));
     if (res)
     {
         do
         {
             Field* f = res->Fetch();
             uint64 const oppId = f[0].Get<uint64>();
-            uint32 const mapId = f[1].Get<uint32>();
-            uint32 const grpGuid = f[2].Get<uint32>();
-            uint32 const baseUntil = f[3].Get<uint32>();
-            uint32 const estMin = f[4].Get<uint32>();
-            uint32 const charGuid = f[5].Get<uint32>();
+            uint32 const rev = f[1].Get<uint32>();
+            uint32 const mapId = f[2].Get<uint32>();
+            uint8 const diff = f[3].Get<uint8>();
+            uint32 const grpGuid = f[4].Get<uint32>();
+            std::string const runState = f[5].Get<std::string>();
+            uint32 const baseUntil = f[6].Get<uint32>();
+            uint32 const estMin = f[7].Get<uint32>();
+            bool const isShadow = f[8].Get<uint8>() != 0;
+            std::string const rolesJson = f[9].Get<std::string>();
+            uint32 const charGuid = f[10].Get<uint32>();
+            std::string const role = f[11].Get<std::string>();
+            std::string const interestState = f[12].Get<std::string>();
+            uint32 const interestRev = f[13].Get<uint32>();
+            bool const enrolledCoop = !f[14].IsNull() && f[14].Get<uint8>() == 1 &&
+                                      !f[15].IsNull() && f[15].Get<std::string>() == "active" &&
+                                      f[16].Get<uint64>() != 0;
+
             uint32 const expAt = baseUntil + estMin * 60 + graceSec;
             if (expAt <= now)
                 continue;
-            next[charGuid] = CoopMembership{oppId, mapId, grpGuid, expAt};
+
+            auto& run = runsByOpp[oppId];
+            if (run.opportunityId == 0)
+            {
+                run.opportunityId = oppId;
+                run.revision = rev;
+                run.targetMapId = mapId;
+                run.difficulty = diff;
+                run.expectedGroupId = grpGuid;
+                run.runState = runState;
+                run.assemblyDeadline = baseUntil + assemblyGraceSec;
+                run.expiresAt = expAt;
+                run.isShadow = isShadow;
+                run.boundToNativeGroup = (grpGuid != 0);
+                if (!CompanionCoopAuth::ParseRoleRequirements(rolesJson, run.requiredRoles))
+                    run.requiredRoles = CompanionCoopAuth::RoleRequirements{};
+            }
+            CompanionCoopAuth::AuthorizedMember mem;
+            mem.characterGuid = charGuid;
+            mem.role = role;
+            mem.interestState = interestState;
+            mem.interestRevision = interestRev;
+            mem.enrolledCoop = enrolledCoop;
+            run.roster.push_back(std::move(mem));
         } while (res->NextRow());
     }
 
+    std::vector<CompanionCoopAuth::AuthorizedRun> nextRuns;
+    nextRuns.reserve(runsByOpp.size());
+    for (auto& [oppId, run] : runsByOpp)
+        nextRuns.push_back(std::move(run));
+
     std::lock_guard<std::mutex> lock(gCoopMutex);
-    gCoopMembers.swap(next);
+    // Generation guard: if a bind or disband committed while this SQL read was running, do NOT clobber it!
+    (void)gCoopRegistry.ReloadRuns(std::move(nextRuns), startGen);
 }
 
 bool CompanionBrain::IsAuthorizedCoopMember(uint32 lowGuid, uint64& outOppId, uint32& outTargetMap, uint32& outGroupId)
@@ -827,17 +1152,84 @@ bool CompanionBrain::IsAuthorizedCoopMember(uint32 lowGuid, uint64& outOppId, ui
     outOppId = 0;
     outTargetMap = 0;
     outGroupId = 0;
-    if (!CoopEnabled())
+    if (!CoopEnabled() || !lowGuid)
         return false;
     uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
     std::lock_guard<std::mutex> lock(gCoopMutex);
-    auto it = gCoopMembers.find(lowGuid);
-    if (it == gCoopMembers.end() || it->second.expiresAt <= now)
+    return gCoopRegistry.LookupBoundMember(lowGuid, now, outOppId, outTargetMap, outGroupId);
+}
+
+bool CompanionBrain::AuthorizeCoopGroup(Player const* bot, CompanionCoopAuth::NativeGroupSnapshot const& snap,
+                                        bool allowQueueBind, bool* outAssemblyInProgress, std::string* outReason)
+{
+    if (outAssemblyInProgress)
+        *outAssemblyInProgress = false;
+    if (outReason)
+        outReason->clear();
+    if (!bot || !CoopEnabled())
+    {
+        if (outReason)
+            *outReason = "coop_disabled";
         return false;
-    outOppId = it->second.opportunityId;
-    outTargetMap = it->second.targetMapId;
-    outGroupId = it->second.groupId;
-    return true;
+    }
+
+    uint32 const botGuid = bot->GetGUID().GetCounter();
+    uint32 const botMapId = bot->GetMapId();
+    uint32 const botInstanceId = bot->GetInstanceId();
+    Map const* map = bot->GetMap();
+    uint8 const botDifficulty = map ? static_cast<uint8>(map->GetDifficulty()) : 0;
+    bool const botInNonRaidDungeon = map && map->IsNonRaidDungeon();
+    bool const botInRaid = map && map->IsRaid();
+    bool const botInBgOrArena = map && map->IsBattlegroundOrArena();
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+
+    CompanionCoopAuth::AuthDecision dec;
+    {
+        std::lock_guard<std::mutex> lock(gCoopMutex);
+        dec = gCoopRegistry.Authorize(true, botGuid, botMapId, botInstanceId, botDifficulty, botInNonRaidDungeon,
+                                      botInRaid, botInBgOrArena, snap, now);
+        if (dec.authorized)
+        {
+            bool const pinned = gCoopRegistry.PinRuntimeBindings(
+                dec.opportunityId, dec.revision, snap.groupId, snap.groupToken, snap.leaderGuid, dec.leaderFailover,
+                snap.isLfg, botInNonRaidDungeon ? botMapId : 0, botInNonRaidDungeon ? botInstanceId : 0);
+            if (!pinned)
+            {
+                if (outReason)
+                    *outReason = "runtime_pin_mismatch";
+                return false;
+            }
+        }
+    }
+
+    if (dec.readyToBind && allowQueueBind)
+    {
+        // Queue atomic DB bind for the world thread (ZERO blocking DB I/O on map threads!).
+        std::lock_guard<std::mutex> lock(gCoopQueueMutex);
+        auto failIt = gFailedBindCooldown.find(dec.opportunityId);
+        if (failIt == gFailedBindCooldown.end() || failIt->second <= now)
+        {
+            PendingCoopBind req;
+            req.opportunityId = dec.opportunityId;
+            req.revision = dec.revision;
+            req.previousGroupId = dec.previousGroupId;
+            req.instanceId = botInNonRaidDungeon ? botInstanceId : 0;
+            req.isLfgRebind = dec.isLfgRebind;
+            req.snap = snap;
+            gPendingCoopBinds[dec.opportunityId] = std::move(req);
+        }
+        if (outAssemblyInProgress)
+            *outAssemblyInProgress = true;
+        if (outReason)
+            *outReason = dec.isLfgRebind ? "lfg_rebind_queued" : "bind_queued";
+        return false;
+    }
+
+    if (outAssemblyInProgress)
+        *outAssemblyInProgress = dec.assemblyInProgress;
+    if (outReason)
+        *outReason = dec.reason;
+    return dec.authorized;
 }
 
 float CompanionBrain::Weight(uint32 lowGuid, std::string const& key, float defaultValue)
