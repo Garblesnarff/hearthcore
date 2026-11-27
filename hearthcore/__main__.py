@@ -60,6 +60,11 @@ def main():
     bmk.add_argument("--scenario", default="baseline_outdoor_solo")
     bmk.add_argument("--samples", type=int, default=3)
     bmk.add_argument("--interval", type=float, default=2.0)
+    bmk.add_argument("--warmup", type=float, default=0.0, help="Seconds to wait before the first sample")
+    bmk.add_argument(
+        "--min-duration", type=float, default=600.0,
+        help="Minimum measured span in seconds; shorter runs fail correctness (default 600 = 10 min)",
+    )
 
     args = cli.parse_args()
     try:
@@ -259,8 +264,12 @@ def main():
 
         if args.command == "phase2-benchmark":
             from .benchmark import run_live_baseline_benchmark
+            from .bridge import BRAIN_DB_PATH
+            from .character_ctl import run_read_sql
             art = run_live_baseline_benchmark(
-                scenario=args.scenario, sample_count=args.samples, interval_sec=args.interval
+                scenario=args.scenario, sample_count=args.samples, interval_sec=args.interval,
+                warmup_sec=args.warmup, min_duration_sec=args.min_duration,
+                brain_db_path=BRAIN_DB_PATH, sql_exec=run_read_sql,
             )
             print(f"Benchmark saved: {art['saved_path']}")
             print(f"Metrics: {art['metrics']} | correctness={art['all_correctness_passed']} | sha256={art['artifact_sha256'][:16]}")
