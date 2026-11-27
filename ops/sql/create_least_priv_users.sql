@@ -72,8 +72,34 @@ PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @s = CONCAT('GRANT SELECT ON acore_characters.* TO ', @wh); PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 SET @s = CONCAT('GRANT SELECT ON acore_world.item_template TO ', @wh); PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @s = CONCAT('GRANT SELECT ON acore_world.quest_template TO ', @wh); PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 SET @s = CONCAT('GRANT SELECT ON acore_world.player_xp_for_level TO ', @wh); PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 SET @s = CONCAT('GRANT SELECT ON acore_auth.realmlist TO ', @wh); PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 SET @s = CONCAT('GRANT SELECT (id, username) ON acore_auth.account TO ', @wh); PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+-- Optional human operator dashboard user (narrowly scoped ONLY to companion direction tables; never characters/auth/world writes!)
+SET @op_enabled = IF(@operator_pw IS NOT NULL AND CHAR_LENGTH(@operator_pw) >= 16, 1, 0);
+SET @s = IF(@op_enabled = 1, CONCAT('CREATE USER IF NOT EXISTS ''hearthcore_operator''@''localhost'' IDENTIFIED BY ', QUOTE(@operator_pw)), 'SELECT 1');
+PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @s = IF(@op_enabled = 1, CONCAT('ALTER USER ''hearthcore_operator''@''localhost'' IDENTIFIED BY ', QUOTE(@operator_pw)), 'SELECT 1');
+PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @s = IF(@op_enabled = 1, CONCAT('CREATE USER IF NOT EXISTS ''hearthcore_operator''@', QUOTE(@client_host), ' IDENTIFIED BY ', QUOTE(@operator_pw)), 'SELECT 1');
+PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @s = IF(@op_enabled = 1, CONCAT('ALTER USER ''hearthcore_operator''@', QUOTE(@client_host), ' IDENTIFIED BY ', QUOTE(@operator_pw)), 'SELECT 1');
+PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @oh = CONCAT('''hearthcore_operator''@''localhost'', ''hearthcore_operator''@', QUOTE(@client_host));
+SET @s = IF(@op_enabled = 1, 'REVOKE ALL PRIVILEGES, GRANT OPTION FROM ''hearthcore_operator''@''localhost''', 'SELECT 1');
+PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @s = IF(@op_enabled = 1, CONCAT('REVOKE ALL PRIVILEGES, GRANT OPTION FROM ''hearthcore_operator''@', QUOTE(@client_host)), 'SELECT 1');
+PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @s = IF(@op_enabled = 1, CONCAT('GRANT SELECT ON acore_characters.characters TO ', @oh), 'SELECT 1'); PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @s = IF(@op_enabled = 1, CONCAT('GRANT SELECT ON acore_characters.companion_proposals TO ', @oh), 'SELECT 1'); PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @s = IF(@op_enabled = 1, CONCAT('GRANT SELECT ON acore_world.item_template TO ', @oh), 'SELECT 1'); PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @s = IF(@op_enabled = 1, CONCAT('GRANT SELECT, INSERT, UPDATE, DELETE ON acore_characters.companion_weights TO ', @oh), 'SELECT 1'); PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @s = IF(@op_enabled = 1, CONCAT('GRANT SELECT, INSERT, UPDATE, DELETE ON acore_characters.companion_weight_overrides TO ', @oh), 'SELECT 1'); PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @s = IF(@op_enabled = 1, CONCAT('GRANT SELECT, INSERT, UPDATE ON acore_characters.companion_work_orders TO ', @oh), 'SELECT 1'); PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @s = IF(@op_enabled = 1, CONCAT('GRANT SELECT, UPDATE ON acore_characters.companion_schedule TO ', @oh), 'SELECT 1'); PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 FLUSH PRIVILEGES;

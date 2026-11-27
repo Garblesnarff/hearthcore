@@ -216,7 +216,7 @@
         ? d.humans
             .map(
               (h) =>
-                `<div class="human-chip" title="XP: ${h.xp.toLocaleString()} / ${h.xp_max.toLocaleString()} (${h.xp_pct}%)"><img class="human-avatar" src="/static/icons/race_${h.race_id}_${h.gender}.png" alt=""/><span style="color:${h.class_color}">★ ${esc(h.name)}</span><span>Lv ${h.level} (${Math.round(h.xp_pct)}%) · ${esc(h.zone)}</span></div>`
+                `<a class="human-chip char-link" href="/character/${encodeURIComponent(h.name.toLowerCase())}" title="Open ${esc(h.name)}'s Character Sheet · XP: ${h.xp.toLocaleString()} / ${h.xp_max.toLocaleString()} (${h.xp_pct}%)"><img class="human-avatar" src="/static/icons/race_${h.race_id}_${h.gender}.png" alt=""/><span style="color:${h.class_color}">★ ${esc(h.name)}</span><span>Lv ${h.level} (${Math.round(h.xp_pct)}%) · ${esc(h.zone)}</span></a>`
             )
             .join("")
         : `<div class="human-chip idle">No Humans Online</div>`;
@@ -287,8 +287,9 @@
   const botCardCache = new Map();
 
   function createBotCardEl(c) {
-    const el = document.createElement("div");
-    el.className = "bot-card";
+    const el = document.createElement("a");
+    el.className = "bot-card char-link";
+    el.href = `/character/${encodeURIComponent(c.name.toLowerCase())}`;
     el.dataset.bot = c.name;
     el.style.setProperty("--cls-color", c.class_color);
     el.innerHTML = `
@@ -826,7 +827,7 @@
           : `<span class="muted">Offline · ${esc(c.zone)}</span>`;
         return `
           <tr class="${c.online ? "" : "offline-row"}">
-            <td><b style="color:${c.class_color}">${esc(c.name)}</b> <span class="muted">${esc(c.race)} ${esc(c.class_short)}</span></td>
+            <td><a class="char-inline-link" href="/character/${encodeURIComponent(c.name.toLowerCase())}"><b style="color:${c.class_color}">${esc(c.name)}</b></a> <span class="muted">${esc(c.race)} ${esc(c.class_short)}</span></td>
             <td class="muted">${esc(SHIFT_LABELS[c.shift_group] || c.shift_group)}</td>
             <td>${esc(ROLE_LABELS[c.role] || c.role)}</td>
             <td class="mono">
@@ -1332,7 +1333,7 @@
               return `
                 <tr class="${p.active ? "" : "offline-row"}">
                   <td>
-                    <div><b style="color:${col}">${esc(name)}</b> ${comp.level ? `<span class="muted mono">Lv ${comp.level}</span>` : ""}</div>
+                    <div><a class="char-inline-link" href="/character/${encodeURIComponent(p.character_id)}"><b style="color:${col}">${esc(name)}</b></a> ${comp.level ? `<span class="muted mono">Lv ${comp.level}</span>` : ""}</div>
                     <div class="muted" style="font-size:10px;margin-top:2px"><span class="act-badge ${srcCls}">${esc(fmtModelShort(p.model || p.source))}</span> ${comp.archetype ? esc(comp.archetype) : ""}</div>
                   </td>
                   <td>

@@ -1357,6 +1357,15 @@ class BrainStore:
                     v TEXT NOT NULL
                 )
             """)
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS operator_directives (
+                    character_id TEXT PRIMARY KEY,
+                    note TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    consumed_at INTEGER NOT NULL DEFAULT 0
+                )
+            """)
             existing_cols = {r[1] for r in db.execute("PRAGMA table_info(plans)").fetchall()}
             for col, typ in [
                 ("start_level", "INTEGER NOT NULL DEFAULT 0"),
@@ -1401,6 +1410,78 @@ class BrainStore:
             db.execute(
                 "INSERT INTO brain_meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
                 (key, str(value)),
+            )
+
+    def set_operator_directive(
+        self,
+        slug: str,
+        note: str,
+        *,
+        now_ts: int | None = None,
+        ttl_hours: int = 24,
+    ) -> dict[str, Any]:
+        """Store or clear a bounded guild-leader directive for one companion's next Claude plan."""
+        ts = int(now_ts if now_ts is not None else time.time())
+        clean_slug = str(slug or "").strip().lower()
+        clean_note = re.sub(r"[\x00-\x1f\x7f]+", " ", str(note or "")).strip()[:240]
+        hours = max(1, min(168, int(ttl_hours)))
+        with self._conn() as db:
+            if not clean_note:
+                db.execute("DELETE FROM operator_directives WHERE character_id = ?", (clean_slug,))
+                return {"character_id": clean_slug, "note": "", "active": False, "updated_at": ts, "expires_at": 0, "consumed_at": 0}
+            exp = ts + hours * 3600
+            db.execute(
+                """
+                INSERT INTO operator_directives (character_id, note, updated_at, expires_at, consumed_at)
+                VALUES (?, ?, ?, ?, 0)
+                ON CONFLICT(character_id) DO UPDATE SET
+                    note = excluded.note,
+                    updated_at = excluded.updated_at,
+                    expires_at = excluded.expires_at,
+                    consumed_at = 0
+                """,
+                (clean_slug, clean_note, ts, exp),
+            )
+            return {
+                "character_id": clean_slug,
+                "note": clean_note,
+                "active": True,
+                "updated_at": ts,
+                "expires_at": exp,
+                "consumed_at": 0,
+            }
+
+    def get_operator_directive(self, slug: str, *, now_ts: int | None = None) -> dict[str, Any] | None:
+        """Return active unexpired operator directive for slug, or None."""
+        ts = int(now_ts if now_ts is not None else time.time())
+        clean_slug = str(slug or "").strip().lower()
+        with self._conn() as db:
+            row = db.execute(
+                """
+                SELECT character_id, note, updated_at, expires_at, consumed_at
+                FROM operator_directives
+                WHERE character_id = ? AND expires_at > ?
+                """,
+                (clean_slug, ts),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "character_id": str(row["character_id"]),
+                "note": str(row["note"]),
+                "active": True,
+                "updated_at": int(row["updated_at"]),
+                "expires_at": int(row["expires_at"]),
+                "consumed_at": int(row["consumed_at"] or 0),
+            }
+
+    def mark_operator_directive_consumed(self, slug: str, *, now_ts: int | None = None) -> None:
+        ts = int(now_ts if now_ts is not None else time.time())
+        clean_slug = str(slug or "").strip().lower()
+        with self._conn() as db:
+            db.execute(
+                "UPDATE operator_directives SET consumed_at = ? WHERE character_id = ? AND expires_at > ?",
+                (ts, clean_slug, ts),
             )
 
     def sync_sequence_floor(self, remote_max_rev: int) -> dict[str, Any]:
@@ -2253,6 +2334,8 @@ def run_cycle(
                     source = provider
                     meta: dict[str, Any] = {}
                     err_note = ""
+                    active_directive = store.get_operator_directive(slug, now_ts=now_ts)
+                    directive_note = active_directive["note"] if active_directive else None
 
                     if provider == "anthropic" and is_fallback_holdout(slug, day_key_utc):
                         source = "fallback_holdout"
@@ -2266,6 +2349,7 @@ def run_cycle(
                                 model=cfg_model,
                                 effort=cfg_effort,
                                 memory=mem_ctx["packet"],
+                                operator_directive=directive_note,
                                 budget=budget,
                                 caller="shadow_planner" if not apply else "planner",
                                 is_shadow=not apply,
@@ -2343,6 +2427,8 @@ def run_cycle(
                         # MySQL acknowledged! Finalize previous open plan and mark this one applied.
                         store.finalize_character_open_plans(slug, comp, now_ts, exclude_plan_id=plan_id)
                         store.mark_plan_applied(plan_id)
+                        if active_directive:
+                            store.mark_operator_directive_consumed(slug, now_ts=now_ts)
                         pending_plan_id = None
                         consecutive_apply_failures = 0
                         mem.record_plan_intention(slug, plan, primary_desc, now_ts)
