@@ -604,6 +604,118 @@ class MySQLIntegrationTests(unittest.TestCase):
         self.assertEqual(props["8002"], ("executing", "0"))
         self.assertEqual(props["8003"], ("interrupted", "0"))
 
+    def test_issue11_coop_group_binding_and_non_reserved_query(self) -> None:
+        """Issue #11: verify ReloadCoopMemberships SQL + atomic single-statement CAS bind with expiry on real MySQL 8.0."""
+        run_sql(
+            """
+            TRUNCATE TABLE companion_opportunities;
+            TRUNCATE TABLE companion_opportunity_interests;
+            TRUNCATE TABLE companion_personas;
+            TRUNCATE TABLE companion_persona_characters;
+
+            INSERT INTO companion_personas (persona_id, slug, faction, owner_group, profile_rev, state, enrolled_coop, created_at, updated_at)
+            VALUES
+              ('p1', 'brannoc', 'alliance', 'guild', 1, 'active', 1, 1000, 1000),
+              ('p2', 'kelda',   'alliance', 'guild', 1, 'active', 1, 1000, 1000),
+              ('p3', 'unreg',   'alliance', 'guild', 1, 'active', 0, 1000, 1000),
+              ('p4', 'stale',   'alliance', 'guild', 1, 'active', 1, 1000, 1000);
+
+            INSERT INTO companion_persona_characters (persona_id, realm_id, character_guid, incarnation, slot_kind, active, created_at)
+            VALUES
+              ('p1', 1, 101, 1, 'main', 1, 1000),
+              ('p2', 1, 102, 1, 'main', 1, 1000),
+              ('p3', 1, 103, 1, 'main', 1, 1000),
+              ('p4', 1, 104, 1, 'main', 1, 1000);
+
+            INSERT INTO companion_opportunities
+              (id, schema_version, revision, kind, creator_guid, faction, guild_id, dungeon_map_id, difficulty,
+               roles_json, state, created_at, recruit_until, estimated_minutes, group_guid, outcome_reason, is_shadow)
+            VALUES
+              (5001, 1, 2, 'dungeon_run', 101, 'alliance', 6, 36, 0, '{"tank":1,"healer":1,"damage":3}', 'assembling', 1000, 2000, 45, 0,   '', 0),
+              (5002, 1, 1, 'dungeon_run', 101, 'alliance', 6, 34, 0, '{"tank":1,"healer":1,"damage":3}', 'assembling', 1000, 2000, 45, 0,   '', 1),
+              (5003, 1, 1, 'dungeon_run', 101, 'alliance', 6, 34, 0, '{"tank":1,"healer":1,"damage":3}', 'active',     100,  200,  10, 777, '', 0),
+              (5004, 1, 1, 'dungeon_run', 101, 'alliance', 6, 34, 0, '{"tank":1,"healer":1,"damage":3}', 'active',     1000, 2000, 45, 888, '', 0),
+              (5005, 1, 1, 'dungeon_run', 101, 'alliance', 6, 34, 0, '{"tank":1,"healer":1,"damage":3}', 'active',     1000, 2000, 45, 0,   '', 0);
+
+            INSERT INTO companion_opportunity_interests
+              (opportunity_id, opportunity_revision, persona_id, character_guid, role, state, reason_code, available_until, reserved_until, created_at, updated_at)
+            VALUES
+              (5001, 2, 'p1', 101, 'tank',   'accepted', '', 5000, 0,    1000, 1000),
+              (5001, 2, 'p2', 102, 'healer', 'reserved', '', 5000, 3000, 1000, 1000),
+              (5001, 2, 'p3', 103, 'damage', 'accepted', '', 5000, 0,    1000, 1000),
+              (5001, 1, 'p4', 104, 'damage', 'accepted', '', 5000, 0,    1000, 1000),
+              (5002, 1, 'p1', 101, 'tank',   'accepted', '', 5000, 0,    1000, 1000),
+              (5005, 1, 'p1', 101, 'tank',   'active',   '', 5000, 0,    1000, 1000);
+            """
+        )
+
+        now = 2500
+        grace = 600
+        # Exact ReloadCoopMemberships query:
+        # - Excludes reserved (102), rev-mismatch (104), shadow (5002), expired (5003), AND zombie active+group_guid=0 (5005).
+        # - Uses EXISTS(companion_persona_characters) so multiple active incarnations never duplicate roster rows.
+        rows = run_sql(
+            f"SELECT o.id, i.character_guid, p.enrolled_coop, o.roles_json, "
+            f"EXISTS(SELECT 1 FROM companion_persona_characters pc "
+            f"  WHERE pc.persona_id = i.persona_id AND pc.character_guid = i.character_guid AND pc.active = 1) "
+            f"FROM companion_opportunities o "
+            f"JOIN ("
+            f"  SELECT id FROM companion_opportunities "
+            f"  WHERE is_shadow = 0 AND kind = 'dungeon_run' "
+            f"  AND (state = 'assembling' OR (state = 'active' AND group_guid > 0)) "
+            f"  AND (recruit_until + estimated_minutes * 60 + {grace}) > {now} "
+            f"  ORDER BY id ASC LIMIT 50"
+            f") active_ops ON active_ops.id = o.id "
+            f"JOIN companion_opportunity_interests i ON i.opportunity_id = o.id AND i.opportunity_revision = o.revision "
+            f"LEFT JOIN companion_personas p ON p.persona_id = i.persona_id "
+            f"WHERE i.state IN ('accepted', 'active') "
+            f"ORDER BY o.id ASC, i.character_guid ASC;",
+            expected_cols=5,
+        )
+        self.assertEqual(
+            rows,
+            [
+                ["5001", "101", "1", '{"tank":1,"healer":1,"damage":3}', "1"],
+                ["5001", "103", "0", '{"tank":1,"healer":1,"damage":3}', "1"],
+            ],
+        )
+
+        # Single-statement atomic UPDATE:
+        # 1) Active non-expired conflict (group_guid=888 held by active 5004) MUST block 5001 from binding 888!
+        run_sql(
+            f"UPDATE companion_opportunities SET group_guid = 888, state = 'active' "
+            f"WHERE id = 5001 AND revision = 2 AND is_shadow = 0 AND kind = 'dungeon_run' "
+            f"AND state IN ('assembling', 'active') AND (recruit_until + estimated_minutes * 60 + {grace}) > {now} "
+            f"AND (group_guid = 0 OR group_guid = 888) "
+            f"AND NOT EXISTS (SELECT 1 FROM ("
+            f"  SELECT id FROM companion_opportunities WHERE group_guid = 888 AND id <> 5001 "
+            f"  AND is_shadow = 0 AND state IN ('assembling', 'active') "
+            f"  AND (recruit_until + estimated_minutes * 60 + {grace}) > {now}"
+            f") AS active_conflict);"
+        )
+        self.assertEqual(run_sql("SELECT group_guid, state FROM companion_opportunities WHERE id = 5001;")[0], ["0", "assembling"])
+
+        # 2) Expired row (5003 holding recycled group_guid=777) MUST NOT block 5001 from binding 777!
+        run_sql(
+            f"UPDATE companion_opportunities SET group_guid = 777, state = 'active' "
+            f"WHERE id = 5001 AND revision = 2 AND is_shadow = 0 AND kind = 'dungeon_run' "
+            f"AND state IN ('assembling', 'active') AND (recruit_until + estimated_minutes * 60 + {grace}) > {now} "
+            f"AND (group_guid = 0 OR group_guid = 777) "
+            f"AND NOT EXISTS (SELECT 1 FROM ("
+            f"  SELECT id FROM companion_opportunities WHERE group_guid = 777 AND id <> 5001 "
+            f"  AND is_shadow = 0 AND state IN ('assembling', 'active') "
+            f"  AND (recruit_until + estimated_minutes * 60 + {grace}) > {now}"
+            f") AS active_conflict);"
+        )
+        self.assertEqual(run_sql("SELECT group_guid, state FROM companion_opportunities WHERE id = 5001;")[0], ["777", "active"])
+
+        # 3) Disband cleanup clears group_guid=777 cleanly.
+        run_sql(
+            "UPDATE companion_opportunities SET group_guid = 0 "
+            "WHERE group_guid = 777 AND is_shadow = 0 AND state IN ('assembling', 'active');"
+        )
+        self.assertEqual(run_sql("SELECT group_guid FROM companion_opportunities WHERE id = 5001;")[0], ["0"])
+
 
 if __name__ == "__main__":
     unittest.main()

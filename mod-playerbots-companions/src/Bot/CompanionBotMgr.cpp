@@ -7,6 +7,7 @@
 #include "CompanionBotMgr.h"
 
 #include "CompanionBrain.h"
+#include "CompanionCoopAuthLogic.h"
 #include "CompanionCraft.h"
 #include "CompanionClassStrategy.h"
 #include "CompanionGatherStrategy.h"
@@ -1272,11 +1273,30 @@ bool CompanionBotMgr::IsOwner(Player const* player) const
 {
     if (!player)
         return false;
-    uint32 const low = player->GetGUID().GetCounter();
-    if (_ownerLow.load() == low && low != 0)
+    return IsAnyOwnerLow(player->GetGUID().GetCounter());
+}
+
+bool CompanionBotMgr::IsAnyOwnerLow(uint32 lowGuid) const
+{
+    if (!lowGuid)
+        return false;
+    if (_ownerLow.load() == lowGuid)
         return true;
     std::lock_guard<std::mutex> lock(_stateMutex);
-    return _allOwnerLows.count(low) > 0;
+    return _allOwnerLows.count(lowGuid) > 0;
+}
+
+bool CompanionBotMgr::IsCompanionSlot(ObjectGuid guid, std::string const& slotName) const
+{
+    if (!slotName.empty() && IsCompanionName(slotName))
+        return true;
+    if (guid)
+    {
+        std::string cachedName;
+        if (sCharacterCache->GetCharacterNameByGuid(guid, cachedName) && IsCompanionName(cachedName))
+            return true;
+    }
+    return false;
 }
 
 bool CompanionBotMgr::IsGroupedWithOwner(Player const* bot) const
@@ -1288,30 +1308,50 @@ bool CompanionBotMgr::IsGroupedWithOwner(Player const* bot) const
     return group && ownerLow && group->IsMember(ObjectGuid::Create<HighGuid::Player>(ownerLow));
 }
 
+namespace
+{
+CompanionCoopAuth::NativeGroupSnapshot BuildCoopGroupSnapshot(CompanionBotMgr const& mgr, Group const* group)
+{
+    CompanionCoopAuth::NativeGroupSnapshot snap;
+    if (!group)
+        return snap;
+
+    snap.groupId = group->GetGUID().GetCounter();
+    snap.groupToken = CompanionBrain::GroupTokenFor(group);
+    snap.isRaid = group->isRaidGroup();
+    snap.isBg = group->isBGGroup();
+    snap.isBf = group->isBFGroup();
+    snap.isLfg = group->isLFGGroup();
+    snap.dungeonDifficulty = static_cast<uint8>(group->GetDungeonDifficulty());
+    snap.leaderGuid = group->GetLeaderGUID().GetCounter();
+    snap.inviteeCount = group->GetInviteeCount();
+
+    // Inspect ALL MemberSlots (online AND offline!) so an offline human or unapproved bot can NEVER bypass the guard.
+    // Avoid reading mutable map/instance fields off other players (cross-map-thread safe).
+    for (Group::MemberSlot const& slot : group->GetMemberSlots())
+    {
+        CompanionCoopAuth::NativeGroupMember m;
+        m.guid = slot.guid.GetCounter();
+        Player const* onlinePlayer = ObjectAccessor::FindConnectedPlayer(slot.guid);
+        m.online = (onlinePlayer != nullptr);
+        m.isOwner = mgr.IsAnyOwnerLow(m.guid);
+        m.isCompanion = mgr.IsCompanionSlot(slot.guid, slot.name);
+        snap.members.push_back(m);
+    }
+    return snap;
+}
+}  // namespace
+
 bool CompanionBotMgr::IsInAuthorizedCoopGroup(Player const* bot) const
 {
     if (!bot || !CompanionBrain::CoopEnabled())
         return false;
     Group const* group = bot->GetGroup();
-    if (!group || group->isRaidGroup())
-        return false;  // Phase II: strictly 5-player dungeon parties, NEVER autonomous raids!
-
-    uint64 oppId = 0;
-    uint32 targetMap = 0;
-    uint32 expectedGroup = 0;
-    if (!CompanionBrain::IsAuthorizedCoopMember(bot->GetGUID().GetCounter(), oppId, targetMap, expectedGroup))
+    if (!group)
         return false;
 
-    // Never auto-control a group containing an unrecognized human player
-    for (GroupReference const* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
-    {
-        Player const* member = itr->GetSource();
-        if (!member)
-            continue;
-        if (!IsCompanion(member))
-            return false;
-    }
-    return true;
+    CompanionCoopAuth::NativeGroupSnapshot snap = BuildCoopGroupSnapshot(*this, group);
+    return CompanionBrain::AuthorizeCoopGroup(bot, snap, /*allowQueueBind=*/false);
 }
 
 void CompanionBotMgr::RepairHeirlooms(Player* bot, std::vector<std::string>& report)
@@ -1410,7 +1450,7 @@ void CompanionBotMgr::ApplyLeadStrategies(PlayerbotAI* botAI)
         return;
 
     bool dungeon = bot->GetMap() && (bot->GetMap()->IsDungeon() || bot->GetMap()->IsRaid());
-    bool groupAllowed = IsGroupedWithOwner(bot) || (bot->GetMap() && bot->GetMap()->IsDungeon() && IsInAuthorizedCoopGroup(bot));
+    bool groupAllowed = IsGroupedWithOwner(bot) || (bot->GetMap() && bot->GetMap()->IsNonRaidDungeon() && IsInAuthorizedCoopGroup(bot));
     bool on = dungeon && groupAllowed && LeadModeOn(bot->GetGUID().GetCounter());
     bool lead = on && CompanionLead::IsGroupLead(bot);
     bool wantLead = on && lead;
@@ -1625,29 +1665,45 @@ void CompanionBotMgr::TickBot(PlayerbotAI* botAI)
         return;
     }
 
-    // Phase II (Card II-05): Explicit COMPANION_COOPERATIVE mode for authorized bot-only 5-player
+    // Phase II (Card II-05, Issue #11): Explicit COMPANION_COOPERATIVE mode for authorized bot-only 5-player
     // dungeon groups (gated by AiPlayerbot.Companion.Coop.Enabled=0 by default). Owner groups ALWAYS
-    // take precedence above; arbitrary/unrecognized groups are still disbanded below.
-    if (group && IsInAuthorizedCoopGroup(bot))
+    // take precedence above; bounded partial assembly is permitted without granting cooperative dungeon control;
+    // arbitrary, expired, mismatched, raid, or unrecognized groups are disbanded below.
+    if (group && CompanionBrain::CoopEnabled())
     {
-        CompanionLease::RequestInterrupt(bot, CompanionLease::Interrupt::Group);
-        Player* leader = ObjectAccessor::FindConnectedPlayer(group->GetLeaderGUID());
-        bool const isLeader = (leader == bot);
-        if (botAI->GetCompanionMode() != PlayerbotAI::COMPANION_COOPERATIVE)
+        bool assemblyInProgress = false;
+        std::string coopReason;
+        CompanionCoopAuth::NativeGroupSnapshot snap = BuildCoopGroupSnapshot(*this, group);
+        if (CompanionBrain::AuthorizeCoopGroup(bot, snap, /*allowQueueBind=*/true, &assemblyInProgress, &coopReason))
         {
-            if (isLeader)
-                botAI->ChangeStrategy("-follow,-stay,-new rpg,-quest,-gather,-grind,-companion duty,-companion quest",
-                                      BOT_STATE_NON_COMBAT);
-            else
-                botAI->ChangeStrategy("+follow,-stay,-new rpg,-quest,-gather,-grind,-companion duty,-companion quest",
-                                      BOT_STATE_NON_COMBAT);
-            botAI->SetCompanionMode(PlayerbotAI::COMPANION_COOPERATIVE);
-            CompanionDuty::CompleteDuty(bot->GetGUID().GetCounter(), "cleared: cooperative dungeon group",
-                                        CompanionDuty::DutyEnd::Interrupted, "interrupt:coop_group");
+            CompanionLease::RequestInterrupt(bot, CompanionLease::Interrupt::Group);
+            Player* leader = ObjectAccessor::FindConnectedPlayer(group->GetLeaderGUID());
+            bool const isLeader = (leader == bot);
+            if (botAI->GetCompanionMode() != PlayerbotAI::COMPANION_COOPERATIVE)
+            {
+                if (isLeader)
+                    botAI->ChangeStrategy("-follow,-stay,-new rpg,-quest,-gather,-grind,-companion duty,-companion quest",
+                                          BOT_STATE_NON_COMBAT);
+                else
+                    botAI->ChangeStrategy("+follow,-stay,-new rpg,-quest,-gather,-grind,-companion duty,-companion quest",
+                                          BOT_STATE_NON_COMBAT);
+                botAI->SetCompanionMode(PlayerbotAI::COMPANION_COOPERATIVE);
+                CompanionDuty::CompleteDuty(bot->GetGUID().GetCounter(), "cleared: cooperative dungeon group",
+                                            CompanionDuty::DutyEnd::Interrupted, "interrupt:coop_group");
+            }
+            if (!isLeader && leader && botAI->GetMaster() != leader)
+                botAI->SetMaster(leader);
+            return;
         }
-        if (!isLeader && leader && botAI->GetMaster() != leader)
-            botAI->SetMaster(leader);
-        return;
+        if (assemblyInProgress)
+        {
+            // Bounded proposal-to-group assembly transition (or queued world-thread DB bind): keep group intact
+            // while waiting for exact full roster confirmation, without granting cooperative dungeon control yet.
+            return;
+        }
+        if (coopReason != "not_authorized_member")
+            LOG_WARN("playerbots", "[Companion] {} coop group {} rejected ({})", bot->GetName(),
+                     group->GetGUID().GetCounter(), coopReason);
     }
 
     // Not with the owner (and not in an authorized cooperative group): any stray group ends.

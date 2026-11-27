@@ -15,9 +15,15 @@
 
 #include "Define.h"
 
+class Group;
 class Item;
 struct ItemTemplate;
+class Player;
 class PlayerbotAI;
+namespace CompanionCoopAuth
+{
+struct NativeGroupSnapshot;
+}
 
 // Companion brain: bag item classes and per-companion weights (acore_characters.companion_weights).
 //
@@ -95,9 +101,20 @@ public:
                                       uint64 expectedOrderId = 0, uint32 expectedSnapshotRev = 0);
     static void ReloadProposals();
 
-    // Phase II Cooperative Mode (Cards II-05/II-06, gated by AiPlayerbot.Companion.Coop.Enabled = 0 by default).
+    // Phase II Cooperative Mode (Cards II-05/II-06, Issue #11, gated by AiPlayerbot.Companion.Coop.Enabled = 0).
     static bool CoopEnabled();
     static bool IsAuthorizedCoopMember(uint32 lowGuid, uint64& outOppId, uint32& outTargetMap, uint32& outGroupId);
+    // Any thread (pure in-memory, never blocks map threads on DB I/O). When allowQueueBind=true (TickBot),
+    // ready-to-bind groups are queued for atomic world-thread DB commit and outAssemblyInProgress is set true.
+    static bool AuthorizeCoopGroup(Player const* bot, CompanionCoopAuth::NativeGroupSnapshot const& snap,
+                                   bool allowQueueBind = false, bool* outAssemblyInProgress = nullptr,
+                                   std::string* outReason = nullptr);
+    // GroupScript lifecycle hooks & monotonic token lookup (real group-ID reuse & disband protection).
+    static uint64 GroupTokenFor(Group const* group);
+    static uint64 OnNativeGroupCreated(Group const* group);
+    static void OnNativeGroupDisbanded(Group const* group);
+    // World thread only: flushes queued binds/disbands atomically to MySQL and reloads memberships.
+    static void FlushCoopGroupMutations();
     static void ReloadCoopMemberships();
 
     static constexpr uint32 WEIGHT_REFRESH_MS = 300000;
