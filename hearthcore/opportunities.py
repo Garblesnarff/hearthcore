@@ -85,11 +85,30 @@ class NativeReconcileSnapshot:
     active_run_ids: frozenset[str] | None = None
     # correlation_key -> {"native_state": ..., "native_queue_id": ..., "group_id": ..., "native_run_id": ...}
     correlation_map: dict[str, dict[str, Any]] | None = None
+    # opportunity_id -> outcome_reason for runs neutrally drained on the native MySQL side (Issue #22)
+    drained_outcomes: dict[int, str] | None = None
+
+
+def coop_mode() -> str:
+    """Global 3-state Phase II cooperative admission mode: 'off' | 'draining' | 'enabled' (Issue #22).
+
+    Safe default is 'off'. When 'draining' or 'off', new admissions are blocked while already-committed
+    native groups finish combat safely and drain at a safe boundary.
+    """
+    raw_mode = (os.getenv("HEARTHCORE_COOP_MODE") or "").strip().lower()
+    if raw_mode in ("draining", "drain"):
+        return "draining"
+    if raw_mode in ("enabled", "on", "1", "true", "yes"):
+        return "enabled"
+    if raw_mode in ("off", "disabled", "0", "false", "no"):
+        return "off"
+    flag = (os.getenv("HEARTHCORE_COOP_ENABLED") or "0").strip().lower()
+    return "enabled" if flag in ("1", "true", "yes", "on") else "off"
 
 
 def coop_enabled() -> bool:
-    """Global feature flag for live Phase II cooperative execution (default False = safe off)."""
-    return (os.getenv("HEARTHCORE_COOP_ENABLED") or "0").strip().lower() in ("1", "true", "yes", "on")
+    """True ONLY when cooperative admission mode is 'enabled' (default False = safe off)."""
+    return coop_mode() == "enabled"
 
 
 def _valid_nonneg_float(val: Any) -> float | None:
@@ -1454,7 +1473,7 @@ class OpportunityCoordinator:
             opp_rev = int(opp["revision"])
 
             # Late handoff after cancellation/expiry -> instruct caller to tear down any orphaned native queue!
-            if opp_state in ("cancelled", "expired", "aborted"):
+            if opp_state in ("cancelled", "expired", "aborted", "drained"):
                 conn.execute("ROLLBACK")
                 return {
                     "ok": False,
@@ -1567,7 +1586,7 @@ class OpportunityCoordinator:
         q_id = str(native_queue_id or "").strip()[:64]
         g_id = max(0, int(group_id or 0))
         out_s = str(outcome or "").strip().lower()
-        if out_s not in ("completed", "aborted", "failed", "disbanded"):
+        if out_s not in ("completed", "aborted", "failed", "disbanded", "drained"):
             return {"ok": False, "reason": f"invalid_outcome:{out_s}"}
 
         conn = self._conn()
@@ -1587,12 +1606,12 @@ class OpportunityCoordinator:
             stored_run = str(opp["native_run_id"] or "")
             stored_q = str(opp["native_queue_id"] or "")
             stored_g = int(opp["group_id"] or 0)
-            target_state = "completed" if out_s == "completed" else "aborted"
+            target_state = "completed" if out_s == "completed" else ("drained" if out_s == "drained" else "aborted")
 
             # Idempotent duplicate terminal callback with matching run ID
             if opp_state == target_state and (
                 (r_id and stored_run == r_id)
-                or (target_state == "aborted" and not stored_run and ((q_id and q_id == stored_q) or (g_id > 0 and g_id == stored_g)))
+                or (target_state in ("aborted", "drained") and not stored_run and ((q_id and q_id == stored_q) or (g_id > 0 and g_id == stored_g)))
             ):
                 conn.execute("COMMIT")
                 return {"ok": True, "idempotent": True, "state": opp_state, "revision": opp_rev}
@@ -1705,12 +1724,14 @@ class OpportunityCoordinator:
                     "adopted_confirmed": 0,
                     "lost_confirmed_released": 0,
                     "aborted_missing_native": 0,
+                    "drained_reconciled": 0,
                 }
 
             groups = snap.active_group_ids
             queues = snap.active_queue_ids
             runs = snap.active_run_ids
             corr_map = snap.correlation_map or {}
+            drained_map = snap.drained_outcomes or {}
 
             # 1. Reconcile live 'confirmed' opportunities via deterministic correlation_key:
             #    Adopt into 'active' if native created it (lost response!); cancel ONLY if absent & past confirm_until!
@@ -1752,13 +1773,30 @@ class OpportunityCoordinator:
                         (ts, oid),
                     ).rowcount
 
-            # 2. Reconcile live 'active'/'cancelling' opportunities ONLY when every relevant native ID set is known (non-None!)
+            # 2. Reconcile live 'active'/'cancelling' opportunities:
+            #    - First map native 'drained' outcomes neutrally (Issue #22) so draining/off mode never aborts them!
+            #    - Otherwise abort ONLY when every relevant native ID set is known (non-None!) and run is gone.
             aborted_missing = 0
+            drained_reconciled = 0
             for r in conn.execute(
                 "SELECT id, state, group_id, native_queue_id, native_run_id FROM opportunities "
                 "WHERE state IN ('active','cancelling') AND is_shadow=0"
             ).fetchall():
                 oid = int(r["id"])
+                if oid in drained_map:
+                    reason_txt = (str(drained_map[oid] or "coop_drained").strip() or "coop_drained")[:120]
+                    conn.execute(
+                        "UPDATE opportunity_interests SET state='released', reserved_until=0, "
+                        "reason_code=?, updated_at=? "
+                        "WHERE opportunity_id=? AND state IN ('active','accepted','reserved')",
+                        (reason_txt[:64], ts, oid),
+                    )
+                    drained_reconciled += conn.execute(
+                        "UPDATE opportunities SET state='drained', native_state='drained', "
+                        "outcome_reason=?, ended_at=?, revision=revision+1 WHERE id=?",
+                        (reason_txt, ts, oid),
+                    ).rowcount
+                    continue
                 gid = int(r["group_id"] or 0)
                 qid = str(r["native_queue_id"] or "").strip()
                 rid = str(r["native_run_id"] or "").strip()
@@ -1800,6 +1838,7 @@ class OpportunityCoordinator:
                 "adopted_confirmed": adopted,
                 "lost_confirmed_released": lost_confirmed,
                 "aborted_missing_native": aborted_missing,
+                "drained_reconciled": drained_reconciled,
             }
         except Exception:
             if conn.in_transaction:

@@ -359,8 +359,15 @@ bool LfgLeaveAction::Execute(Event /*event*/)
     // otherwise pulls random bots straight back out, so LFGQueue::CheckCompatibility never
     // sees a role-complete pool that holds still long enough to form a group. Turning
     // RandomBotJoinLfg off still lets whoever is mid-queue fall through and leave.
-    // Config bool is tested first so the O(currentBots) IsRandomBot() scan is skipped
-    // whenever the feature is disabled.
+    // Issue #22: When coop admission mode is Off or Draining, cancel pending queued companions cleanly.
+    if (sCompanionBotMgr.IsCompanion(bot) && !sCompanionBotMgr.IsGroupedWithOwner(bot))
+    {
+        if (CompanionBrain::CoopEnabled())
+            return false;
+        WorldPacket* packet = new WorldPacket(CMSG_LFG_LEAVE);
+        bot->GetSession()->QueuePacket(packet);
+        return true;
+    }
     if (sPlayerbotAIConfig.randomBotJoinLfg && RandomPlayerbotMgr::instance().IsRandomBot(bot))
         return false;
 

@@ -86,6 +86,7 @@ public:
             {"create", HandleCompanionCreateCommand, SEC_GAMEMASTER, Console::Yes},
             {"schedule", HandleCompanionScheduleCommand, SEC_GAMEMASTER, Console::Yes},
             {"life", HandleCompanionLifeCommand, SEC_GAMEMASTER, Console::Yes},
+            {"recall", HandleCompanionRecallCommand, SEC_GAMEMASTER, Console::Yes},
         };
 
         static ChatCommandTable commandTable = {
@@ -120,6 +121,46 @@ public:
         std::ostringstream out;
         out << "quest " << ev.questId << ", " << (nowSec - ev.atSec) << "s ago";
         return out.str();
+    }
+
+    static bool HandleCompanionRecallCommand(ChatHandler* handler, char const* args)
+    {
+        std::string target = args ? args : "";
+        while (!target.empty() && std::isspace(static_cast<unsigned char>(target.front())))
+            target.erase(target.begin());
+        while (!target.empty() && std::isspace(static_cast<unsigned char>(target.back())))
+            target.pop_back();
+        if (target.empty())
+        {
+            handler->PSendSysMessage("Usage: .companion recall <companionName|all>");
+            return true;
+        }
+        std::string lowerTarget = target;
+        std::transform(lowerTarget.begin(), lowerTarget.end(), lowerTarget.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        uint32 matched = 0;
+        uint32 recalled = 0;
+        for (std::string const& name : sCompanionBotMgr.CompanionNames())
+        {
+            std::string lowerName = name;
+            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (lowerTarget != "all" && lowerName != lowerTarget)
+                continue;
+            if (ObjectGuid guid = sCharacterCache->GetCharacterGuidByName(name))
+            {
+                ++matched;
+                if (CompanionBrain::RequestCoopOwnerRecall(guid.GetCounter()))
+                    ++recalled;
+            }
+        }
+        if (matched == 0)
+            handler->PSendSysMessage("No configured companion matched '{}'.", target);
+        else if (recalled == 0)
+            handler->PSendSysMessage("Matched {} companion(s), none currently in a committed cooperative group.", matched);
+        else
+            handler->PSendSysMessage("Requested safe-boundary cooperative recall for {} active cooperative companion(s).", recalled);
+        return true;
     }
 
     static bool HandleCompanionRepairCommand(ChatHandler* handler, char const* /*args*/)
@@ -1086,7 +1127,7 @@ class CompanionCoopGroupScript : public GroupScript
 {
 public:
     CompanionCoopGroupScript()
-        : GroupScript("CompanionCoopGroupScript", {GROUPHOOK_ON_CREATE, GROUPHOOK_ON_DISBAND})
+        : GroupScript("CompanionCoopGroupScript", {GROUPHOOK_ON_CREATE, GROUPHOOK_ON_REMOVE_MEMBER, GROUPHOOK_ON_DISBAND})
     {
     }
 
@@ -1094,6 +1135,15 @@ public:
     {
         if (group)
             CompanionBrain::OnNativeGroupCreated(group);
+    }
+
+    void OnRemoveMember(Group* group, ObjectGuid guid, RemoveMethod method, ObjectGuid /*kicker*/,
+                        char const* /*reason*/) override
+    {
+        // Guard against LFG vote-kick initiation (GROUP_REMOVEMETHOD_KICK does not immediately remove the player).
+        if (!group || !guid || (group->isLFGGroup(true) && method == GROUP_REMOVEMETHOD_KICK))
+            return;
+        CompanionBrain::OnNativeGroupMemberRemoved(group, guid.GetCounter());
     }
 
     void OnDisband(Group* group) override
