@@ -264,9 +264,12 @@ def main():
 
         if args.command == "phase2-benchmark":
             from .benchmark import run_live_baseline_benchmark
+            from .bridge import BRAIN_DB_PATH
+            from .character_ctl import run_read_sql
             art = run_live_baseline_benchmark(
                 scenario=args.scenario, sample_count=args.samples, interval_sec=args.interval,
-                warmup_sec=args.warmup, min_duration_sec=args.min_duration
+                warmup_sec=args.warmup, min_duration_sec=args.min_duration,
+                brain_db_path=BRAIN_DB_PATH, sql_exec=run_read_sql,
             )
             print(f"Benchmark saved: {art['saved_path']}")
             print(f"Metrics: {art['metrics']} | correctness={art['all_correctness_passed']} | sha256={art['artifact_sha256'][:16]}")
