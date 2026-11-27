@@ -1501,6 +1501,8 @@ def _read_shadow_db_context_readonly(db_path: Path, *, now_ts: int) -> dict[str,
         "paused_slugs": set(),
         "busy_personas": set(),
         "queued_by_dungeon": {},
+        "future_intents_by_dungeon": {},
+        "future_commitments_by_dungeon": {},
     }
     if not db_path.is_file():
         return out
@@ -1564,6 +1566,83 @@ def _read_shadow_db_context_readonly(db_path: Path, *, now_ts: int) -> dict[str,
                 }
                 if st in ("reserved", "accepted"):
                     out["busy_personas"].add(pid)
+
+        if "future_dungeon_intents" in tables:
+            for r in conn.execute(
+                """
+                SELECT dungeon_id, persona_id, realm_id, character_guid, character_slug, faction,
+                       roles_json, earliest_start_ts, latest_end_ts, expires_at
+                FROM future_dungeon_intents
+                WHERE is_shadow = 1 AND state = 'open' AND expires_at > ? AND latest_end_ts > ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (int(now_ts), int(now_ts)),
+            ).fetchall():
+                # P2-9: Apply PersonaRegistry identity/core filter so quarantined/core personas never leak into shadow report!
+                if out["has_registry"]:
+                    rec = out["enrollments"].get((int(r["realm_id"]), int(r["character_guid"])))
+                    if (
+                        rec is None
+                        or rec["persona_id"] != str(r["persona_id"])
+                        or rec["state"] != "active"
+                        or not rec["char_active"]
+                        or not rec["enrolled_coop"]
+                    ):
+                        continue
+                try:
+                    roles_parsed = json.loads(str(r["roles_json"] or "[]"))
+                except (ValueError, TypeError) as exc:
+                    logger.warning("Skipping malformed roles_json in shadow intent read: %s", exc)
+                    continue
+                did = str(r["dungeon_id"])
+                out["future_intents_by_dungeon"].setdefault(did, []).append({
+                    "persona_id": str(r["persona_id"]),
+                    "slug": str(r["character_slug"]),
+                    "faction": str(r["faction"]),
+                    "roles": roles_parsed,
+                    "earliest_start_ts": int(r["earliest_start_ts"]),
+                    "latest_end_ts": int(r["latest_end_ts"]),
+                    "expires_at": int(r["expires_at"]),
+                })
+
+        if "future_commitments" in tables:
+            for r in conn.execute(
+                """
+                SELECT id, dungeon_id, faction, window_start, window_end, state, accept_until, is_shadow
+                FROM future_commitments
+                WHERE is_shadow = 1 AND state IN ('proposed', 'scheduled', 'activating', 'activated') AND window_end > ?
+                ORDER BY window_start ASC, id ASC
+                """,
+                (int(now_ts),),
+            ).fetchall():
+                did = str(r["dungeon_id"])
+                out["future_commitments_by_dungeon"].setdefault(did, []).append({
+                    "commitment_id": int(r["id"]),
+                    "faction": str(r["faction"]),
+                    "window_start": int(r["window_start"]),
+                    "window_end": int(r["window_end"]),
+                    "state": str(r["state"]),
+                    "accept_until": int(r["accept_until"]),
+                    "is_shadow": bool(int(r["is_shadow"])),
+                })
+
+            # P1-8: Mark personas with imminent LIVE scheduled/activating commitments as busy!
+            if "future_commitment_members" in tables:
+                lead_cutoff = int(now_ts) + 900
+                for mr in conn.execute(
+                    """
+                    SELECT DISTINCT m.persona_id
+                    FROM future_commitment_members m
+                    JOIN future_commitments c ON c.id = m.commitment_id
+                    WHERE c.is_shadow = 0
+                      AND c.state IN ('scheduled', 'activating')
+                      AND m.state IN ('accepted', 'activated')
+                      AND c.window_start <= ?
+                      AND c.window_end > ?
+                    """,
+                    (lead_cutoff, int(now_ts)),
+                ).fetchall():
+                    out["busy_personas"].add(str(mr["persona_id"]))
     except sqlite3.Error as exc:
         out["ok"] = False
         out["errors"].append(f"{type(exc).__name__}: {exc}")
@@ -2090,6 +2169,8 @@ def run_shadow_match_snapshot(
     paused_slugs = db_ctx["paused_slugs"]
     busy_personas = db_ctx["busy_personas"]
     queued_by_dungeon = db_ctx["queued_by_dungeon"]
+    future_intents_by_dungeon = db_ctx["future_intents_by_dungeon"]
+    future_commitments_by_dungeon = db_ctx["future_commitments_by_dungeon"]
     companions = world_ctx.get("companions") or {}
 
     known = set(profiles())
@@ -2421,6 +2502,8 @@ def run_shadow_match_snapshot(
             "excluded_reasons": excluded_reasons,
             "unknown_telemetry_count": unknown_telemetry,
             "missing_identity_fallback_count": missing_identity,
+            "future_intents": future_intents_by_dungeon.get(spec.dungeon_id, []),
+            "future_commitments": future_commitments_by_dungeon.get(spec.dungeon_id, []),
             "candidates": pool_by_role,
         })
 
