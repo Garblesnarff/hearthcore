@@ -1,0 +1,12 @@
+## Interface: 30300
+## Title: LoganReads
+## Notes: Early-reader quest text for Logan
+## Author: wonky
+## Version: 1.2
+## SavedVariablesPerCharacter: LoganReadsPC
+## SavedVariables: LoganReadsLog, LoganReadsCoachLog
+LoganReads_Audio.lua
+LoganReads_Coach_Audio.lua
+LoganReads_Data.lua
+LoganReads.lua
+LoganReads_Coach.lua
