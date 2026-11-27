@@ -1291,6 +1291,9 @@
     const resCount = Object.keys(mem.active_reservations || {}).length;
 
     $("brain-active-badge").textContent = `${activeCnt} active · ${resCount} reserved orders${opAlerts.length ? ` · ⚠ ${opAlerts.length} stall alert${opAlerts.length > 1 ? "s" : ""}` : ""}`;
+    const emptyPlansMsg = ab.redacted
+      ? `<tr><td colspan="5" class="empty-note">🔒 Admin session locked or expired — click <b>🔒 Unlock Admin</b> above to view companion plans &amp; Claude decisions.</td></tr>`
+      : `<tr><td colspan="5" class="empty-note">No AI Brain session plans recorded yet.</td></tr>`;
     const plansHtml =
       activeList.length > 0
         ? activeList
@@ -1343,11 +1346,14 @@
                 </tr>`;
             })
             .join("")
-        : `<tr><td colspan="5" class="empty-note">No AI Brain session plans recorded yet.</td></tr>`;
+        : emptyPlansMsg;
     setHtmlIfChanged($("brain-plans-tbody"), plansHtml);
 
     const hist = ab.history || [];
-    $("brain-hist-badge").textContent = `${hist.length} recent`;
+    $("brain-hist-badge").textContent = ab.redacted ? "locked" : `${hist.length} recent`;
+    const emptyHistMsg = ab.redacted
+      ? `<div class="empty-note">🔒 Admin session locked or expired — click <b>🔒 Unlock Admin</b> above.</div>`
+      : `<div class="empty-note">No decisions logged yet.</div>`;
     const histHtml =
       hist.length > 0
         ? hist
@@ -1372,11 +1378,18 @@
                 </div>`;
             })
             .join("")
-        : `<div class="empty-note">No decisions logged yet.</div>`;
+        : emptyHistMsg;
     setHtmlIfChanged($("brain-history-list"), histHtml);
   }
 
   function render(d) {
+    if (d && typeof d.view_mode === "string") {
+      const nextAuth = d.view_mode === "admin";
+      if (nextAuth !== adminUnlocked) {
+        adminUnlocked = nextAuth;
+        updateAdminBtn();
+      }
+    }
     renderHeader(d);
     if (state.view === "overview") renderOverview(d);
     else if (state.view === "vault") renderVaultView(d);
