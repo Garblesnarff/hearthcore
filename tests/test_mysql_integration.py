@@ -126,6 +126,7 @@ class MySQLIntegrationTests(unittest.TestCase):
         CREATE TABLE IF NOT EXISTS acore_auth.account (id INT PRIMARY KEY, username VARCHAR(32), verifier VARBINARY(32));
         CREATE TABLE IF NOT EXISTS acore_auth.realmlist (id INT PRIMARY KEY, name VARCHAR(32), address VARCHAR(32), port INT, flag INT);
         CREATE TABLE IF NOT EXISTS acore_world.item_template (entry INT PRIMARY KEY, name VARCHAR(64));
+        CREATE TABLE IF NOT EXISTS acore_world.quest_template (ID INT PRIMARY KEY, QuestLevel INT, LogTitle VARCHAR(128));
         CREATE TABLE IF NOT EXISTS acore_world.player_xp_for_level (level INT PRIMARY KEY, Experience INT);
         INSERT IGNORE INTO acore_auth.account (id, username, verifier) VALUES (1, 'Tester', UNHEX('AABBCC'));
         """
@@ -133,6 +134,7 @@ class MySQLIntegrationTests(unittest.TestCase):
         users_sql = (ROOT / "ops" / "sql" / "create_least_priv_users.sql").read_text(encoding="utf-8")
         brain_pw = "BrainTestPass1234567890!"
         watch_pw = "WatchTestPass1234567890!"
+        operator_pw = "OperatorTestPass1234567!"
 
         # Discover exact client host IP seen by MySQL container (e.g. 172.18.0.1 in CI Docker bridge)
         client_host_res = subprocess.run(
@@ -149,7 +151,7 @@ class MySQLIntegrationTests(unittest.TestCase):
                 stub_ddl
                 + "\nUSE acore_characters;\n"
                 + schema_sql
-                + f"\nSET @client_host='{client_host}'; SET @brain_pw='{brain_pw}'; SET @watch_pw='{watch_pw}';\n"
+                + f"\nSET @client_host='{client_host}'; SET @brain_pw='{brain_pw}'; SET @watch_pw='{watch_pw}'; SET @operator_pw='{operator_pw}';\n"
                 + users_sql
             ).encode("utf-8"),
             check=True,
@@ -165,9 +167,11 @@ class MySQLIntegrationTests(unittest.TestCase):
                 env=dict(os.environ, MYSQL_PWD=pw),
             )
 
-        # 1. azeroth_watch CAN read allowed columns and CANNOT read account.verifier or write anything!
+        # 1. azeroth_watch CAN read allowed columns + quest_template and CANNOT read account.verifier or write anything!
         r_ok = run_as("azeroth_watch", watch_pw, "SELECT id, username FROM acore_auth.account;")
         self.assertEqual(r_ok.returncode, 0, r_ok.stderr.decode())
+        r_qt = run_as("azeroth_watch", watch_pw, "SELECT ID, LogTitle FROM acore_world.quest_template;")
+        self.assertEqual(r_qt.returncode, 0, r_qt.stderr.decode())
         r_col = run_as("azeroth_watch", watch_pw, "SELECT verifier FROM acore_auth.account;")
         self.assertNotEqual(r_col.returncode, 0, "azeroth_watch MUST NOT read account.verifier!")
         r_wr = run_as("azeroth_watch", watch_pw, "INSERT INTO acore_characters.companion_bank_requests (item_entry, requested_by, min_count, note) VALUES (1, 'x', 1, 'x');")
@@ -186,6 +190,18 @@ class MySQLIntegrationTests(unittest.TestCase):
         self.assertNotEqual(r_b_deny_canon.returncode, 0, "hearthcore_brain MUST NOT write canonical companion_weights!")
         r_b_deny_ver = run_as("hearthcore_brain", brain_pw, "SELECT verifier FROM acore_auth.account;")
         self.assertNotEqual(r_b_deny_ver.returncode, 0, "hearthcore_brain MUST NOT read account.verifier!")
+
+        # 3. hearthcore_operator CAN pin manual weights & update schedule, and CANNOT write characters or read account.verifier!
+        r_op_pin = run_as(
+            "hearthcore_operator", operator_pw,
+            "INSERT INTO acore_characters.companion_weights (guid, `key`, value, source) "
+            "VALUES (101, 'craft', 1.45, 'manual') ON DUPLICATE KEY UPDATE value=1.45, source='manual';",
+        )
+        self.assertEqual(r_op_pin.returncode, 0, r_op_pin.stderr.decode())
+        r_op_deny_chars = run_as("hearthcore_operator", operator_pw, "INSERT INTO acore_characters.characters (guid, name) VALUES (998, 'Hack');")
+        self.assertNotEqual(r_op_deny_chars.returncode, 0, "hearthcore_operator MUST NOT write characters!")
+        r_op_deny_ver = run_as("hearthcore_operator", operator_pw, "SELECT verifier FROM acore_auth.account;")
+        self.assertNotEqual(r_op_deny_ver.returncode, 0, "hearthcore_operator MUST NOT read account.verifier!")
 
     def test_world_context_and_supply_state_reads_migrations_and_reconcile_drift(self):
         import importlib.util
@@ -246,7 +262,7 @@ class MySQLIntegrationTests(unittest.TestCase):
         INSERT INTO `{db_name}`.character_skills VALUES (101, 164, 105, 150), (101, 186, 121, 150);
         INSERT INTO `{db_name}`.character_queststatus_rewarded VALUES (101, 1001), (101, 1002);
         INSERT INTO `{db_name}`.guild_bank_item VALUES (6, 9001);
-        INSERT INTO `{db_name}`.item_instance VALUES (9001, 2770, 40);
+        INSERT INTO `{db_name}`.item_instance (guid, itemEntry, count) VALUES (9001, 2770, 40);
         INSERT INTO `{db_name}`.companion_events (guid, event_type, summary, partner_guid, zone_id, created_at)
             VALUES (101, 'level_up', 'Brannoc reached 33', 0, 10, 1800000000);
         """
@@ -367,6 +383,125 @@ class MySQLIntegrationTests(unittest.TestCase):
             # Verify throwaway drill DB was cleanly dropped!
             leftover = run_sql("SHOW DATABASES LIKE 'hearthcore_restore_drill_%';")
             self.assertEqual(leftover, [], f"Throwaway drill DB was not cleaned up: {leftover}")
+
+    def test_character_sheet_and_direction_controls_against_real_mysql(self):
+        import subprocess
+        from hearthcore.character_ctl import (
+            apply_focus_preset,
+            create_character_work_order,
+            fetch_character_sheet,
+            set_character_ai_paused,
+            set_manual_weight,
+            update_character_schedule,
+        )
+
+        host = os.environ["HEARTHCORE_DB_HOST"]
+        port = os.environ.get("HEARTHCORE_DB_PORT", "3306")
+        db_name = os.environ["HEARTHCORE_DB_NAME"]
+        root_pw = os.environ["HEARTHCORE_DB_PASSWORD"]
+        env_root = dict(os.environ, MYSQL_PWD=root_pw)
+
+        ddl_and_seed = f"""
+        CREATE DATABASE IF NOT EXISTS acore_world;
+        CREATE TABLE IF NOT EXISTS acore_world.item_template (
+            entry INT PRIMARY KEY, name VARCHAR(64), Quality TINYINT DEFAULT 1,
+            ItemLevel SMALLINT DEFAULT 1, RequiredLevel TINYINT DEFAULT 1,
+            armor INT DEFAULT 0, InventoryType TINYINT DEFAULT 0
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        CREATE TABLE IF NOT EXISTS acore_world.quest_template (
+            ID INT PRIMARY KEY, QuestLevel SMALLINT DEFAULT 1, LogTitle VARCHAR(128)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        CREATE TABLE IF NOT EXISTS acore_world.player_xp_for_level (
+            level TINYINT PRIMARY KEY, Experience INT
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+        DROP TABLE IF EXISTS `{db_name}`.characters;
+        CREATE TABLE `{db_name}`.characters (
+            guid INT PRIMARY KEY, account INT NOT NULL, name VARCHAR(32) NOT NULL,
+            race TINYINT NOT NULL DEFAULT 1, class TINYINT NOT NULL DEFAULT 1, gender TINYINT NOT NULL DEFAULT 0,
+            level TINYINT UNSIGNED NOT NULL, xp INT NOT NULL DEFAULT 0, money INT NOT NULL DEFAULT 0,
+            zone INT NOT NULL DEFAULT 0, map INT NOT NULL DEFAULT 0, online TINYINT NOT NULL DEFAULT 0,
+            totaltime INT NOT NULL DEFAULT 0, health INT NOT NULL DEFAULT 100, power1 INT NOT NULL DEFAULT 0
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        DROP TABLE IF EXISTS `{db_name}`.character_inventory;
+        CREATE TABLE `{db_name}`.character_inventory (guid INT, bag INT, slot TINYINT, item INT);
+        DROP TABLE IF EXISTS `{db_name}`.item_instance;
+        CREATE TABLE `{db_name}`.item_instance (guid INT PRIMARY KEY, itemEntry INT, count INT DEFAULT 1, enchantments TEXT, durability INT DEFAULT 50);
+        DROP TABLE IF EXISTS `{db_name}`.character_stats;
+        CREATE TABLE `{db_name}`.character_stats (
+            guid INT PRIMARY KEY, maxhealth INT, maxpower1 INT, strength INT, agility INT, stamina INT,
+            intellect INT, spirit INT, armor INT, attackPower INT, rangedAttackPower INT, spellPower INT,
+            critPct FLOAT, rangedCritPct FLOAT, spellCritPct FLOAT, dodgePct FLOAT, parryPct FLOAT,
+            blockPct FLOAT, resilience INT
+        );
+        DROP TABLE IF EXISTS `{db_name}`.character_skills;
+        CREATE TABLE `{db_name}`.character_skills (guid INT, skill SMALLINT, value SMALLINT, max SMALLINT);
+        DROP TABLE IF EXISTS `{db_name}`.character_queststatus;
+        CREATE TABLE `{db_name}`.character_queststatus (guid INT, quest INT, status TINYINT);
+        DROP TABLE IF EXISTS `{db_name}`.character_queststatus_rewarded;
+        CREATE TABLE `{db_name}`.character_queststatus_rewarded (guid INT, quest INT);
+        DROP TABLE IF EXISTS `{db_name}`.character_reputation;
+        CREATE TABLE `{db_name}`.character_reputation (guid INT, faction SMALLINT, standing INT, flags TINYINT);
+        DROP TABLE IF EXISTS `{db_name}`.character_homebind;
+        CREATE TABLE `{db_name}`.character_homebind (guid INT PRIMARY KEY, mapId INT, zoneId INT);
+
+        TRUNCATE TABLE `{db_name}`.companion_schedule;
+        TRUNCATE TABLE `{db_name}`.companion_weights;
+        TRUNCATE TABLE `{db_name}`.companion_weight_overrides;
+        TRUNCATE TABLE `{db_name}`.companion_work_orders;
+        TRUNCATE TABLE `{db_name}`.companion_profiles;
+        TRUNCATE TABLE `{db_name}`.companion_rep_goals;
+
+        INSERT IGNORE INTO acore_world.item_template (entry, name, Quality, ItemLevel, RequiredLevel, armor, InventoryType)
+            VALUES (2840, 'Copper Bar', 1, 5, 1, 0, 0), (44096, 'Battleworn Thrash Blade', 7, 1, 1, 0, 13);
+        INSERT IGNORE INTO acore_world.quest_template (ID, QuestLevel, LogTitle) VALUES (501, 30, 'Steel of Ironforge');
+        INSERT IGNORE INTO acore_world.player_xp_for_level (level, Experience) VALUES (33, 48600);
+
+        INSERT INTO `{db_name}`.characters VALUES
+            (101, 2, 'Brannoc', 4, 1, 1, 33, 3397, 761128, 1519, 0, 1, 72000, 1588, 0);
+        INSERT INTO `{db_name}`.companion_schedule (name, shift_group, start_hour, end_hour, days_mask, always_online, note)
+            VALUES ('Brannoc', 'core-wonky', 0, 24, 127, 1, 'Core tank');
+        INSERT INTO `{db_name}`.item_instance VALUES (9901, 44096, 1, '1898 0 0', 100);
+        INSERT INTO `{db_name}`.character_inventory VALUES (101, 0, 15, 9901);
+        INSERT INTO `{db_name}`.character_stats VALUES (101, 1588, 0, 92, 54, 110, 30, 35, 1450, 240, 85, 0, 12.5, 6.2, 4.0, 8.1, 5.0, 6.5, 0);
+        INSERT INTO `{db_name}`.character_skills VALUES (101, 164, 150, 150);
+        INSERT INTO `{db_name}`.character_queststatus VALUES (101, 501, 3);
+        INSERT INTO `{db_name}`.character_homebind VALUES (101, 0, 1537);
+        """
+        subprocess.run(
+            ["mysql", f"-h{host}", f"-P{port}", "-uroot"],
+            input=ddl_and_seed.encode("utf-8"),
+            check=True, capture_output=True, env=env_root,
+        )
+
+        # Exercise all 5 real MySQL writes + real read-back via fetch_character_sheet!
+        apply_focus_preset("brannoc", "craft", hours=2, now_ts=1_800_000_000)
+        set_manual_weight("brannoc", "gather", 1.40, pinned=True)
+        create_character_work_order("brannoc", 2840, 10, "CI order", now_ts=1_800_000_000)
+        update_character_schedule("brannoc", shift_group="prime-time", always_online=False)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sheet = fetch_character_sheet("brannoc", db_path=Path(tmp) / "brain.db", now_ts=1_800_000_060, can_control=True)
+            self.assertIsNotNone(sheet)
+            assert sheet is not None
+            self.assertEqual(sheet["character"]["schedule"]["shift_group"], "prime-time")
+            self.assertFalse(sheet["character"]["schedule"]["always_online"])
+            wmap = {w["key"]: w for w in sheet["weights"]}
+            self.assertEqual(wmap["gather"]["effective"], 1.4)
+            self.assertTrue(wmap["gather"]["pinned"])
+            self.assertEqual(wmap["craft"]["effective"], 1.5)
+            self.assertEqual(wmap["craft"]["effective_source"], "operator")
+            self.assertEqual(len(sheet["work_orders"]), 1)
+            self.assertEqual(sheet["work_orders"][0]["item_name"], "Copper Bar")
+
+            # Pause AI & unpin gather, verify read-back!
+            set_character_ai_paused("brannoc", True, now_ts=1_800_000_070)
+            set_manual_weight("brannoc", "gather", 1.0, pinned=False)
+            sheet2 = fetch_character_sheet("brannoc", db_path=Path(tmp) / "brain.db", now_ts=1_800_000_080, can_control=True)
+            assert sheet2 is not None
+            self.assertTrue(sheet2["ai_brain"]["paused"])
+            wmap2 = {w["key"]: w for w in sheet2["weights"]}
+            self.assertFalse(wmap2["gather"]["pinned"])
 
 
 if __name__ == "__main__":

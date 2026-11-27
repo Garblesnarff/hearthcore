@@ -23,6 +23,7 @@ import http.server
 import json
 import mimetypes
 import os
+import re
 import secrets
 import signal
 import socket
@@ -74,6 +75,16 @@ CSP_HEADER = (
 _CTL_LOCK = threading.Lock()
 _LAST_RUN_TS: dict[str, float] = {}
 _AUTH_FAILS: dict[str, list[float]] = {}
+_CHAR_SLUG_RE = re.compile(r"^[a-zA-Z0-9_-]{1,32}$")
+_CHAR_POST_RE = re.compile(r"^/api/character/([a-zA-Z0-9_-]{1,32})/(preset|weight|directive|pause|work-order|schedule)$")
+
+
+def _load_character_ctl():
+    hc_root = str(_default_hearthcore_root())
+    if hc_root not in sys.path:
+        sys.path.insert(0, hc_root)
+    from hearthcore import character_ctl  # type: ignore
+    return character_ctl
 
 # Explicit read-only kiosk allow-list (Issues #71 & #72)
 PUBLIC_TOP_KEYS = (
@@ -387,11 +398,14 @@ def make_handler(
     overrides_path: str | None = None,
     audit_path: str = AUDIT_LOG_PATH,
     systemctl_runner=None,
+    replan_runner=None,
+    character_ctl=None,
     allowed_hosts: set[str] | None = None,
     max_sse_clients: int = MAX_SSE_CLIENTS,
     session_ttl_sec: int = SESSION_TTL_SEC,
     require_auth_for_reads: bool | None = None,
     trust_loopback_reads: bool | None = None,
+    trust_loopback_writes: bool | None = None,
 ):
     # Separate mutable settings file so dashboard NEVER rewrites .env holding ANTHROPIC_API_KEY (Issue #72).
     settings_path = overrides_path if overrides_path is not None else (
@@ -408,6 +422,11 @@ def make_handler(
         bool(trust_loopback_reads)
         if trust_loopback_reads is not None
         else (os.getenv("AZEROTH_WATCH_TRUST_LOOPBACK_READS") or "0").strip().lower() in ("1", "true", "yes", "on")
+    )
+    local_writes_ok = (
+        bool(trust_loopback_writes)
+        if trust_loopback_writes is not None
+        else (os.getenv("AZEROTH_WATCH_TRUST_LOOPBACK_WRITES") or "0").strip().lower() in ("1", "true", "yes", "on")
     )
 
     # Per-server-instance server-side session store (revocable!), SSE counter, and serialization cache
@@ -573,6 +592,12 @@ def make_handler(
                 return False, False
             return False, False
 
+        def _is_loopback(self) -> bool:
+            return self._client_ip() in ("127.0.0.1", "::1")
+
+        def _is_local_write_trusted(self) -> bool:
+            return bool(local_writes_ok and self._is_loopback())
+
         def do_GET(self):
             if not self._check_host_header():
                 return
@@ -588,7 +613,8 @@ def make_handler(
                 if rate_lim:
                     self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Too many failed attempts; wait 60s"}', close_conn=True)
                     return
-                body = json.dumps({"ok": True, "authenticated": is_auth}).encode("utf-8")
+                local_open = self._is_local_write_trusted()
+                body = json.dumps({"ok": True, "authenticated": bool(is_auth or local_open), "local_open": local_open}).encode("utf-8")
                 self._send_bytes(200, "application/json; charset=utf-8", body)
                 return
 
@@ -603,12 +629,13 @@ def make_handler(
                 if rate_lim:
                     self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Too many failed attempts; wait 60s"}', close_conn=True)
                     return
-                if auth_reads and not is_auth:
+                eff_auth = bool(is_auth or self._is_local_write_trusted())
+                if auth_reads and not eff_auth:
                     self._send_bytes(401, "application/json; charset=utf-8", b'{"ok":false,"error":"Authentication required for /api/state (use /api/kiosk for minimal view)"}', close_conn=True)
                     return
-                is_local_ro = bool(local_reads_ok and not auth_reads and self._client_ip() in ("127.0.0.1", "::1"))
+                is_local_ro = bool(local_reads_ok and not auth_reads and self._is_loopback())
                 ver, snap = collector.get_snapshot()
-                body = _cached_serialized_state(ver, snap, is_auth, local_readonly=is_local_ro)
+                body = _cached_serialized_state(ver, snap, eff_auth, local_readonly=is_local_ro)
                 self._send_bytes(200, "application/json; charset=utf-8", body)
                 return
 
@@ -617,10 +644,12 @@ def make_handler(
                 if rate_lim:
                     self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Too many failed attempts; wait 60s"}', close_conn=True)
                     return
-                if auth_reads and not is_auth:
+                local_open = self._is_local_write_trusted()
+                eff_auth = bool(is_auth or local_open)
+                if auth_reads and not eff_auth:
                     self._send_bytes(401, "application/json; charset=utf-8", b'{"ok":false,"error":"Authentication required for /api/stream"}', close_conn=True)
                     return
-                is_local_ro = bool(local_reads_ok and not auth_reads and self._client_ip() in ("127.0.0.1", "::1"))
+                is_local_ro = bool(local_reads_ok and not auth_reads and self._is_loopback())
                 with state_lock:
                     if sse_active["count"] >= max(1, int(max_sse_clients)):
                         self._send_bytes(
@@ -646,12 +675,13 @@ def make_handler(
                         # Re-check session revocation on active SSE streams so logout immediately stops admin view!
                         if stream_used_cookie and not _validate_session(stream_sid):
                             is_auth = False
+                            eff_auth = bool(local_open)
                             stream_used_cookie = False
                         ver, snap = collector.get_snapshot()
                         age_bucket = int((snap or {}).get("data_age_sec") or 0) // 5 if isinstance(snap, dict) else 0
-                        cur_key = (ver, is_auth, is_local_ro, age_bucket)
+                        cur_key = (ver, eff_auth, is_local_ro, age_bucket)
                         if cur_key != last_key and snap:
-                            payload_b = _cached_serialized_state(ver, snap, is_auth, local_readonly=is_local_ro)
+                            payload_b = _cached_serialized_state(ver, snap, eff_auth, local_readonly=is_local_ro)
                             msg = f"id: {ver}\nevent: state\ndata: ".encode("utf-8") + payload_b + b"\n\n"
                             self.wfile.write(msg)
                             self.wfile.flush()
@@ -665,6 +695,46 @@ def make_handler(
                 finally:
                     with state_lock:
                         sse_active["count"] = max(0, sse_active["count"] - 1)
+
+            if path.startswith("/api/character/"):
+                slug = urllib.parse.unquote(path[len("/api/character/"):]).strip("/")
+                if not _CHAR_SLUG_RE.match(slug):
+                    self._send_bytes(400, "application/json; charset=utf-8", b'{"ok":false,"error":"Invalid character name"}')
+                    return
+                is_auth, rate_lim = self._is_authenticated(count_failure=True)
+                if rate_lim:
+                    self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Too many failed attempts; wait 60s"}', close_conn=True)
+                    return
+                local_open = self._is_local_write_trusted()
+                eff_auth = bool(is_auth or local_open)
+                if auth_reads and not eff_auth:
+                    self._send_bytes(401, "application/json; charset=utf-8", b'{"ok":false,"error":"Authentication required"}', close_conn=True)
+                    return
+                is_local_ro = bool(local_reads_ok and not auth_reads and self._is_loopback())
+                try:
+                    ctl = character_ctl if character_ctl is not None else _load_character_ctl()
+                    sheet = ctl.fetch_character_sheet(
+                        slug,
+                        redact_admin=(not (eff_auth or is_local_ro)),
+                        can_control=eff_auth,
+                    )
+                except Exception as exc:
+                    print(f"[server] character sheet fetch error for {slug}: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+                    self._send_bytes(500, "application/json; charset=utf-8", b'{"ok":false,"error":"Failed to load character sheet"}')
+                    return
+                if sheet is None:
+                    self._send_bytes(404, "application/json; charset=utf-8", b'{"ok":false,"error":"Character not found"}')
+                    return
+                self._send_bytes(200, "application/json; charset=utf-8", json.dumps(sheet, separators=(",", ":")).encode("utf-8"))
+                return
+
+            if path.startswith("/character/"):
+                slug = urllib.parse.unquote(path[len("/character/"):]).strip("/")
+                if _CHAR_SLUG_RE.match(slug):
+                    self._serve_static("character.html")
+                    return
+                self._send_bytes(404, "text/plain; charset=utf-8", b"Not found")
+                return
 
             if path == "/" or path == "/index.html":
                 self._serve_static("index.html")
@@ -754,15 +824,18 @@ def make_handler(
                 return
 
             # 4. Require explicit authorization for ALL state-changing controls (rate-limited!)
-            is_auth, rate_lim = self._is_authenticated(count_failure=True)
-            if rate_lim:
-                _audit_log(ip, path, 429, "auth_rate_limited", audit_path=audit_path)
-                self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Too many failed attempts; wait 60s"}', close_conn=True)
-                return
-            if not is_auth:
-                _audit_log(ip, path, 401, "unauthorized", audit_path=audit_path)
-                self._send_bytes(401, "application/json; charset=utf-8", b'{"ok":false,"error":"Admin authorization required"}', close_conn=True)
-                return
+            # Optional loopback-only open mode (AZEROTH_WATCH_TRUST_LOOPBACK_WRITES=1) still enforces
+            # Host allow-list, Same-Origin CSRF, JSON Content-Type, size limit, and audit logging.
+            if not self._is_local_write_trusted():
+                is_auth, rate_lim = self._is_authenticated(count_failure=True)
+                if rate_lim:
+                    _audit_log(ip, path, 429, "auth_rate_limited", audit_path=audit_path)
+                    self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Too many failed attempts; wait 60s"}', close_conn=True)
+                    return
+                if not is_auth:
+                    _audit_log(ip, path, 401, "unauthorized", audit_path=audit_path)
+                    self._send_bytes(401, "application/json; charset=utf-8", b'{"ok":false,"error":"Admin authorization required"}', close_conn=True)
+                    return
 
             if path == "/api/brain/model":
                 model = str(body.get("model") or "").strip()
@@ -805,12 +878,16 @@ def make_handler(
                     self._send_bytes(400, "application/json; charset=utf-8", b'{"ok":false,"error":"Unknown target"}')
                     return
                 now = time.monotonic()
+                rate_limited = False
                 with _CTL_LOCK:
                     if now - _LAST_RUN_TS.get(target, 0.0) < 15.0:
-                        _audit_log(ip, path, 429, f"rate_limited:{target}", audit_path=audit_path)
-                        self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Please wait 15s between manual runs"}')
-                        return
-                    _LAST_RUN_TS[target] = now
+                        rate_limited = True
+                    else:
+                        _LAST_RUN_TS[target] = now
+                if rate_limited:
+                    _audit_log(ip, path, 429, f"rate_limited:{target}", audit_path=audit_path)
+                    self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Please wait 15s between manual runs"}')
+                    return
                 if systemctl_runner is not None:
                     systemctl_runner(unit)
                 else:
@@ -822,6 +899,98 @@ def make_handler(
                 _audit_log(ip, path, 200, f"started={unit}", audit_path=audit_path)
                 resp = json.dumps({"ok": True, "started": unit}).encode("utf-8")
                 self._send_bytes(200, "application/json; charset=utf-8", resp)
+                return
+
+            m_char = _CHAR_POST_RE.match(path)
+            if m_char:
+                slug = m_char.group(1).lower()
+                action = m_char.group(2)
+                try:
+                    ctl = character_ctl if character_ctl is not None else _load_character_ctl()
+                    if action == "preset":
+                        preset = str(body.get("preset") or "").strip().lower()
+                        hours = int(body.get("hours") or 2)
+                        res = ctl.apply_focus_preset(slug, preset, hours)
+                        detail = f"preset={preset} hours={res.get('hours')}"
+                    elif action == "weight":
+                        wkey = str(body.get("key") or "").strip()
+                        val = float(body.get("value", 1.0))
+                        pinned = bool(body.get("pinned", True))
+                        res = ctl.set_manual_weight(slug, wkey, val, pinned=pinned)
+                        detail = f"weight={wkey}:{res.get('value')} pinned={pinned}"
+                    elif action == "directive":
+                        note = str(body.get("note") or "")
+                        ttl_hours = int(body.get("ttl_hours") or 24)
+                        replan_now = bool(body.get("replan", False))
+                        res = ctl.set_character_directive(slug, note, ttl_hours=ttl_hours)
+                        replan_started = False
+                        if replan_now:
+                            rkey = f"replan:{slug}"
+                            now_m = time.monotonic()
+                            replan_limited = False
+                            with _CTL_LOCK:
+                                if now_m - _LAST_RUN_TS.get(rkey, 0.0) < 15.0:
+                                    replan_limited = True
+                                else:
+                                    _LAST_RUN_TS[rkey] = now_m
+                            if replan_limited:
+                                _audit_log(ip, path, 429, f"replan_rate_limited:{slug}", audit_path=audit_path)
+                                self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Please wait 15s between replans for this character"}')
+                                return
+                            if replan_runner is not None:
+                                replan_runner(slug)
+                            else:
+                                hc_root = str(_default_hearthcore_root())
+                                subprocess.Popen(
+                                    [sys.executable, "-m", "hearthcore", "brain-tick", "--provider", "anthropic", "--force", "--character", slug],
+                                    cwd=hc_root,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                )
+                            replan_started = True
+                        res["replan_started"] = replan_started
+                        detail = f"directive_len={len(note.strip())} replan={replan_started}"
+                    elif action == "pause":
+                        paused = bool(body.get("paused", False))
+                        res = ctl.set_character_ai_paused(slug, paused)
+                        detail = f"paused={paused}"
+                    elif action == "work-order":
+                        item_entry = int(body.get("item_entry") or 0)
+                        qty = int(body.get("quantity") or 5)
+                        story = str(body.get("story") or "")
+                        assign_here = bool(body.get("assign_to_character", True))
+                        res = ctl.create_character_work_order(slug, item_entry, qty, story, assign_to_character=assign_here)
+                        detail = f"order={item_entry}x{res.get('quantity')}"
+                    elif action == "schedule":
+                        sg = body.get("shift_group")
+                        ao = body.get("always_online")
+                        res = ctl.update_character_schedule(
+                            slug,
+                            shift_group=(str(sg) if sg is not None else None),
+                            always_online=(bool(ao) if ao is not None else None),
+                        )
+                        detail = f"shift={res.get('shift_group')} always={res.get('always_online')}"
+                    else:
+                        self._send_bytes(404, "application/json; charset=utf-8", b'{"ok":false,"error":"Unknown action"}')
+                        return
+                except ValueError as exc:
+                    _audit_log(ip, path, 400, f"bad_input:{type(exc).__name__}", audit_path=audit_path)
+                    self._send_bytes(400, "application/json; charset=utf-8", json.dumps({"ok": False, "error": str(exc)}).encode("utf-8"))
+                    return
+                except Exception as exc:
+                    # Check Invalid from hearthcore.core without hard top-level import dependency
+                    if exc.__class__.__name__ == "Invalid":
+                        _audit_log(ip, path, 400, f"invalid:{str(exc)[:80]}", audit_path=audit_path)
+                        self._send_bytes(400, "application/json; charset=utf-8", json.dumps({"ok": False, "error": str(exc)}).encode("utf-8"))
+                        return
+                    print(f"[server] character control error {path}: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+                    _audit_log(ip, path, 500, f"error:{type(exc).__name__}", audit_path=audit_path)
+                    self._send_bytes(500, "application/json; charset=utf-8", b'{"ok":false,"error":"Action failed"}')
+                    return
+
+                _trigger_collector_refresh()
+                _audit_log(ip, path, 200, detail, audit_path=audit_path)
+                self._send_bytes(200, "application/json; charset=utf-8", json.dumps(res, separators=(",", ":")).encode("utf-8"))
                 return
 
             self._send_bytes(404, "application/json; charset=utf-8", b'{"ok":false,"error":"Not found"}')

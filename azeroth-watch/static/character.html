@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Character Sheet — Azeroth Watch</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body class="char-page">
+  <div id="char-app">
+    <header class="topbar char-topbar">
+      <div class="char-top-left">
+        <a class="back-btn" href="/" title="Back to Azeroth Watch Dashboard">&larr; Dashboard</a>
+        <div class="brand-sep"></div>
+        <div class="brand-text">
+          <div class="brand-title">AZEROTH WATCH</div>
+          <div class="brand-sub" id="char-crumb">Character Sheet</div>
+        </div>
+      </div>
+      <div class="char-top-right">
+        <span class="brain-toast" id="char-toast"></span>
+        <button class="ctl-action-btn subtle" id="btn-char-refresh" title="Refresh character sheet now">↻ Refresh</button>
+        <button class="ctl-action-btn subtle" id="btn-char-admin" style="display:none" title="Unlock administrative controls">🔒 Unlock Controls</button>
+      </div>
+    </header>
+
+    <div id="char-loading" class="card char-state-box">Loading character sheet...</div>
+    <div id="char-error" class="card char-state-box" style="display:none"></div>
+
+    <main id="char-main" style="display:none">
+      <!-- HERO BANNER -->
+      <section class="card char-hero" id="char-hero"></section>
+
+      <!-- TWO-COLUMN WORKSPACE (switches to single centered layout for human characters) -->
+      <div class="char-layout" id="char-layout">
+        <!-- LEFT: WOW CHARACTER SHEET -->
+        <div class="char-sheet-col">
+          <section class="card">
+            <div class="card-head">
+              <h2>Equipment &amp; Paperdoll <span class="badge mono" id="gear-ilvl-badge">Avg iLvl --</span></h2>
+              <span class="muted" id="gear-count-meta">0 / 19 equipped</span>
+            </div>
+            <div class="paperdoll-grid" id="paperdoll-grid"></div>
+          </section>
+
+          <section class="card">
+            <div class="card-head">
+              <h2>Combat Attributes &amp; Stats</h2>
+              <span class="muted mono" id="stats-power-meta"></span>
+            </div>
+            <div class="stats-grid" id="stats-grid"></div>
+          </section>
+
+          <div class="char-subgrid">
+            <section class="card">
+              <div class="card-head">
+                <h2>Professions &amp; Skills</h2>
+                <span class="muted" id="profs-count-meta"></span>
+              </div>
+              <div id="char-profs-list" class="stack-list"></div>
+            </section>
+
+            <section class="card">
+              <div class="card-head">
+                <h2>Active Quests <span class="badge mono" id="quests-done-badge">0 done</span></h2>
+                <span class="muted" id="quests-active-meta"></span>
+              </div>
+              <div id="char-quests-list" class="stack-list char-scroll-box"></div>
+            </section>
+          </div>
+
+          <section class="card">
+            <div class="card-head">
+              <h2>Reputations &amp; Standings</h2>
+              <span class="muted">Visible &amp; Goal Factions</span>
+            </div>
+            <div id="char-reps-grid" class="reps-grid"></div>
+          </section>
+        </div>
+
+        <!-- RIGHT: COMPANION DIRECTION & AI BRAIN (Companions only) -->
+        <div class="char-control-col" id="char-control-col">
+          <!-- 1-5 DIRECTION CONTROLS -->
+          <section class="card char-controls-card" id="controls-card">
+            <div class="card-head">
+              <h2>Direct This Companion <span class="badge mono" id="ctrl-mode-badge">Live</span></h2>
+              <button class="ctl-action-btn" id="btn-pause-ai" title="Pause or resume AI weight overrides for this companion">⏸ Pause AI</button>
+            </div>
+
+            <div id="ctrl-locked-note" class="ctrl-locked-note" style="display:none">
+              🔒 Read-only view on LAN. Click <b>🔒 Unlock Controls</b> in the top bar to direct this companion.
+            </div>
+
+            <div id="ctrl-body">
+              <!-- CONTROL 1: ONE-CLICK FOCUS PRESETS -->
+              <div class="ctrl-section">
+                <div class="ctrl-sec-head">
+                  <h3>1. One-Click Focus Preset</h3>
+                  <label class="ctrl-inline-lbl">
+                    Duration
+                    <select id="preset-hours" class="ctrl-select">
+                      <option value="1">1 hour</option>
+                      <option value="2" selected>2 hours</option>
+                      <option value="3">3 hours</option>
+                      <option value="4">4 hours</option>
+                      <option value="6">6 hours</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="preset-grid" id="preset-grid"></div>
+                <div class="muted ctrl-hint" id="override-status-line"></div>
+              </div>
+
+              <!-- CONTROL 3: CLAUDE DIRECTIVE + REPLAN NOW -->
+              <div class="ctrl-section">
+                <div class="ctrl-sec-head">
+                  <h3>2. Note to Claude AI Brain</h3>
+                  <span class="muted" id="directive-status-badge">No active note</span>
+                </div>
+                <textarea id="directive-input" class="ctrl-textarea" rows="2" maxlength="240" placeholder="e.g. Focus on leveling Blacksmithing to 150 and smelt Copper Bars for the guild bank..."></textarea>
+                <div class="ctrl-btn-row">
+                  <button class="ctl-action-btn" id="btn-save-directive">💾 Save Note</button>
+                  <button class="ctl-action-btn primary-gold" id="btn-replan-now">⚡ Save &amp; Replan Now</button>
+                  <button class="ctl-action-btn subtle" id="btn-clear-directive">Clear</button>
+                </div>
+              </div>
+
+              <!-- CONTROL 2: MANUAL WEIGHT SLIDERS & PINS -->
+              <div class="ctrl-section">
+                <div class="ctrl-sec-head">
+                  <h3>3. Priority Weights &amp; Manual Pins</h3>
+                  <span class="muted">Pinned (📌) weights override Claude</span>
+                </div>
+                <div id="weights-list" class="weights-list"></div>
+              </div>
+
+              <!-- CONTROL 5: QUICK WORK ORDER & SHIFT SCHEDULE -->
+              <div class="ctrl-section ctrl-two-col">
+                <div class="ctrl-subbox">
+                  <h3>4. Quick Work Order</h3>
+                  <select id="wo-item-select" class="ctrl-select full"></select>
+                  <div class="ctrl-inline-row">
+                    <label class="ctrl-inline-lbl">Qty <input type="number" id="wo-qty" class="ctrl-input num" min="1" max="40" value="5" /></label>
+                    <label class="ctrl-check-lbl"><input type="checkbox" id="wo-assign-here" checked /> Assign to <span id="wo-char-name">bot</span></label>
+                  </div>
+                  <input type="text" id="wo-story" class="ctrl-input full" maxlength="140" placeholder="Optional note (e.g. For raid prep)" />
+                  <button class="ctl-action-btn" id="btn-create-wo">📦 Create Work Order</button>
+                </div>
+
+                <div class="ctrl-subbox">
+                  <h3>5. Shift &amp; Schedule</h3>
+                  <select id="sched-group-select" class="ctrl-select full"></select>
+                  <label class="ctrl-check-lbl" style="margin:6px 0">
+                    <input type="checkbox" id="sched-always-online" /> Always Online (ignore shift window)
+                  </label>
+                  <button class="ctl-action-btn" id="btn-save-sched">🕒 Save Schedule</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- AI BRAIN & MEMORY -->
+          <section class="card" id="char-brain-card">
+            <div class="card-head">
+              <h2>AI Brain &amp; Session History</h2>
+              <span class="badge mono" id="brain-state-badge">--</span>
+            </div>
+            <div id="char-brain-body"></div>
+          </section>
+
+          <!-- GUILD LIFE TABS -->
+          <section class="card">
+            <div class="card-head">
+              <h2>Guild Life &amp; Activity</h2>
+              <div class="mini-tabs" id="life-tabs">
+                <button class="chip active" data-ltab="events">Events</button>
+                <button class="chip" data-ltab="bonds">Bonds</button>
+                <button class="chip" data-ltab="orders">Orders</button>
+                <button class="chip" data-ltab="ledger">Ledger</button>
+              </div>
+            </div>
+            <div id="char-life-body" class="stack-list char-scroll-box"></div>
+          </section>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="/static/character.js"></script>
+</body>
+</html>
