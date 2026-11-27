@@ -113,6 +113,15 @@ public:
     static uint64 GroupTokenFor(Group const* group);
     static uint64 OnNativeGroupCreated(Group const* group);
     static void OnNativeGroupDisbanded(Group const* group);
+    // Issue #12: Native admission flags, fail-closed resource limits, persisted hysteresis & atomic caps.
+    static bool TryAdmitCoopQueue(uint64 opportunityId, uint32 targetMapId, bool allMembersEnrolled,
+                                  uint32 additionalLoginsNeeded = 0, std::string* outReason = nullptr);
+    static bool TryAdmitCompanionLfgJoin(Player const* bot, std::vector<uint32> const& targetMapIds,
+                                         std::string* outReason = nullptr);
+    static bool TryAdmitCompanionLfgProposal(Player const* bot, uint32 proposalId, uint32 rawLfgDungeonEntry,
+                                             std::string* outReason = nullptr);
+    static void ReleaseCoopAdmissionToken(uint64 opportunityId);
+    static bool CoopHeadroomPaused();
     // World thread only: flushes queued binds/disbands atomically to MySQL and reloads memberships.
     static void FlushCoopGroupMutations();
     static void ReloadCoopMemberships();

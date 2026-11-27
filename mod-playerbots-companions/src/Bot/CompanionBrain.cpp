@@ -6,6 +6,7 @@
 
 #include "CompanionBrain.h"
 #include "CompanionClassStrategy.h"
+#include "CompanionCoopAdmissionLogic.h"
 #include "CompanionCoopAuthLogic.h"
 #include "CompanionDuty.h"
 #include "CompanionCraft.h"
@@ -14,11 +15,16 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <unordered_set>
 
 #include "Bag.h"
 #include "Config.h"
+#include "DBCStores.h"
 #include "DatabaseEnv.h"
 #include "GameTime.h"
 #include "Group.h"
@@ -28,12 +34,14 @@
 #include "ItemUsageValue.h"
 #include "Log.h"
 #include "Map.h"
+#include "MapMgr.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "Playerbots.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotAIConfig.h"
 #include "StringFormat.h"
+#include "WorldSessionMgr.h"
 
 namespace
 {
@@ -85,7 +93,235 @@ std::mutex gCoopQueueMutex;
 std::unordered_map<uint64, PendingCoopBind> gPendingCoopBinds;  // oppId -> latest queued bind
 std::vector<PendingCoopDisband> gPendingCoopDisbands;
 std::unordered_map<uint64, uint32> gFailedBindCooldown;         // oppId -> unix time when retry allowed
+std::unordered_map<uint64, uint32> gAdmissionBlockedOpps;       // oppId -> blocked until unix time (stops 15s retry loop)
 constexpr uint32 COOP_BIND_FAIL_BACKOFF_SEC = 15;
+
+// Issue #12: Native admission controller, world-tick p99 ring buffer & host telemetry sampler.
+std::mutex gAdmissionMutex;
+CompanionCoopAdmission::AdmissionController gAdmissionController;
+CompanionCoopAdmission::TickRingBuffer gTickRing;
+uint32 gTelemetrySampleTimer = 0;
+constexpr uint32 COOP_TELEMETRY_SAMPLE_MS = 5000;
+uint64 gPrevSwapPages = 0;
+uint32 gPrevSwapSampleSec = 0;
+bool gHasPrevSwap = false;
+bool gHysteresisLoaded = false;
+bool gHysteresisPersistDirty = false;
+bool gHysteresisPersistPaused = false;
+uint32 gHysteresisPersistTs = 0;
+std::vector<std::string> gHysteresisPersistReasons;
+
+CompanionCoopAdmission::AdmissionConfig LoadNativeAdmissionConfig()
+{
+    CompanionCoopAdmission::AdmissionConfig cfg;
+    cfg.coopEnabled = CompanionBrain::CoopEnabled();
+    cfg.enabledDungeonMaps = CompanionCoopAdmission::ParseEnabledMapList(
+        sConfigMgr->GetOption<std::string>("AiPlayerbot.Companion.Coop.EnabledDungeonMaps", "", false));
+    cfg.maxManagedGroups = sConfigMgr->GetOption<uint32>(
+        "AiPlayerbot.Companion.Coop.MaxManagedGroups", CompanionCoopAdmission::DEFAULT_MAX_MANAGED_GROUPS, false);
+    cfg.maxTotalInstances = sConfigMgr->GetOption<uint32>(
+        "AiPlayerbot.Companion.Coop.MaxTotalInstances", CompanionCoopAdmission::DEFAULT_MAX_TOTAL_INSTANCES, false);
+    cfg.maxOnlinePopulation = sConfigMgr->GetOption<uint32>(
+        "AiPlayerbot.Companion.Coop.MaxOnlinePopulation", CompanionCoopAdmission::DEFAULT_MAX_ONLINE_POPULATION, false);
+    cfg.minAvailRamMib = sConfigMgr->GetOption<float>("AiPlayerbot.Companion.Coop.MinAvailRamMib", 512.0f, false);
+    cfg.recoverAvailRamMib =
+        sConfigMgr->GetOption<float>("AiPlayerbot.Companion.Coop.RecoverAvailRamMib", 640.0f, false);
+    cfg.maxTickP99Ms = sConfigMgr->GetOption<float>("AiPlayerbot.Companion.Coop.MaxTickP99Ms", 45.0f, false);
+    cfg.recoverTickP99Ms = sConfigMgr->GetOption<float>("AiPlayerbot.Companion.Coop.RecoverTickP99Ms", 38.0f, false);
+    cfg.maxSwapIoPagesPerSec =
+        sConfigMgr->GetOption<float>("AiPlayerbot.Companion.Coop.MaxSwapIoPagesPerSec", 25.0f, false);
+    cfg.recoverSwapIoPagesPerSec =
+        sConfigMgr->GetOption<float>("AiPlayerbot.Companion.Coop.RecoverSwapIoPagesPerSec", 10.0f, false);
+    cfg.maxCpuPsiSomeAvg10 =
+        sConfigMgr->GetOption<float>("AiPlayerbot.Companion.Coop.MaxCpuPsiSomeAvg10", 20.0f, false);
+    cfg.recoverCpuPsiSomeAvg10 =
+        sConfigMgr->GetOption<float>("AiPlayerbot.Companion.Coop.RecoverCpuPsiSomeAvg10", 10.0f, false);
+    cfg.maxTelemetryAgeSec = sConfigMgr->GetOption<uint32>(
+        "AiPlayerbot.Companion.Coop.MaxTelemetryAgeSec", CompanionCoopAdmission::DEFAULT_MAX_TELEMETRY_AGE_SEC, false);
+    cfg.tokenTtlSec = sConfigMgr->GetOption<uint32>(
+        "AiPlayerbot.Companion.Coop.AdmissionTokenTtlSec", CompanionCoopAdmission::DEFAULT_TOKEN_TTL_SEC, false);
+    return cfg;
+}
+
+std::string NativeHeadroomStatePath()
+{
+    return sConfigMgr->GetOption<std::string>("AiPlayerbot.Companion.Coop.HeadroomStateFile",
+                                              CompanionCoopAdmission::DEFAULT_HEADROOM_STATE_FILE, false);
+}
+
+bool PersistHysteresisStateOnWorldThread(bool paused, uint32 nowSec, std::vector<std::string> const& reasons)
+{
+    std::string const path = NativeHeadroomStatePath();
+    if (path.empty())
+        return true;
+    std::string const tmp = path + ".tmp";
+    std::ofstream out(tmp, std::ios::trunc);
+    if (!out)
+    {
+        LOG_WARN("playerbots", "[CompanionCoop] Failed opening headroom state temp file '{}'", tmp);
+        return false;
+    }
+    out << CompanionCoopAdmission::FormatHeadroomStateJson(paused, nowSec, reasons);
+    out.flush();
+    if (!out.good())
+    {
+        LOG_WARN("playerbots", "[CompanionCoop] Failed writing headroom state temp file '{}'", tmp);
+        return false;
+    }
+    out.close();
+    if (std::rename(tmp.c_str(), path.c_str()) != 0)
+    {
+        LOG_WARN("playerbots", "[CompanionCoop] Failed renaming headroom state '{}' -> '{}'", tmp, path);
+        return false;
+    }
+    return true;
+}
+
+void FlushHysteresisPersistenceOnWorldThread()
+{
+    bool paused = false;
+    uint32 ts = 0;
+    std::vector<std::string> reasons;
+    {
+        std::lock_guard<std::mutex> lock(gAdmissionMutex);
+        if (!gHysteresisPersistDirty)
+            return;
+        paused = gHysteresisPersistPaused;
+        ts = gHysteresisPersistTs;
+        reasons = gHysteresisPersistReasons;
+        gHysteresisPersistDirty = false;
+    }
+    if (!PersistHysteresisStateOnWorldThread(paused, ts, reasons))
+    {
+        // Fail closed in memory if state file cannot be persisted!
+        std::lock_guard<std::mutex> lock(gAdmissionMutex);
+        gAdmissionController.LoadHysteresisState(true);
+    }
+}
+
+void EnsureHysteresisLoaded()
+{
+    if (gHysteresisLoaded)
+        return;
+    gHysteresisLoaded = true;
+    std::string const path = NativeHeadroomStatePath();
+    if (path.empty())
+        return;
+    std::error_code ec;
+    bool const exists = std::filesystem::exists(path, ec);
+    if (ec)
+    {
+        LOG_WARN("playerbots", "[CompanionCoop] Unable to stat headroom state '{}'; failing closed (paused=true)", path);
+        std::lock_guard<std::mutex> lock(gAdmissionMutex);
+        gAdmissionController.LoadHysteresisState(true);
+        return;
+    }
+    if (!exists)
+        return;
+
+    std::ifstream in(path);
+    if (!in)
+    {
+        LOG_WARN("playerbots", "[CompanionCoop] Headroom state '{}' unreadable; failing closed (paused=true)", path);
+        std::lock_guard<std::mutex> lock(gAdmissionMutex);
+        gAdmissionController.LoadHysteresisState(true);
+        return;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    bool paused = true;
+    if (!CompanionCoopAdmission::ParseHeadroomPausedJson(ss.str(), paused))
+    {
+        LOG_WARN("playerbots", "[CompanionCoop] Corrupt headroom state '{}'; failing closed (paused=true)", path);
+        paused = true;
+    }
+    std::lock_guard<std::mutex> lock(gAdmissionMutex);
+    gAdmissionController.LoadHysteresisState(paused);
+}
+
+void SampleCoopHostTelemetry(uint32 nowSec)
+{
+    CompanionCoopAdmission::TelemetrySnapshot snap;
+    snap.valid = true;
+    snap.sampledAt = nowSec;
+
+    // 1. /proc/meminfo -> MemAvailable (MiB)
+    {
+        std::ifstream mem("/proc/meminfo");
+        double mib = 0.0;
+        if (mem && CompanionCoopAdmission::ParseMemAvailableMib(mem, mib))
+        {
+            snap.hasMemAvail = true;
+            snap.memAvailMib = mib;
+        }
+    }
+
+    // 2. /proc/vmstat -> delta (pswpin + pswpout) / dt -> swap pages/sec
+    {
+        std::ifstream vm("/proc/vmstat");
+        std::uint64_t totalPages = 0;
+        if (vm && CompanionCoopAdmission::ParseVmstatSwapPages(vm, totalPages))
+        {
+            if (gHasPrevSwap && nowSec > gPrevSwapSampleSec && totalPages >= gPrevSwapPages)
+            {
+                double const dt = static_cast<double>(nowSec - gPrevSwapSampleSec);
+                snap.hasSwapIo = true;
+                snap.swapIoPagesPerSec = static_cast<double>(totalPages - gPrevSwapPages) / dt;
+            }
+            gPrevSwapPages = totalPages;
+            gPrevSwapSampleSec = nowSec;
+            gHasPrevSwap = true;
+        }
+    }
+
+    // 3. /proc/pressure/cpu -> "some avg10=..."
+    {
+        std::ifstream psi("/proc/pressure/cpu");
+        double avg10 = 0.0;
+        if (psi && CompanionCoopAdmission::ParseCpuPsiSomeAvg10(psi, avg10))
+        {
+            snap.hasCpuPsi = true;
+            snap.cpuPsiSomeAvg10 = avg10;
+        }
+    }
+
+    // 4. World-thread tick p99 latency (ms)
+    double p99 = 0.0;
+    if (gTickRing.Percentile(99.0, p99))
+    {
+        snap.hasTickP99 = true;
+        snap.tickP99Ms = p99;
+    }
+
+    // 5. Real active instance count (managed + ordinary/human dungeon/BG/arena instances) & online population
+    uint32 dungeons = 0;
+    uint32 bgs = 0;
+    uint32 arenas = 0;
+    sMapMgr->GetNumInstances(dungeons, bgs, arenas);
+    snap.hasInstances = true;
+    snap.activeInstances = dungeons + bgs + arenas;
+
+    snap.hasPopulation = true;
+    snap.onlinePopulation = sWorldSessionMgr->GetPlayerCount();
+
+    CompanionCoopAdmission::AdmissionConfig const cfg = LoadNativeAdmissionConfig();
+    std::vector<std::string> reasons;
+    {
+        std::lock_guard<std::mutex> lock(gAdmissionMutex);
+        bool const prevPaused = gAdmissionController.IsHeadroomPaused();
+        gAdmissionController.UpdateTelemetry(snap);
+        (void)gAdmissionController.EvaluateHeadroom(cfg, snap, nowSec, reasons);
+        bool const newPaused = gAdmissionController.IsHeadroomPaused();
+        if (newPaused != prevPaused)
+        {
+            gHysteresisPersistPaused = newPaused;
+            gHysteresisPersistTs = nowSec;
+            gHysteresisPersistReasons = reasons;
+            gHysteresisPersistDirty = true;
+        }
+    }
+    FlushHysteresisPersistenceOnWorldThread();
+}
 
 // WotLK 3.3.5a (1-450) profession leveling-guide materials whitelist (Mining/BS, Eng, JC, Herb/Alch, Inscription,
 // Skinning/LW, Tailoring, Enchanting, First Aid, and guide-standard Cooking meats/fish).
@@ -348,6 +584,20 @@ void CompanionBrain::Update(uint32 elapsed)
 {
     if (!_defaultsLoaded)
         LoadDefaults();
+
+    // Issue #12: Record world tick duration (ms) and sample host/server telemetry on the world thread.
+    gTickRing.Record(elapsed);
+    if (CoopEnabled())
+    {
+        EnsureHysteresisLoaded();
+        gTelemetrySampleTimer += elapsed;
+        if (gTelemetrySampleTimer >= COOP_TELEMETRY_SAMPLE_MS)
+        {
+            gTelemetrySampleTimer = 0;
+            SampleCoopHostTelemetry(static_cast<uint32>(GameTime::GetGameTime().count()));
+        }
+        FlushHysteresisPersistenceOnWorldThread();
+    }
 
     FlushCoopGroupMutations();
 
@@ -821,6 +1071,202 @@ uint64 CompanionBrain::OnNativeGroupCreated(Group const* group)
     return token;
 }
 
+bool CompanionBrain::TryAdmitCoopQueue(uint64 opportunityId, uint32 targetMapId, bool allMembersEnrolled,
+                                       uint32 additionalLoginsNeeded, std::string* outReason)
+{
+    if (outReason)
+        outReason->clear();
+
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    std::unordered_set<uint64_t> committedOppIds;
+    std::unordered_set<uint64_t> assemblingOppIds;
+    {
+        std::lock_guard<std::mutex> lock(gCoopMutex);
+        for (auto const& r : gCoopRegistry.Runs())
+        {
+            if (r.isShadow || !CompanionCoopAuth::IsActiveRunState(r.runState) || r.expiresAt <= now)
+                continue;
+            if (r.boundToNativeGroup)
+                committedOppIds.insert(r.opportunityId);
+            else
+                assemblingOppIds.insert(r.opportunityId);
+        }
+    }
+
+    CompanionCoopAdmission::AdmissionConfig const cfg = LoadNativeAdmissionConfig();
+    CompanionCoopAdmission::AdmissionDecision dec;
+    {
+        std::lock_guard<std::mutex> lock(gAdmissionMutex);
+        bool const prevPaused = gAdmissionController.IsHeadroomPaused();
+        dec = gAdmissionController.TryAdmitNewQueueOrProposal(
+            cfg, gAdmissionController.LastTelemetry(), opportunityId, targetMapId, committedOppIds, assemblingOppIds,
+            allMembersEnrolled, additionalLoginsNeeded, now);
+        bool const newPaused = gAdmissionController.IsHeadroomPaused();
+        if (newPaused != prevPaused)
+        {
+            // Queue persistence to world thread ONLY (single writer, zero interleaved temp files!).
+            gHysteresisPersistPaused = newPaused;
+            gHysteresisPersistTs = now;
+            gHysteresisPersistReasons = dec.detailReasons;
+            gHysteresisPersistDirty = true;
+        }
+    }
+    if (outReason)
+        *outReason = dec.reason;
+    return dec.admitted;
+}
+
+namespace
+{
+bool ResolveBotCoopRunForAdmission(uint32 botGuid, uint32 nowSec, uint64& outOppId, uint32& outTargetMap,
+                                   bool& outAllEnrolled, uint32& outOfflineCount)
+{
+    outOppId = 0;
+    outTargetMap = 0;
+    outAllEnrolled = false;
+    outOfflineCount = 0;
+    std::vector<uint32> rosterGuids;
+    {
+        std::lock_guard<std::mutex> lock(gCoopMutex);
+        for (auto const& r : gCoopRegistry.Runs())
+        {
+            if (r.isShadow || !CompanionCoopAuth::IsActiveRunState(r.runState) || r.expiresAt <= nowSec)
+                continue;
+            bool foundSelf = false;
+            bool allEnr = !r.roster.empty();
+            for (auto const& rm : r.roster)
+            {
+                if (rm.characterGuid == botGuid)
+                    foundSelf = true;
+                if (!rm.enrolledCoop || !CompanionCoopAuth::IsConfirmedInterestState(rm.interestState) ||
+                    rm.interestRevision != r.revision)
+                    allEnr = false;
+            }
+            if (foundSelf)
+            {
+                outOppId = r.opportunityId;
+                outTargetMap = r.targetMapId;
+                outAllEnrolled = allEnr;
+                for (auto const& rm : r.roster)
+                    rosterGuids.push_back(rm.characterGuid);
+                break;
+            }
+        }
+    }
+    if (!outOppId)
+        return false;
+    // Count offline roster members outside gCoopMutex (prevents forced mass logins for coop admission!).
+    for (uint32 g : rosterGuids)
+    {
+        if (!ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(g)))
+            ++outOfflineCount;
+    }
+    return true;
+}
+}  // namespace
+
+bool CompanionBrain::TryAdmitCompanionLfgJoin(Player const* bot, std::vector<uint32> const& targetMapIds,
+                                              std::string* outReason)
+{
+    if (outReason)
+        outReason->clear();
+    if (!bot)
+    {
+        if (outReason)
+            *outReason = "invalid_bot";
+        return false;
+    }
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    uint64 oppId = 0;
+    uint32 runMap = 0;
+    bool allEnrolled = false;
+    uint32 offlineCount = 0;
+    if (!ResolveBotCoopRunForAdmission(bot->GetGUID().GetCounter(), now, oppId, runMap, allEnrolled, offlineCount))
+    {
+        if (outReason)
+            *outReason = CoopEnabled() ? "no_authorized_opportunity" : "coop_disabled";
+        return false;
+    }
+    if (targetMapIds.empty() || runMap == 0)
+    {
+        if (outReason)
+            *outReason = "empty_or_unknown_target_map";
+        return false;
+    }
+    // Validate EVERY dungeon in the LFG join list (never allow extra or random dungeons to slip past!)
+    for (uint32 mId : targetMapIds)
+    {
+        if (mId == 0 || mId != runMap)
+        {
+            if (outReason)
+                *outReason = "map_mismatch";
+            return false;
+        }
+    }
+    return TryAdmitCoopQueue(oppId, runMap, allEnrolled, offlineCount, outReason);
+}
+
+bool CompanionBrain::TryAdmitCompanionLfgProposal(Player const* bot, uint32 /*proposalId*/, uint32 rawLfgDungeonEntry,
+                                                  std::string* outReason)
+{
+    if (outReason)
+        outReason->clear();
+    if (!bot)
+    {
+        if (outReason)
+            *outReason = "invalid_bot";
+        return false;
+    }
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    uint64 oppId = 0;
+    uint32 runMap = 0;
+    bool allEnrolled = false;
+    uint32 offlineCount = 0;
+    if (!ResolveBotCoopRunForAdmission(bot->GetGUID().GetCounter(), now, oppId, runMap, allEnrolled, offlineCount))
+    {
+        if (outReason)
+            *outReason = CoopEnabled() ? "no_authorized_opportunity" : "coop_disabled";
+        return false;
+    }
+    // SMSG_LFG_PROPOSAL_UPDATE encodes dungeon as (id | type << 24); mask low 24 bits before DBC lookup!
+    uint32 const dungeonId = rawLfgDungeonEntry & 0x00FFFFFFu;
+    if (dungeonId == 0)
+    {
+        if (outReason)
+            *outReason = "unknown_proposal_dungeon";
+        return false;
+    }
+    LFGDungeonEntry const* entry = sLFGDungeonStore.LookupEntry(dungeonId);
+    if (!entry || entry->TypeID == 6 /* LFG_TYPE_RANDOM */ || entry->MapID <= 0)
+    {
+        if (outReason)
+            *outReason = "unsupported_or_random_proposal_dungeon";
+        return false;
+    }
+    uint32 const propMap = static_cast<uint32>(entry->MapID);
+    if (runMap == 0 || propMap != runMap)
+    {
+        if (outReason)
+            *outReason = "proposal_map_mismatch";
+        return false;
+    }
+    return TryAdmitCoopQueue(oppId, runMap, allEnrolled, offlineCount, outReason);
+}
+
+void CompanionBrain::ReleaseCoopAdmissionToken(uint64 opportunityId)
+{
+    if (!opportunityId)
+        return;
+    std::lock_guard<std::mutex> lock(gAdmissionMutex);
+    (void)gAdmissionController.ReleaseToken(opportunityId);
+}
+
+bool CompanionBrain::CoopHeadroomPaused()
+{
+    std::lock_guard<std::mutex> lock(gAdmissionMutex);
+    return gAdmissionController.IsHeadroomPaused();
+}
+
 void CompanionBrain::OnNativeGroupDisbanded(Group const* group)
 {
     if (!group)
@@ -899,6 +1345,7 @@ void CompanionBrain::FlushCoopGroupMutations()
         {
             if (tr.aborted)
             {
+                ReleaseCoopAdmissionToken(tr.opportunityId);
                 CharacterDatabase.DirectExecute(Acore::StringFormat(
                     "UPDATE companion_opportunities SET group_guid = 0, state = 'aborted', "
                     "outcome_reason = 'native_group_disbanded' "
@@ -937,6 +1384,55 @@ void CompanionBrain::FlushCoopGroupMutations()
                      "[CompanionCoop] Dropped stale queued bind for opp #{} (group {} already disbanded)",
                      req.opportunityId, req.snap.groupId);
             continue;
+        }
+
+        // Issue #12: Enforce native admission flags, dungeon allowlist, enrollment, no forced mass logins,
+        // fail-closed headroom + hysteresis, and atomic group/instance/population caps BEFORE committing a new
+        // managed group! Already-committed groups pass through safely without disruption.
+        uint32 runTargetMap = 0;
+        bool runAllEnrolled = false;
+        bool alreadyCommitted = false;
+        std::vector<uint32> rosterGuids;
+        {
+            std::lock_guard<std::mutex> lock(gCoopMutex);
+            for (auto const& r : gCoopRegistry.Runs())
+            {
+                if (r.opportunityId != req.opportunityId || r.revision != req.revision)
+                    continue;
+                runTargetMap = r.targetMapId;
+                alreadyCommitted = r.boundToNativeGroup;
+                runAllEnrolled = !r.roster.empty();
+                for (auto const& rm : r.roster)
+                {
+                    rosterGuids.push_back(rm.characterGuid);
+                    if (!rm.enrolledCoop || !CompanionCoopAuth::IsConfirmedInterestState(rm.interestState) ||
+                        rm.interestRevision != r.revision)
+                        runAllEnrolled = false;
+                }
+                break;
+            }
+        }
+        uint32 offlineRosterCount = 0;
+        for (uint32 g : rosterGuids)
+        {
+            if (!ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(g)))
+                ++offlineRosterCount;
+        }
+        bool mintedNewToken = false;
+        if (!alreadyCommitted)
+        {
+            std::string admitReason;
+            if (!TryAdmitCoopQueue(req.opportunityId, runTargetMap, runAllEnrolled, offlineRosterCount, &admitReason))
+            {
+                std::lock_guard<std::mutex> lock(gCoopQueueMutex);
+                gFailedBindCooldown[req.opportunityId] = now + COOP_BIND_FAIL_BACKOFF_SEC;
+                gAdmissionBlockedOpps[req.opportunityId] = now + COOP_BIND_FAIL_BACKOFF_SEC;
+                LOG_WARN("playerbots",
+                         "[CompanionCoop] Admission gate blocked opp #{} (map {}, group {}): {}",
+                         req.opportunityId, runTargetMap, req.snap.groupId, admitReason);
+                continue;
+            }
+            mintedNewToken = true;
         }
 
         std::string const groupGuard =
@@ -980,6 +1476,8 @@ void CompanionBrain::FlushCoopGroupMutations()
 
         if (!dbConfirmed)
         {
+            if (mintedNewToken)
+                ReleaseCoopAdmissionToken(req.opportunityId);
             std::lock_guard<std::mutex> lock(gCoopQueueMutex);
             gFailedBindCooldown[req.opportunityId] = now + COOP_BIND_FAIL_BACKOFF_SEC;
             LOG_WARN("playerbots",
@@ -997,6 +1495,10 @@ void CompanionBrain::FlushCoopGroupMutations()
         }
         if (boundOk)
         {
+            {
+                std::lock_guard<std::mutex> lock(gAdmissionMutex);
+                (void)gAdmissionController.MarkCommitted(req.opportunityId);
+            }
             std::lock_guard<std::mutex> lock(gCoopQueueMutex);
             gFailedBindCooldown.erase(req.opportunityId);
             LOG_INFO("playerbots",
@@ -1006,6 +1508,8 @@ void CompanionBrain::FlushCoopGroupMutations()
         }
         else
         {
+            if (mintedNewToken)
+                ReleaseCoopAdmissionToken(req.opportunityId);
             // Roll back DB group_guid so a rejected registry bind never leaves an orphaned group_guid in MySQL!
             CharacterDatabase.DirectExecute(Acore::StringFormat(
                 "UPDATE companion_opportunities SET group_guid = {}, state = 'assembling' "
@@ -1137,14 +1641,27 @@ void CompanionBrain::ReloadCoopMemberships()
         } while (res->NextRow());
     }
 
+    std::unordered_set<uint64_t> liveOppIds;
     std::vector<CompanionCoopAuth::AuthorizedRun> nextRuns;
     nextRuns.reserve(runsByOpp.size());
     for (auto& [oppId, run] : runsByOpp)
+    {
+        liveOppIds.insert(oppId);
         nextRuns.push_back(std::move(run));
+    }
 
-    std::lock_guard<std::mutex> lock(gCoopMutex);
-    // Generation guard: if a bind or disband committed while this SQL read was running, do NOT clobber it!
-    (void)gCoopRegistry.ReloadRuns(std::move(nextRuns), startGen);
+    bool reloaded = false;
+    {
+        std::lock_guard<std::mutex> lock(gCoopMutex);
+        // Generation guard: if a bind or disband committed while this SQL read was running, do NOT clobber it!
+        reloaded = gCoopRegistry.ReloadRuns(std::move(nextRuns), startGen);
+    }
+    if (reloaded)
+    {
+        // Prune committed tokens for completed/expired/cancelled opportunities so tokens never leak over uptime!
+        std::lock_guard<std::mutex> lock(gAdmissionMutex);
+        (void)gAdmissionController.PruneCommittedTokensNotIn(liveOppIds);
+    }
 }
 
 bool CompanionBrain::IsAuthorizedCoopMember(uint32 lowGuid, uint64& outOppId, uint32& outTargetMap, uint32& outGroupId)
@@ -1205,7 +1722,18 @@ bool CompanionBrain::AuthorizeCoopGroup(Player const* bot, CompanionCoopAuth::Na
     if (dec.readyToBind && allowQueueBind)
     {
         // Queue atomic DB bind for the world thread (ZERO blocking DB I/O on map threads!).
+        // If this opportunity was already rejected by the admission gate, fail closed cleanly so TickBot
+        // disbands the blocked unbound group instead of retrying every 15s forever.
         std::lock_guard<std::mutex> lock(gCoopQueueMutex);
+        auto blkIt = gAdmissionBlockedOpps.find(dec.opportunityId);
+        if (blkIt != gAdmissionBlockedOpps.end() && blkIt->second > now)
+        {
+            if (outAssemblyInProgress)
+                *outAssemblyInProgress = false;
+            if (outReason)
+                *outReason = "admission_gate_blocked";
+            return false;
+        }
         auto failIt = gFailedBindCooldown.find(dec.opportunityId);
         if (failIt == gFailedBindCooldown.end() || failIt->second <= now)
         {

@@ -190,25 +190,26 @@ class Batch3And4P2Tests(unittest.TestCase):
                     reason_code="volunteer", available_until=5000, now_ts=2000,
                 )
             live_hr = tp / "live_headroom.json"
-            blk_missing = admit_cooperative_opportunity(
-                coord, opp["id"], expected_revision=1, state_path=live_hr,
-                mem_avail_mib=None, tick_p99_ms=20.0, active_managed_groups=0, now_ts=2001,
-            )
-            self.assertFalse(blk_missing["ok"])
-            self.assertEqual(blk_missing["reason"], "resource_headroom_blocked")
-            # Hysteresis keeps live path paused at 580 MiB (<640)
-            blk_hyst = admit_cooperative_opportunity(
-                coord, opp["id"], expected_revision=1, state_path=live_hr,
-                mem_avail_mib=580.0, tick_p99_ms=20.0, active_managed_groups=0, now_ts=2005,
-            )
-            self.assertFalse(blk_hyst["ok"])
-            # Recovery >=640 MiB and <=38 ms admits and reserves party!
-            admitted = admit_cooperative_opportunity(
-                coord, opp["id"], expected_revision=1, state_path=live_hr,
-                mem_avail_mib=700.0, tick_p99_ms=20.0, active_managed_groups=0, now_ts=2010,
-            )
-            self.assertTrue(admitted["ok"])
-            self.assertEqual(len(admitted["party"]), 5)
+            with mock.patch.dict(os.environ, {"HEARTHCORE_COOP_ENABLED": "1", "HEARTHCORE_COOP_DUNGEONS": "deadmines_n"}):
+                blk_missing = admit_cooperative_opportunity(
+                    coord, opp["id"], expected_revision=1, state_path=live_hr,
+                    mem_avail_mib=None, tick_p99_ms=20.0, active_managed_groups=0, now_ts=2001,
+                )
+                self.assertFalse(blk_missing["ok"])
+                self.assertEqual(blk_missing["reason"], "resource_headroom_blocked")
+                # Hysteresis keeps live path paused at 580 MiB (<640)
+                blk_hyst = admit_cooperative_opportunity(
+                    coord, opp["id"], expected_revision=1, state_path=live_hr,
+                    mem_avail_mib=580.0, tick_p99_ms=20.0, active_managed_groups=0, now_ts=2005,
+                )
+                self.assertFalse(blk_hyst["ok"])
+                # Recovery >=640 MiB and <=38 ms admits and reserves party!
+                admitted = admit_cooperative_opportunity(
+                    coord, opp["id"], expected_revision=1, state_path=live_hr,
+                    mem_avail_mib=700.0, tick_p99_ms=20.0, active_managed_groups=0, now_ts=2010,
+                )
+                self.assertTrue(admitted["ok"])
+                self.assertEqual(len(admitted["party"]), 5)
 
             # Structured cycle_summary JSON log is emitted on hearthcore.bridge logger
             from hearthcore.bridge import run_cycle

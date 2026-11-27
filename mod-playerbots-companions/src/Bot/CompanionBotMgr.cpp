@@ -929,6 +929,13 @@ std::string CompanionBotMgr::ScheduleSummary() const
 
 void CompanionBotMgr::LoginMissingCompanions()
 {
+    // Issue #12: Stagger companion logins when coop mode is enabled (or explicitly configured),
+    // leaving non-coop startup speed untouched (0 = unlimited when coop is OFF).
+    // NEVER log out a companion in combat, inside an instance, with an owner, or in an active coop group!
+    uint32 const cfgMaxLogins = sConfigMgr->GetOption<uint32>("AiPlayerbot.Companion.MaxLoginsPerPass", 0, false);
+    uint32 const maxLoginsPerPass = cfgMaxLogins > 0 ? cfgMaxLogins : (CompanionBrain::CoopEnabled() ? 2u : 0u);
+    uint32 loginsThisPass = 0;
+
     for (std::string const& name : _displayNames)
     {
         ObjectGuid guid = sCharacterCache->GetCharacterGuidByName(name);
@@ -941,8 +948,8 @@ void CompanionBotMgr::LoginMissingCompanions()
         bool const wantOnline = IsScheduledOnline(name, connected);
         if (!wantOnline)
         {
-            if (connected && !IsGroupedWithOwner(connected) && !connected->IsInCombat() &&
-                (!connected->GetMap() || !connected->GetMap()->Instanceable()))
+            if (connected && !IsGroupedWithOwner(connected) && !IsInAuthorizedCoopGroup(connected) &&
+                !connected->IsInCombat() && (!connected->GetMap() || !connected->GetMap()->Instanceable()))
             {
                 LOG_INFO("playerbots", "[Companion] {}: schedule shift ended, logging out", name);
                 sRandomPlayerbotMgr.LogoutPlayerBot(guid);
@@ -951,8 +958,11 @@ void CompanionBotMgr::LoginMissingCompanions()
         }
         if (connected)
             continue;
+        if (maxLoginsPerPass > 0 && loginsThisPass >= maxLoginsPerPass)
+            continue;
         // Master account 0 means "no master": the bot is logged in as a standalone bot and is not in the random list.
         sRandomPlayerbotMgr.AddPlayerBot(guid, 0);
+        ++loginsThisPass;
         LOG_INFO("playerbots", "Companion bot '{}' login requested", name);
     }
 }
