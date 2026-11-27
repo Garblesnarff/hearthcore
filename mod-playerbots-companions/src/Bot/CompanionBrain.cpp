@@ -5,9 +5,11 @@
  */
 
 #include "CompanionBrain.h"
+#include "CompanionBotMgr.h"
 #include "CompanionClassStrategy.h"
 #include "CompanionCoopAdmissionLogic.h"
 #include "CompanionCoopAuthLogic.h"
+#include "CompanionCoopDrainLogic.h"
 #include "CompanionDuty.h"
 #include "CompanionCraft.h"
 #include "CompanionLife.h"
@@ -32,6 +34,7 @@
 #include "Item.h"
 #include "ItemTemplate.h"
 #include "ItemUsageValue.h"
+#include "LFGMgr.h"
 #include "Log.h"
 #include "Map.h"
 #include "MapMgr.h"
@@ -87,14 +90,32 @@ struct PendingCoopBind
 struct PendingCoopDisband
 {
     uint32 groupId = 0;
+    bool hadDrainedOpp = false;
     std::vector<CompanionCoopAuth::Registry::DisbandTransition> transitions;
 };
+struct PendingCoopExit
+{
+    uint64 opportunityId = 0;
+    std::vector<uint32> exitedMemberGuids;
+    CompanionCoopDrain::DrainReason reason = CompanionCoopDrain::DrainReason::None;
+    bool groupFullyExited = false;
+    uint8 retryCount = 0;
+};
+constexpr uint8 COOP_EXIT_MAX_RETRIES = 5;
 std::mutex gCoopQueueMutex;
 std::unordered_map<uint64, PendingCoopBind> gPendingCoopBinds;  // oppId -> latest queued bind
 std::vector<PendingCoopDisband> gPendingCoopDisbands;
+std::vector<PendingCoopExit> gPendingCoopExits;
+std::unordered_set<uint64> gPendingDrainedOpps;                 // retained until DB reload confirms opp is no longer active/assembling
 std::unordered_map<uint64, uint32> gFailedBindCooldown;         // oppId -> unix time when retry allowed
 std::unordered_map<uint64, uint32> gAdmissionBlockedOpps;       // oppId -> blocked until unix time (stops 15s retry loop)
 constexpr uint32 COOP_BIND_FAIL_BACKOFF_SEC = 15;
+
+// Issue #22: Accepted native group ownership & safe-boundary drain coordinator (strictly separated from admission mode).
+std::mutex gDrainMutex;
+CompanionCoopDrain::DrainCoordinator gDrainCoordinator;
+std::atomic<bool> gCoopBootProbeDone{false};
+std::atomic<bool> gCoopDbHealthy{true};
 
 // Issue #12: Native admission controller, world-tick p99 ring buffer & host telemetry sampler.
 std::mutex gAdmissionMutex;
@@ -1042,10 +1063,131 @@ bool CompanionBrain::MarkProposalCompleted(uint32 lowGuid, uint64 proposalId, ui
     return true;
 }
 
+CompanionCoopDrain::CoopMode CompanionBrain::GetCoopMode()
+{
+    // Issue #22: 3-state admission mode (Off / Draining / Enabled), safe default OFF.
+    bool const enabledFlag = sConfigMgr->GetOption<bool>("AiPlayerbot.Companion.Coop.Enabled", false, false);
+    std::string const modeRaw = sConfigMgr->GetOption<std::string>("AiPlayerbot.Companion.Coop.Mode", "", false);
+    return CompanionCoopDrain::ParseCoopMode(enabledFlag, modeRaw);
+}
+
 bool CompanionBrain::CoopEnabled()
 {
-    // Safe default OFF (Phase II Card II-05/II-11 feature gate).
-    return sConfigMgr->GetOption<bool>("AiPlayerbot.Companion.Coop.Enabled", false, false);
+    // Safe default OFF; returns true ONLY when mode == Enabled (Draining & Off block new admissions).
+    return CompanionCoopDrain::AllowsNewAdmissions(GetCoopMode());
+}
+
+bool CompanionBrain::IsCoopBootProbeDone()
+{
+    return gCoopBootProbeDone.load();
+}
+
+bool CompanionBrain::RequestCoopOwnerRecall(uint32 botGuid)
+{
+    if (!botGuid)
+        return false;
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    uint32 const drainGraceSec = sConfigMgr->GetOption<uint32>(
+        "AiPlayerbot.Companion.Coop.DrainGraceSeconds", CompanionCoopDrain::DEFAULT_DRAIN_GRACE_SEC, false);
+    std::lock_guard<std::mutex> lock(gDrainMutex);
+    return gDrainCoordinator.RequestOwnerRecall(botGuid, now, drainGraceSec);
+}
+
+void CompanionBrain::ClearCoopOwnerRecall(uint32 botGuid)
+{
+    if (!botGuid)
+        return;
+    std::lock_guard<std::mutex> lock(gDrainMutex);
+    gDrainCoordinator.ClearOwnerRecall(botGuid);
+}
+
+bool CompanionBrain::IsCoopGroupHoldingForDrain(Player const* bot, Group const* group)
+{
+    if (!bot || !group)
+        return false;
+    bool hasHuman = false;
+    for (Group::MemberSlot const& slot : group->GetMemberSlots())
+    {
+        if (sCompanionBotMgr.IsAnyOwnerLow(slot.guid.GetCounter()) ||
+            !sCompanionBotMgr.IsCompanionSlot(slot.guid, slot.name))
+        {
+            hasHuman = true;
+            break;
+        }
+    }
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    CompanionCoopDrain::CoopMode const mode = GetCoopMode();
+    std::lock_guard<std::mutex> lock(gDrainMutex);
+    return gDrainCoordinator.IsHoldingForDrain(bot->GetGUID().GetCounter(), group->GetGUID().GetCounter(),
+                                               GroupTokenFor(group), hasHuman, mode, now);
+}
+
+CompanionCoopDrain::DrainDecision CompanionBrain::EvaluateCoopDrain(Player const* bot, Group const* group,
+                                                                    bool shiftEnded, bool ownerRecalled)
+{
+    CompanionCoopDrain::DrainDecision empty;
+    if (!bot || !group)
+        return empty;
+
+    CompanionCoopDrain::MemberBoundaryInput in;
+    in.botGuid = bot->GetGUID().GetCounter();
+    in.groupId = group->GetGUID().GetCounter();
+    in.groupToken = GroupTokenFor(group);
+    in.botInCombat = bot->IsInCombat();
+    in.botDead = bot->isDead();
+    in.inDungeonInstance = (bot->GetMap() && bot->GetMap()->IsNonRaidDungeon());
+    in.isLfgGroup = group->isLFGGroup();
+    in.lfgDungeonFinished = (in.isLfgGroup && sLFGMgr->GetState(group->GetGUID()) == lfg::LFG_STATE_FINISHED_DUNGEON);
+    in.hasLfgDeserter = bot->HasAura(CompanionCoopDrain::SPELL_LFG_DUNGEON_DESERTER);
+    in.hasLfgCooldown = bot->HasAura(CompanionCoopDrain::SPELL_LFG_DUNGEON_COOLDOWN);
+    in.shiftEnded = shiftEnded;
+    in.ownerRecalled = ownerRecalled;
+
+    // Inspect ALL MemberSlots for human presence (never touch human groups!).
+    std::unordered_set<uint32> groupGuids;
+    for (Group::MemberSlot const& slot : group->GetMemberSlots())
+    {
+        uint32 const low = slot.guid.GetCounter();
+        if (sCompanionBotMgr.IsAnyOwnerLow(low) || !sCompanionBotMgr.IsCompanionSlot(slot.guid, slot.name))
+        {
+            in.hasHumanMember = true;
+            break;
+        }
+        groupGuids.insert(low);
+    }
+
+    // Check combat ONLY across players on bot's OWN map (owned by current map thread — ZERO cross-map-thread read!).
+    in.groupInCombat = in.botInCombat;
+    if (!in.hasHumanMember && !in.groupInCombat && bot->GetMap())
+    {
+        for (auto const& ref : bot->GetMap()->GetPlayers())
+        {
+            Player const* peer = ref.GetSource();
+            if (peer && groupGuids.count(peer->GetGUID().GetCounter()) > 0 && peer->IsInCombat())
+            {
+                in.groupInCombat = true;
+                break;
+            }
+        }
+    }
+
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    uint32 const drainGraceSec = sConfigMgr->GetOption<uint32>(
+        "AiPlayerbot.Companion.Coop.DrainGraceSeconds", CompanionCoopDrain::DEFAULT_DRAIN_GRACE_SEC, false);
+    CompanionCoopDrain::CoopMode const mode = GetCoopMode();
+
+    std::lock_guard<std::mutex> lock(gDrainMutex);
+    return gDrainCoordinator.EvaluateMember(mode, in, now, drainGraceSec);
+}
+
+void CompanionBrain::MarkCoopExitInitiated(uint64 opportunityId, uint32 botGuid,
+                                           CompanionCoopDrain::DrainReason reason)
+{
+    if (!opportunityId || !botGuid)
+        return;
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    std::lock_guard<std::mutex> lock(gDrainMutex);
+    (void)gDrainCoordinator.MarkExitInitiated(opportunityId, botGuid, reason, now);
 }
 
 uint64 CompanionBrain::GroupTokenFor(Group const* group)
@@ -1176,6 +1318,19 @@ bool CompanionBrain::TryAdmitCompanionLfgJoin(Player const* bot, std::vector<uin
             *outReason = "invalid_bot";
         return false;
     }
+    // Issue #22: Reject new LFG queue admission while native LFG Deserter or Cooldown penalty aura is active!
+    if (bot->HasAura(CompanionCoopDrain::SPELL_LFG_DUNGEON_DESERTER))
+    {
+        if (outReason)
+            *outReason = "lfg_deserter_active";
+        return false;
+    }
+    if (bot->HasAura(CompanionCoopDrain::SPELL_LFG_DUNGEON_COOLDOWN))
+    {
+        if (outReason)
+            *outReason = "lfg_cooldown_active";
+        return false;
+    }
     uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
     uint64 oppId = 0;
     uint32 runMap = 0;
@@ -1215,6 +1370,19 @@ bool CompanionBrain::TryAdmitCompanionLfgProposal(Player const* bot, uint32 /*pr
     {
         if (outReason)
             *outReason = "invalid_bot";
+        return false;
+    }
+    // Issue #22: Reject new LFG queue admission while native LFG Deserter or Cooldown penalty aura is active!
+    if (bot->HasAura(CompanionCoopDrain::SPELL_LFG_DUNGEON_DESERTER))
+    {
+        if (outReason)
+            *outReason = "lfg_deserter_active";
+        return false;
+    }
+    if (bot->HasAura(CompanionCoopDrain::SPELL_LFG_DUNGEON_COOLDOWN))
+    {
+        if (outReason)
+            *outReason = "lfg_cooldown_active";
         return false;
     }
     uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
@@ -1267,6 +1435,46 @@ bool CompanionBrain::CoopHeadroomPaused()
     return gAdmissionController.IsHeadroomPaused();
 }
 
+void CompanionBrain::OnNativeGroupMemberRemoved(Group const* group, uint32 memberLowGuid)
+{
+    if (!group || !memberLowGuid)
+        return;
+    uint32 const groupId = group->GetGUID().GetCounter();
+    uint64 const token = GroupTokenFor(group);
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    uint32 const drainGraceSec = sConfigMgr->GetOption<uint32>(
+        "AiPlayerbot.Companion.Coop.DrainGraceSeconds", CompanionCoopDrain::DEFAULT_DRAIN_GRACE_SEC, false);
+
+    uint64 oppId = 0;
+    CompanionCoopDrain::DrainReason reason = CompanionCoopDrain::DrainReason::None;
+    bool groupFullyExited = false;
+    bool wasDrain = false;
+    bool wasOwned = false;
+    {
+        std::lock_guard<std::mutex> lock(gDrainMutex);
+        wasOwned = gDrainCoordinator.OnActualMemberRemoved(groupId, token, memberLowGuid, now, drainGraceSec, oppId,
+                                                           reason, groupFullyExited, wasDrain);
+    }
+    if (!wasOwned || !oppId)
+        return;
+    if (groupFullyExited)
+        ReleaseCoopAdmissionToken(oppId);
+    // Only record a 'drained' DB transition when this exit was actually a drain (mode/expiry/recall/shift/outage);
+    // normal post-completion leaves leave the opportunity to its normal completion/disband path!
+    if (!wasDrain)
+        return;
+
+    std::lock_guard<std::mutex> lock(gCoopQueueMutex);
+    PendingCoopExit ex;
+    ex.opportunityId = oppId;
+    ex.exitedMemberGuids.push_back(memberLowGuid);
+    ex.reason = reason;
+    ex.groupFullyExited = groupFullyExited;
+    gPendingCoopExits.push_back(std::move(ex));
+    if (groupFullyExited)
+        gPendingDrainedOpps.insert(oppId);
+}
+
 void CompanionBrain::OnNativeGroupDisbanded(Group const* group)
 {
     if (!group)
@@ -1282,19 +1490,70 @@ void CompanionBrain::OnNativeGroupDisbanded(Group const* group)
             gGroupTokens.erase(it);
         }
     }
-    if (!groupId || !CoopEnabled())
+    if (!groupId)
         return;
 
     uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    std::vector<CompanionCoopDrain::DisbandDrainResult> drainResults;
+    {
+        std::lock_guard<std::mutex> lock(gDrainMutex);
+        drainResults = gDrainCoordinator.OnGroupDisbanded(groupId, token);
+    }
+    std::unordered_set<uint64> drainedOppIds;
+    for (auto const& dr : drainResults)
+    {
+        ReleaseCoopAdmissionToken(dr.opportunityId);
+        if (dr.wasDraining)
+            drainedOppIds.insert(dr.opportunityId);
+    }
+
+    // Also include opportunities just drained by OnRemoveMember (e.g. LFG auto-disband right after last member left!)
+    {
+        std::lock_guard<std::mutex> lock(gCoopQueueMutex);
+        for (uint64 oid : gPendingDrainedOpps)
+            drainedOppIds.insert(oid);
+    }
+
+    if (!CoopEnabled() && drainResults.empty() && drainedOppIds.empty())
+        return;
+
     std::vector<CompanionCoopAuth::Registry::DisbandTransition> transitions;
     {
         std::lock_guard<std::mutex> lock(gCoopMutex);
         (void)gCoopRegistry.OnGroupDisbanded(groupId, token, now, &transitions);
     }
 
-    // ALWAYS purge any queued bind targeting this disbanded group (even if it hadn't committed to registry yet!)
-    // and queue DB cleanup when transitions occurred or a pending bind existed for this groupId.
+    // Filter out opportunities already closed neutrally as 'drained' so disband cleanup NEVER overwrites them
+    // as 'aborted' (covers BOTH 2nd-to-last-member auto-disband AND LFG last-member OnRemoveMember -> Disband!).
+    bool hadDrainedOpp = false;
+    std::vector<CompanionCoopAuth::Registry::DisbandTransition> nonDrainTransitions;
+    for (auto const& tr : transitions)
+    {
+        if (drainedOppIds.count(tr.opportunityId) > 0)
+            hadDrainedOpp = true;
+        else
+            nonDrainTransitions.push_back(tr);
+    }
+    if (!drainResults.empty())
+    {
+        for (auto const& dr : drainResults)
+            if (dr.wasDraining)
+                hadDrainedOpp = true;
+    }
+
     std::lock_guard<std::mutex> lock(gCoopQueueMutex);
+    for (auto const& dr : drainResults)
+    {
+        if (!dr.wasDraining)
+            continue;
+        PendingCoopExit ex;
+        ex.opportunityId = dr.opportunityId;
+        ex.exitedMemberGuids = dr.remainingMembers;
+        ex.reason = dr.reason;
+        ex.groupFullyExited = true;
+        gPendingCoopExits.push_back(std::move(ex));
+        gPendingDrainedOpps.insert(dr.opportunityId);
+    }
     bool removedPending = false;
     for (auto it = gPendingCoopBinds.begin(); it != gPendingCoopBinds.end();)
     {
@@ -1306,43 +1565,197 @@ void CompanionBrain::OnNativeGroupDisbanded(Group const* group)
         else
             ++it;
     }
-    if (!transitions.empty() || removedPending)
-        gPendingCoopDisbands.push_back(PendingCoopDisband{groupId, std::move(transitions)});
+    if (!nonDrainTransitions.empty() || removedPending)
+        gPendingCoopDisbands.push_back(PendingCoopDisband{groupId, hadDrainedOpp, std::move(nonDrainTransitions)});
 }
 
 void CompanionBrain::FlushCoopGroupMutations()
 {
-    if (!CoopEnabled())
-    {
-        std::lock_guard<std::mutex> lock(gCoopQueueMutex);
-        gPendingCoopBinds.clear();
-        gPendingCoopDisbands.clear();
-        gFailedBindCooldown.clear();
-        return;
-    }
-
+    CompanionCoopDrain::CoopMode const mode = GetCoopMode();
     std::vector<PendingCoopDisband> disbands;
     std::vector<PendingCoopBind> binds;
+    std::vector<PendingCoopExit> exits;
     {
         std::lock_guard<std::mutex> lock(gCoopQueueMutex);
-        if (gPendingCoopDisbands.empty() && gPendingCoopBinds.empty())
+        // When mode != Enabled (Draining or Off), cancel all pending uncommitted binds immediately while
+        // STILL retaining disbands and safe-boundary member exit commitment releases!
+        if (!CompanionCoopDrain::AllowsNewAdmissions(mode))
+        {
+            gPendingCoopBinds.clear();
+            gFailedBindCooldown.clear();
+        }
+        if (gPendingCoopDisbands.empty() && gPendingCoopBinds.empty() && gPendingCoopExits.empty())
             return;
         disbands.swap(gPendingCoopDisbands);
+        exits.swap(gPendingCoopExits);
         binds.reserve(gPendingCoopBinds.size());
         for (auto& [oppId, req] : gPendingCoopBinds)
             binds.push_back(std::move(req));
         gPendingCoopBinds.clear();
     }
 
+    // Issue #22: Defer exits, disbands AND binds while DB is unhealthy so no writes are lost during outages
+    // and disbands can never race ahead of deferred drained exits!
+    auto restoreDeferred = [&](std::vector<PendingCoopExit>& remExits)
+    {
+        std::lock_guard<std::mutex> lock(gCoopQueueMutex);
+        if (!remExits.empty())
+            gPendingCoopExits.insert(gPendingCoopExits.begin(), std::make_move_iterator(remExits.begin()),
+                                     std::make_move_iterator(remExits.end()));
+        if (!disbands.empty())
+            gPendingCoopDisbands.insert(gPendingCoopDisbands.begin(), std::make_move_iterator(disbands.begin()),
+                                        std::make_move_iterator(disbands.end()));
+        if (CompanionCoopDrain::AllowsNewAdmissions(mode))
+        {
+            for (auto& b : binds)
+                if (gPendingCoopBinds.find(b.opportunityId) == gPendingCoopBinds.end())
+                    gPendingCoopBinds.emplace(b.opportunityId, std::move(b));
+        }
+    };
+
+    if (!gCoopDbHealthy.load())
+    {
+        restoreDeferred(exits);
+        return;
+    }
+
     uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
     uint32 const graceSec = sConfigMgr->GetOption<uint32>("AiPlayerbot.Companion.Coop.ExitGraceMinutes", 10, false) * 60;
+
+    // Issue #22: Flush BOTH partial and full member exits BEFORE disbands and verify DB persistence!
+    // Distinguish real DB outage (`SELECT 1` fails) from missing/poisoned row (bounded COOP_EXIT_MAX_RETRIES) so
+    // a single deleted/unconfirmable row can NEVER stall all subsequent disbands indefinitely!
+    std::vector<PendingCoopExit> retryExits;
+    std::unordered_set<uint64> confirmedDrainedOpps;
+    bool dbFailedDuringExits = false;
+    for (PendingCoopExit& ex : exits)
+    {
+        char const* tag = CompanionCoopDrain::DrainOutcomeTag(ex.reason);
+        if (!tag || !*tag)
+            tag = "coop_drained";
+        if (ex.groupFullyExited)
+        {
+            // Release ALL remaining active/accepted/reserved member interest rows for this opportunity (also catches
+            // any earlier partial exit whose interest row missed!).
+            CharacterDatabase.DirectExecute(Acore::StringFormat(
+                "UPDATE companion_opportunity_interests SET state = 'released', reason_code = '{}', "
+                "reserved_until = 0, updated_at = {} "
+                "WHERE opportunity_id = {} AND state IN ('reserved', 'accepted', 'active')",
+                tag, now, ex.opportunityId));
+            CharacterDatabase.DirectExecute(Acore::StringFormat(
+                "UPDATE companion_opportunities SET state = 'drained', group_guid = 0, outcome_reason = '{}' "
+                "WHERE id = {} AND is_shadow = 0 AND state IN ('assembling', 'active')",
+                tag, ex.opportunityId));
+            QueryResult confirm = CharacterDatabase.Query(Acore::StringFormat(
+                "SELECT state FROM companion_opportunities WHERE id = {}", ex.opportunityId));
+            bool persisted = false;
+            if (confirm)
+            {
+                std::string const st = confirm->Fetch()[0].Get<std::string>();
+                persisted = !CompanionCoopAuth::IsActiveRunState(st);
+            }
+            else if (CharacterDatabase.Query("SELECT 1"))
+            {
+                // DB is healthy, row simply does not exist (deleted/pruned): treat as closed, never wedge queue!
+                persisted = true;
+            }
+            else
+            {
+                dbFailedDuringExits = true;
+            }
+            if (!persisted)
+            {
+                if (dbFailedDuringExits)
+                {
+                    gCoopDbHealthy.store(false);
+                    retryExits.push_back(std::move(ex));
+                }
+                else if (ex.retryCount < COOP_EXIT_MAX_RETRIES)
+                {
+                    ++ex.retryCount;
+                    retryExits.push_back(std::move(ex));
+                }
+                else
+                {
+                    LOG_WARN("playerbots",
+                             "[CompanionCoop] Dropping unconfirmable drain exit for opp #{} after {} retries",
+                             ex.opportunityId, COOP_EXIT_MAX_RETRIES);
+                }
+            }
+            else
+            {
+                confirmedDrainedOpps.insert(ex.opportunityId);
+                LOG_INFO("playerbots", "[CompanionCoop] Opportunity #{} drained cleanly on actual exit ({})",
+                         ex.opportunityId, tag);
+            }
+        }
+        else if (!ex.exitedMemberGuids.empty())
+        {
+            std::ostringstream inList;
+            for (size_t i = 0; i < ex.exitedMemberGuids.size(); ++i)
+            {
+                if (i > 0)
+                    inList << ",";
+                inList << ex.exitedMemberGuids[i];
+                CharacterDatabase.DirectExecute(Acore::StringFormat(
+                    "UPDATE companion_opportunity_interests SET state = 'released', reason_code = '{}', "
+                    "reserved_until = 0, updated_at = {} "
+                    "WHERE opportunity_id = {} AND character_guid = {} AND state IN ('reserved', 'accepted', 'active')",
+                    tag, now, ex.opportunityId, ex.exitedMemberGuids[i]));
+            }
+            // Verify partial member exit persisted (if DB failed mid-flush, re-queue for retry!).
+            QueryResult pConfirm = CharacterDatabase.Query(Acore::StringFormat(
+                "SELECT COUNT(*) FROM companion_opportunity_interests "
+                "WHERE opportunity_id = {} AND character_guid IN ({}) AND state IN ('reserved', 'accepted', 'active')",
+                ex.opportunityId, inList.str()));
+            if (!pConfirm)
+            {
+                dbFailedDuringExits = true;
+                gCoopDbHealthy.store(false);
+                retryExits.push_back(std::move(ex));
+            }
+            else if (pConfirm->Fetch()[0].Get<uint64>() > 0 && ex.retryCount < COOP_EXIT_MAX_RETRIES)
+            {
+                ++ex.retryCount;
+                retryExits.push_back(std::move(ex));
+            }
+        }
+    }
+    if (!retryExits.empty())
+    {
+        if (dbFailedDuringExits)
+        {
+            // Real DB outage: defer disbands AND binds too so nothing is dropped or raced!
+            restoreDeferred(retryExits);
+            return;
+        }
+        // DB is healthy (only an isolated row failed confirmation): re-queue ONLY retryExits without blocking
+        // unrelated disbands or binds!
+        std::lock_guard<std::mutex> lock(gCoopQueueMutex);
+        gPendingCoopExits.insert(gPendingCoopExits.begin(), std::make_move_iterator(retryExits.begin()),
+                                 std::make_move_iterator(retryExits.end()));
+    }
+
+    std::unordered_set<uint64> drainedGuard;
+    {
+        std::lock_guard<std::mutex> lock(gCoopQueueMutex);
+        drainedGuard = gPendingDrainedOpps;
+    }
+    for (uint64 oid : confirmedDrainedOpps)
+        drainedGuard.insert(oid);
 
     for (PendingCoopDisband const& d : disbands)
     {
         if (!d.groupId)
             continue;
+        bool skippedAnyDrained = d.hadDrainedOpp;
         for (auto const& tr : d.transitions)
         {
+            if (drainedGuard.count(tr.opportunityId) > 0)
+            {
+                skippedAnyDrained = true;
+                continue;
+            }
             if (tr.aborted)
             {
                 ReleaseCoopAdmissionToken(tr.opportunityId);
@@ -1362,12 +1775,16 @@ void CompanionBrain::FlushCoopGroupMutations()
                     tr.opportunityId, d.groupId));
             }
         }
-        // Fallback sweep for any remaining row still referencing this disbanded group_guid (no zombie active+0!).
-        CharacterDatabase.DirectExecute(Acore::StringFormat(
-            "UPDATE companion_opportunities SET group_guid = 0, state = 'aborted', "
-            "outcome_reason = 'native_group_disbanded' "
-            "WHERE group_guid = {} AND is_shadow = 0 AND state IN ('assembling', 'active')",
-            d.groupId));
+        // Fallback sweep for any remaining row still referencing this disbanded group_guid (no zombie active+0!),
+        // skipped when this group belonged to a drained opportunity so drained rows are NEVER overwritten as aborted!
+        if (!skippedAnyDrained)
+        {
+            CharacterDatabase.DirectExecute(Acore::StringFormat(
+                "UPDATE companion_opportunities SET group_guid = 0, state = 'aborted', "
+                "outcome_reason = 'native_group_disbanded' "
+                "WHERE group_guid = {} AND is_shadow = 0 AND state IN ('assembling', 'active')",
+                d.groupId));
+        }
         LOG_INFO("playerbots", "[CompanionCoop] Cleared DB group_guid {} after native group disband", d.groupId);
     }
 
@@ -1499,6 +1916,29 @@ void CompanionBrain::FlushCoopGroupMutations()
                 std::lock_guard<std::mutex> lock(gAdmissionMutex);
                 (void)gAdmissionController.MarkCommitted(req.opportunityId);
             }
+            {
+                // Register accepted native group ownership in DrainCoordinator (separated from admission mode!).
+                std::vector<uint32_t> memGuids;
+                memGuids.reserve(req.snap.members.size());
+                for (auto const& nm : req.snap.members)
+                    memGuids.push_back(nm.guid);
+                uint32 runExpiresAt = 0;
+                {
+                    std::lock_guard<std::mutex> lock(gCoopMutex);
+                    for (auto const& r : gCoopRegistry.Runs())
+                    {
+                        if (r.opportunityId == req.opportunityId)
+                        {
+                            runExpiresAt = r.expiresAt;
+                            break;
+                        }
+                    }
+                }
+                std::lock_guard<std::mutex> dlock(gDrainMutex);
+                gDrainCoordinator.RegisterCommittedGroup(req.opportunityId, req.revision, req.snap.groupId,
+                                                         req.snap.groupToken, runTargetMap, req.snap.isLfg, memGuids,
+                                                         now, runExpiresAt);
+            }
             std::lock_guard<std::mutex> lock(gCoopQueueMutex);
             gFailedBindCooldown.erase(req.opportunityId);
             LOG_INFO("playerbots",
@@ -1526,21 +1966,60 @@ void CompanionBrain::FlushCoopGroupMutations()
 
 void CompanionBrain::ReloadCoopMemberships()
 {
-    if (!CoopEnabled())
+    CompanionCoopDrain::CoopMode const mode = GetCoopMode();
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    uint32 const drainGraceSec = sConfigMgr->GetOption<uint32>(
+        "AiPlayerbot.Companion.Coop.DrainGraceSeconds", CompanionCoopDrain::DEFAULT_DRAIN_GRACE_SEC, false);
+    uint32 const outageGraceSec = sConfigMgr->GetOption<uint32>(
+        "AiPlayerbot.Companion.Coop.OutageGraceSeconds", CompanionCoopDrain::DEFAULT_OUTAGE_GRACE_SEC, false);
+
+    if (!CompanionCoopDrain::AllowsNewAdmissions(mode))
     {
-        std::lock_guard<std::mutex> lock(gCoopMutex);
-        if (!gCoopRegistry.Runs().empty())
-            gCoopRegistry.Clear();
-        return;
+        // Issue #22: Toggle OFF or Draining MUST NOT wipe already-committed groups mid-pull!
+        // On startup (gCoopBootProbeDone == false), ALWAYS probe DB once even in Off mode so pre-existing
+        // committed groups survive a restart and drain safely instead of being disbanded as strays!
+        bool hasOwned = false;
+        {
+            std::lock_guard<std::mutex> lock(gDrainMutex);
+            gDrainCoordinator.TriggerGlobalDrain(mode, now, drainGraceSec);
+            hasOwned = gDrainCoordinator.HasOwnedGroups();
+        }
+        bool hasPendingWrites = false;
+        {
+            std::lock_guard<std::mutex> lock(gCoopQueueMutex);
+            gPendingCoopBinds.clear();
+            gFailedBindCooldown.clear();
+            hasPendingWrites =
+                (!gPendingCoopExits.empty() || !gPendingCoopDisbands.empty() || !gPendingDrainedOpps.empty());
+        }
+        if (mode == CompanionCoopDrain::CoopMode::Off && !hasOwned && !hasPendingWrites && gCoopBootProbeDone.load())
+        {
+            std::lock_guard<std::mutex> lock(gCoopMutex);
+            if (!gCoopRegistry.Runs().empty())
+                gCoopRegistry.Clear();
+            return;
+        }
     }
 
-    FlushCoopGroupMutations();
-
+    // Issue #22 (P1-2): ALWAYS probe DB health BEFORE flushing mutations so exit/disband writes are NEVER
+    // attempted into a just-failed DB and lost!
     QueryResult probe = CharacterDatabase.Query(
         "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() "
         "AND table_name IN ('companion_opportunities', 'companion_opportunity_interests', "
         "'companion_personas', 'companion_persona_characters')");
-    if (!probe || probe->Fetch()[0].Get<uint64>() < 4)
+    if (!probe)
+    {
+        // Real DB outage (COUNT(*) returned nullptr)! NEVER clear committed group ownership mid-pull;
+        // mark DB unhealthy so exit/disband writes stay queued until recovery, and drain at safe boundary past grace.
+        gCoopDbHealthy.store(false);
+        std::lock_guard<std::mutex> lock(gDrainMutex);
+        gDrainCoordinator.NoteDbOutage(now, outageGraceSec, drainGraceSec);
+        LOG_WARN("playerbots", "[CompanionCoop] DB probe failed (transient outage); preserving committed groups");
+        return;
+    }
+    gCoopBootProbeDone.store(true);
+    gCoopDbHealthy.store(true);
+    if (probe->Fetch()[0].Get<uint64>() < 4)
     {
         if (!gCoopSchemaMissingLogged)
         {
@@ -1548,10 +2027,25 @@ void CompanionBrain::ReloadCoopMemberships()
             LOG_WARN("playerbots",
                      "[CompanionCoop] Cooperative authorization disabled: required Phase II tables missing");
         }
-        std::lock_guard<std::mutex> lock(gCoopMutex);
-        gCoopRegistry.Clear();
+        bool hasOwned = false;
+        {
+            std::lock_guard<std::mutex> lock(gDrainMutex);
+            hasOwned = gDrainCoordinator.HasOwnedGroups();
+        }
+        if (!hasOwned)
+        {
+            std::lock_guard<std::mutex> lock(gCoopMutex);
+            gCoopRegistry.Clear();
+        }
         return;
     }
+
+    {
+        std::lock_guard<std::mutex> lock(gDrainMutex);
+        gDrainCoordinator.NoteDbHealthy();
+    }
+    // DB is confirmed healthy right now — flush pending exits, disbands (and binds if Enabled) before reading DB!
+    FlushCoopGroupMutations();
 
     uint64 startGen = 0;
     {
@@ -1559,14 +2053,17 @@ void CompanionBrain::ReloadCoopMemberships()
         startGen = gCoopRegistry.BindGeneration();
     }
 
-    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
     uint32 const graceSec = sConfigMgr->GetOption<uint32>("AiPlayerbot.Companion.Coop.ExitGraceMinutes", 10, false) * 60;
     uint32 const assemblyGraceSec = sConfigMgr->GetOption<uint32>(
         "AiPlayerbot.Companion.Coop.AssemblyGraceSeconds", CompanionCoopAuth::DEFAULT_ASSEMBLY_GRACE_SEC, false);
 
-    // Issue #11: Filter expiry in SQL, exclude zombie active rows with group_guid=0, limit by OPPORTUNITIES
-    // (never truncating a roster mid-group!), use EXISTS for persona_characters (preventing duplicate rows across
-    // incarnations), load roles_json to verify exact required headcount/roles, and NEVER select 'reserved' rows.
+    // Issue #11 & #22: When mode != Enabled (Draining/Off), load ONLY already-bound active runs (for safe drain /
+    // restart resilience) and NEVER load new assembling runs!
+    std::string const stateFilter =
+        CompanionCoopDrain::AllowsNewAdmissions(mode)
+            ? "(state = 'assembling' OR (state = 'active' AND group_guid > 0))"
+            : "(state = 'active' AND group_guid > 0)";
+
     std::unordered_map<uint64, CompanionCoopAuth::AuthorizedRun> runsByOpp;
     QueryResult res = CharacterDatabase.Query(Acore::StringFormat(
         "SELECT o.id, o.revision, o.dungeon_map_id, o.difficulty, o.group_guid, o.state, "
@@ -1579,7 +2076,7 @@ void CompanionBrain::ReloadCoopMemberships()
         "JOIN ("
         "  SELECT id FROM companion_opportunities "
         "  WHERE is_shadow = 0 AND kind = 'dungeon_run' "
-        "  AND (state = 'assembling' OR (state = 'active' AND group_guid > 0)) "
+        "  AND {} "
         "  AND (recruit_until + estimated_minutes * 60 + {}) > {} "
         "  ORDER BY id ASC LIMIT 50"
         ") active_ops ON active_ops.id = o.id "
@@ -1587,7 +2084,7 @@ void CompanionBrain::ReloadCoopMemberships()
         "LEFT JOIN companion_personas p ON p.persona_id = i.persona_id "
         "WHERE i.state IN ('accepted', 'active') "
         "ORDER BY o.id ASC, i.character_guid ASC",
-        graceSec, now));
+        stateFilter, graceSec, now));
     if (res)
     {
         do
@@ -1641,13 +2138,160 @@ void CompanionBrain::ReloadCoopMemberships()
         } while (res->NextRow());
     }
 
+    // Confirm gPendingDrainedOpps cleanup ONLY once DB query proves the row is no longer active/assembling
+    // and no pending exit remains queued for that oppId!
+    std::unordered_set<uint64> skipDrained;
+    std::unordered_set<uint64_t> pendingExitOppIds;
+    {
+        std::lock_guard<std::mutex> lock(gCoopQueueMutex);
+        for (auto const& ex : gPendingCoopExits)
+            pendingExitOppIds.insert(ex.opportunityId);
+        for (auto it = gPendingDrainedOpps.begin(); it != gPendingDrainedOpps.end();)
+        {
+            if (runsByOpp.find(*it) == runsByOpp.end() && pendingExitOppIds.count(*it) == 0)
+                it = gPendingDrainedOpps.erase(it);
+            else
+                ++it;
+        }
+        skipDrained = gPendingDrainedOpps;
+    }
+
     std::unordered_set<uint64_t> liveOppIds;
+    std::unordered_set<uint32_t> liveGroupIds;
     std::vector<CompanionCoopAuth::AuthorizedRun> nextRuns;
+    std::vector<PendingCoopExit> orphanCleanupExits;
     nextRuns.reserve(runsByOpp.size());
+
     for (auto& [oppId, run] : runsByOpp)
     {
+        if (skipDrained.count(oppId) > 0)
+            continue;  // Already drained in memory; awaiting confirmed DB persistence — never revive!
+
+        // Issue #22 (P1-1): Verify any DB 'active' row with group_guid > 0 actually has a live native Group!
+        // If the native group is already gone (e.g. crash/shutdown orphan), clean it up cleanly instead of
+        // re-registering ownership and leaking its admission token forever!
+        if (!run.isShadow && run.boundToNativeGroup && run.expectedGroupId != 0 && run.runState == "active")
+        {
+            Group const* nativeGrp = sGroupMgr->GetGroupByGUID(run.expectedGroupId);
+            if (!nativeGrp)
+            {
+                std::vector<uint32> memGuids;
+                memGuids.reserve(run.roster.size());
+                for (auto const& m : run.roster)
+                    memGuids.push_back(m.characterGuid);
+                ReleaseCoopAdmissionToken(oppId);
+                PendingCoopExit ex;
+                ex.opportunityId = oppId;
+                ex.exitedMemberGuids = std::move(memGuids);
+                ex.reason = (mode == CompanionCoopDrain::CoopMode::Off) ? CompanionCoopDrain::DrainReason::ToggleOff
+                                                                        : CompanionCoopDrain::DrainReason::RunExpired;
+                ex.groupFullyExited = true;
+                orphanCleanupExits.push_back(std::move(ex));
+                LOG_INFO("playerbots",
+                         "[CompanionCoop] Swept orphaned DB active opp #{} (native group {} no longer exists)",
+                         oppId, run.expectedGroupId);
+                continue;
+            }
+            liveGroupIds.insert(run.expectedGroupId);
+            std::vector<uint32_t> memGuids;
+            memGuids.reserve(run.roster.size());
+            for (auto const& m : run.roster)
+                memGuids.push_back(m.characterGuid);
+            uint64 const liveToken = GroupTokenFor(nativeGrp);
+            std::lock_guard<std::mutex> dlock(gDrainMutex);
+            gDrainCoordinator.RegisterCommittedGroup(run.opportunityId, run.revision, run.expectedGroupId, liveToken,
+                                                     run.targetMapId, nativeGrp->isLFGGroup() || run.isLfgBound,
+                                                     memGuids, now, run.expiresAt);
+        }
         liveOppIds.insert(oppId);
         nextRuns.push_back(std::move(run));
+    }
+
+    // Check liveness of ALL currently owned groups (world thread safe via sGroupMgr->GetGroupByGUID) AND query
+    // their EXACT DB states directly (`WHERE id IN (...)`) — NEVER infer DB closure from the time-filtered/LIMIT-50
+    // reload query, or RunExpired runs would get swept mid-pull right when their time window expires!
+    std::vector<uint32_t> ownedGroupIds;
+    std::vector<uint64_t> ownedOppIds;
+    {
+        std::lock_guard<std::mutex> dlock(gDrainMutex);
+        ownedGroupIds = gDrainCoordinator.OwnedGroupIds();
+        ownedOppIds = gDrainCoordinator.OwnedOpportunityIds();
+    }
+    for (uint32_t gid : ownedGroupIds)
+    {
+        if (sGroupMgr->GetGroupByGUID(gid) != nullptr)
+            liveGroupIds.insert(gid);
+    }
+    std::unordered_set<uint64_t> dbClosedOppIds;
+    if (!ownedOppIds.empty())
+    {
+        std::ostringstream idList;
+        for (size_t i = 0; i < ownedOppIds.size(); ++i)
+        {
+            if (i > 0)
+                idList << ",";
+            idList << ownedOppIds[i];
+        }
+        std::unordered_map<uint64_t, std::string> exactDbStates;
+        QueryResult stateRes = CharacterDatabase.Query(
+            Acore::StringFormat("SELECT id, state FROM companion_opportunities WHERE id IN ({})", idList.str()));
+        bool stateQueryOk = (stateRes != nullptr);
+        if (stateRes)
+        {
+            do
+            {
+                Field* sf = stateRes->Fetch();
+                exactDbStates[sf[0].Get<uint64>()] = sf[1].Get<std::string>();
+            } while (stateRes->NextRow());
+        }
+        else if (CharacterDatabase.Query("SELECT 1"))
+        {
+            // DB is healthy and returned 0 rows (all owned IDs deleted from DB).
+            stateQueryOk = true;
+        }
+        if (stateQueryOk)
+        {
+            for (uint64_t oid : ownedOppIds)
+            {
+                auto sit = exactDbStates.find(oid);
+                if (sit == exactDbStates.end() || !CompanionCoopAuth::IsActiveRunState(sit->second))
+                    dbClosedOppIds.insert(oid);
+            }
+        }
+    }
+    std::vector<CompanionCoopDrain::StaleGroupCleanup> staleCleaned;
+    {
+        std::lock_guard<std::mutex> dlock(gDrainMutex);
+        staleCleaned = gDrainCoordinator.SweepOrphanedOrExpiredGroups(dbClosedOppIds, liveGroupIds, pendingExitOppIds, now);
+        if (!CompanionCoopDrain::AllowsNewAdmissions(mode))
+            gDrainCoordinator.TriggerGlobalDrain(mode, now, drainGraceSec);
+    }
+    for (auto const& item : staleCleaned)
+    {
+        ReleaseCoopAdmissionToken(item.opportunityId);
+        if (item.needsDbDrainWrite)
+        {
+            PendingCoopExit ex;
+            ex.opportunityId = item.opportunityId;
+            ex.exitedMemberGuids = item.remainingMembers;
+            ex.reason = item.reason;
+            ex.groupFullyExited = true;
+            orphanCleanupExits.push_back(std::move(ex));
+        }
+        LOG_INFO("playerbots", "[CompanionCoop] Swept stale owned opp #{} (group {}, db_write={})",
+                 item.opportunityId, item.groupId, item.needsDbDrainWrite ? "yes" : "no");
+    }
+    if (!orphanCleanupExits.empty())
+    {
+        {
+            std::lock_guard<std::mutex> lock(gCoopQueueMutex);
+            for (auto& ex : orphanCleanupExits)
+            {
+                gPendingDrainedOpps.insert(ex.opportunityId);
+                gPendingCoopExits.push_back(std::move(ex));
+            }
+        }
+        FlushCoopGroupMutations();
     }
 
     bool reloaded = false;
@@ -1658,9 +2302,15 @@ void CompanionBrain::ReloadCoopMemberships()
     }
     if (reloaded)
     {
-        // Prune committed tokens for completed/expired/cancelled opportunities so tokens never leak over uptime!
+        // Prune committed tokens ONLY for runs that are neither in liveOppIds nor still owned/draining!
+        std::unordered_set<uint64_t> keepOppIds = liveOppIds;
+        {
+            std::lock_guard<std::mutex> dlock(gDrainMutex);
+            for (uint64_t oid : gDrainCoordinator.OwnedOpportunityIds())
+                keepOppIds.insert(oid);
+        }
         std::lock_guard<std::mutex> lock(gAdmissionMutex);
-        (void)gAdmissionController.PruneCommittedTokensNotIn(liveOppIds);
+        (void)gAdmissionController.PruneCommittedTokensNotIn(keepOppIds);
     }
 }
 

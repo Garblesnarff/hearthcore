@@ -716,6 +716,28 @@ class MySQLIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(run_sql("SELECT group_guid FROM companion_opportunities WHERE id = 5001;")[0], ["0"])
 
+        # 4) Issue #22: Verify exact neutral 'drained' + 'released' SQL against real MySQL 8.0 schema!
+        run_sql(
+            f"UPDATE companion_opportunity_interests SET state = 'released', reason_code = 'coop_toggled_off', "
+            f"reserved_until = 0, updated_at = {now} "
+            f"WHERE opportunity_id = 5001 AND character_guid = 101 AND state IN ('reserved', 'accepted', 'active');"
+        )
+        run_sql(
+            "UPDATE companion_opportunities SET state = 'drained', group_guid = 0, outcome_reason = 'coop_toggled_off' "
+            "WHERE id = 5001 AND is_shadow = 0 AND state IN ('assembling', 'active');"
+        )
+        self.assertEqual(
+            run_sql("SELECT state, group_guid, outcome_reason FROM companion_opportunities WHERE id = 5001;")[0],
+            ["drained", "0", "coop_toggled_off"],
+        )
+        self.assertEqual(
+            run_sql(
+                "SELECT state, reason_code, reserved_until FROM companion_opportunity_interests "
+                "WHERE opportunity_id = 5001 AND character_guid = 101;"
+            )[0],
+            ["released", "coop_toggled_off", "0"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

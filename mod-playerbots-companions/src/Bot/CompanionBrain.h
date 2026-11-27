@@ -24,6 +24,12 @@ namespace CompanionCoopAuth
 {
 struct NativeGroupSnapshot;
 }
+namespace CompanionCoopDrain
+{
+enum class CoopMode : uint8;
+enum class DrainReason : uint8;
+struct DrainDecision;
+}
 
 // Companion brain: bag item classes and per-companion weights (acore_characters.companion_weights).
 //
@@ -101,7 +107,8 @@ public:
                                       uint64 expectedOrderId = 0, uint32 expectedSnapshotRev = 0);
     static void ReloadProposals();
 
-    // Phase II Cooperative Mode (Cards II-05/II-06, Issue #11, gated by AiPlayerbot.Companion.Coop.Enabled = 0).
+    // Phase II Cooperative Mode (Cards II-05/II-06, Issues #11, #12, #22, gated by AiPlayerbot.Companion.Coop.Enabled = 0).
+    static CompanionCoopDrain::CoopMode GetCoopMode();
     static bool CoopEnabled();
     static bool IsAuthorizedCoopMember(uint32 lowGuid, uint64& outOppId, uint32& outTargetMap, uint32& outGroupId);
     // Any thread (pure in-memory, never blocks map threads on DB I/O). When allowQueueBind=true (TickBot),
@@ -109,9 +116,18 @@ public:
     static bool AuthorizeCoopGroup(Player const* bot, CompanionCoopAuth::NativeGroupSnapshot const& snap,
                                    bool allowQueueBind = false, bool* outAssemblyInProgress = nullptr,
                                    std::string* outReason = nullptr);
-    // GroupScript lifecycle hooks & monotonic token lookup (real group-ID reuse & disband protection).
+    // Issue #22: Cooperative drain, safe owner recall, shift-end & outage handling (NEVER disbands mid-pull!).
+    static bool IsCoopBootProbeDone();
+    static bool RequestCoopOwnerRecall(uint32 botGuid);
+    static void ClearCoopOwnerRecall(uint32 botGuid);
+    static bool IsCoopGroupHoldingForDrain(Player const* bot, Group const* group);
+    static CompanionCoopDrain::DrainDecision EvaluateCoopDrain(Player const* bot, Group const* group, bool shiftEnded,
+                                                               bool ownerRecalled);
+    static void MarkCoopExitInitiated(uint64 opportunityId, uint32 botGuid, CompanionCoopDrain::DrainReason reason);
+    // GroupScript lifecycle hooks & monotonic token lookup (real group-ID reuse, disband & actual exit release).
     static uint64 GroupTokenFor(Group const* group);
     static uint64 OnNativeGroupCreated(Group const* group);
+    static void OnNativeGroupMemberRemoved(Group const* group, uint32 memberLowGuid);
     static void OnNativeGroupDisbanded(Group const* group);
     // Issue #12: Native admission flags, fail-closed resource limits, persisted hysteresis & atomic caps.
     static bool TryAdmitCoopQueue(uint64 opportunityId, uint32 targetMapId, bool allMembersEnrolled,

@@ -8,6 +8,7 @@
 
 #include "CompanionBrain.h"
 #include "CompanionCoopAuthLogic.h"
+#include "CompanionCoopDrainLogic.h"
 #include "CompanionCraft.h"
 #include "CompanionClassStrategy.h"
 #include "CompanionGatherStrategy.h"
@@ -1354,10 +1355,19 @@ CompanionCoopAuth::NativeGroupSnapshot BuildCoopGroupSnapshot(CompanionBotMgr co
 
 bool CompanionBotMgr::IsInAuthorizedCoopGroup(Player const* bot) const
 {
-    if (!bot || !CompanionBrain::CoopEnabled())
+    if (!bot)
         return false;
     Group const* group = bot->GetGroup();
     if (!group)
+        return false;
+
+    // Issue #22: Pure read-only check! Keep cooperative combat strategies active ONLY while an owned
+    // committed group is actively draining/holding through combat or awaiting queued exit; healthy active
+    // runs ALWAYS go through full Issue #11 exact-roster AuthorizeCoopGroup verification!
+    if (CompanionBrain::IsCoopGroupHoldingForDrain(bot, group))
+        return true;
+
+    if (!CompanionBrain::CoopEnabled())
         return false;
 
     CompanionCoopAuth::NativeGroupSnapshot snap = BuildCoopGroupSnapshot(*this, group);
@@ -1662,7 +1672,8 @@ void CompanionBotMgr::TickBot(PlayerbotAI* botAI)
 
     if (groupedWithOwner)
     {
-        // The owner's group always wins: it ends any lease (no failure, no cooldown).
+        // The owner's group always wins: it ends any lease (no failure, no cooldown) and clears pending coop recalls.
+        CompanionBrain::ClearCoopOwnerRecall(bot->GetGUID().GetCounter());
         CompanionLease::RequestInterrupt(bot, CompanionLease::Interrupt::Group);
         if (botAI->GetCompanionMode() != PlayerbotAI::COMPANION_FOLLOW)
         {
@@ -1675,10 +1686,61 @@ void CompanionBotMgr::TickBot(PlayerbotAI* botAI)
         return;
     }
 
-    // Phase II (Card II-05, Issue #11): Explicit COMPANION_COOPERATIVE mode for authorized bot-only 5-player
-    // dungeon groups (gated by AiPlayerbot.Companion.Coop.Enabled=0 by default). Owner groups ALWAYS
-    // take precedence above; bounded partial assembly is permitted without granting cooperative dungeon control;
-    // arbitrary, expired, mismatched, raid, or unrecognized groups are disbanded below.
+    // Issue #22: On startup, wait for the first world-thread boot DB probe before treating any bot-only non-owner
+    // group as a stray (never holds human-led groups!), so pre-existing committed coop groups are adopted safely!
+    if (group && !CompanionBrain::IsCoopBootProbeDone())
+    {
+        bool hasHuman = false;
+        for (Group::MemberSlot const& slot : group->GetMemberSlots())
+        {
+            if (IsAnyOwnerLow(slot.guid.GetCounter()) || !IsCompanionSlot(slot.guid, slot.name))
+            {
+                hasHuman = true;
+                break;
+            }
+        }
+        if (!hasHuman)
+            return;
+    }
+
+    // Issue #22: Check accepted cooperative group ownership & safe-boundary drain BEFORE checking CoopEnabled()
+    // or falling through to stray-group disband! Toggling coop OFF, expiry, owner recall, shift end, or DB/worker
+    // outages NEVER arbitrarily disband a committed group mid-pull.
+    if (group)
+    {
+        bool const shiftEnded = !IsScheduledOnline(bot->GetName(), bot);
+        bool const ownerInvited =
+            (bot->GetGroupInvite() != nullptr && IsAnyOwnerLow(bot->GetGroupInvite()->GetLeaderGUID().GetCounter()));
+        CompanionCoopDrain::DrainDecision const drain =
+            CompanionBrain::EvaluateCoopDrain(bot, group, shiftEnded, ownerInvited);
+
+        if (drain.action == CompanionCoopDrain::DrainAction::HoldInCombat ||
+            drain.action == CompanionCoopDrain::DrainAction::ExitPending)
+        {
+            // Mid-pull / combat / dead during drain, OR LeaveOrDisbandGroup() recently queued and awaiting
+            // actual GroupScript::OnRemoveMember / OnDisband: do NOT fall through to stray-group disband!
+            return;
+        }
+        if (drain.action == CompanionCoopDrain::DrainAction::ExitAtSafeBoundary)
+        {
+            // Safe boundary reached (or bounded grace deadline expired / exit retry due): mark exit initiated
+            // (commitment will be released ONLY when GroupScript::OnRemoveMember / OnDisband confirms actual exit!)
+            // and queue native CMSG_GROUP_DISBAND (AzerothCore's LFG removal hook handles LFG dungeon teleport-out!).
+            LOG_INFO("playerbots",
+                     "[CompanionCoop] {} leaving committed group {} ({}, opp #{}, retry={}, forced_grace={}, lfg_penalty={})",
+                     bot->GetName(), group->GetGUID().GetCounter(), drain.outcomeTag, drain.opportunityId,
+                     drain.retryExit ? "yes" : "no", drain.forcedByGraceDeadline ? "yes" : "no",
+                     drain.expectLfgDeserterPenalty ? "expected" : "none");
+            CompanionBrain::MarkCoopExitInitiated(drain.opportunityId, bot->GetGUID().GetCounter(), drain.reason);
+            botAI->LeaveOrDisbandGroup();
+            return;
+        }
+    }
+
+    // Phase II (Card II-05, Issues #11, #12, #22): Explicit COMPANION_COOPERATIVE mode for authorized bot-only
+    // 5-player dungeon groups. Owner groups ALWAYS take precedence above; bounded partial assembly is permitted
+    // without granting cooperative dungeon control; arbitrary, expired, mismatched, raid, or unrecognized groups
+    // are disbanded below.
     if (group && CompanionBrain::CoopEnabled())
     {
         bool assemblyInProgress = false;
