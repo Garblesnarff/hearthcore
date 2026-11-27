@@ -124,7 +124,7 @@ class CharacterSheetAndControlsTests(unittest.TestCase):
             # Operator directive visible when not redacted
             self.assertEqual(sheet["ai_brain"]["operator_directive"]["note"], "Smelt bronze bars today!")
 
-            # Redacted LAN kiosk mode hides directive & sets can_control=False
+            # Redacted LAN kiosk mode hides directive & sets can_control=False & hides human private details
             sheet_ro = fetch_character_sheet(
                 "brannoc",
                 sql_exec=_mock_sql_for_characters([], is_companion=True),
@@ -136,14 +136,30 @@ class CharacterSheetAndControlsTests(unittest.TestCase):
             assert sheet_ro is not None
             self.assertFalse(sheet_ro["can_control"])
             self.assertTrue(sheet_ro["ai_brain"]["redacted"])
+            self.assertFalse(sheet_ro["ai_brain"]["paused"])
             self.assertIsNone(sheet_ro["ai_brain"]["operator_directive"])
 
-            # Human character (Wonky) returns full sheet with is_companion=False & can_control=False
+            human_redacted = fetch_character_sheet(
+                "wonky",
+                sql_exec=_mock_sql_for_characters([], is_companion=False),
+                db_path=db_p,
+                now_ts=1_800_000_050,
+                redact_admin=True,
+                can_control=False,
+            )
+            assert human_redacted is not None
+            self.assertTrue(human_redacted["redacted"])
+            self.assertIsNone(human_redacted["character"]["money"])
+            self.assertIsNone(human_redacted["character"]["homebind"])
+            self.assertEqual(human_redacted["gear"], [])
+
+            # Human character (Wonky) returns full sheet with is_companion=False & can_control=False when unredacted
             human_sheet = fetch_character_sheet(
                 "wonky",
                 sql_exec=_mock_sql_for_characters([], is_companion=False),
                 db_path=db_p,
                 now_ts=1_800_000_050,
+                redact_admin=False,
                 can_control=True,
             )
             assert human_sheet is not None
@@ -154,15 +170,19 @@ class CharacterSheetAndControlsTests(unittest.TestCase):
 
     def test_all_five_companion_direction_controls_and_human_rejection(self):
         with tempfile.TemporaryDirectory() as tmp:
-            db_p = Path(tmp) / "brain.db"
+            tp = Path(tmp)
+            db_p = tp / "brain.db"
+            rt_p = tp / "runtime"
             sql_log: list[str] = []
             runner = _mock_sql_for_characters(sql_log, is_companion=True, existing_overrides=True)
 
-            # 1. Focus preset writes monotonic revision > remote_max (50) with source='operator'
-            res_p = apply_focus_preset("brannoc", "craft", hours=3, sql_exec=runner, now_ts=1_800_000_000)
+            # 1. Focus preset uses SAME monotonic revision counter (remote_max 50 -> 51, NOT epoch!)
+            res_p = apply_focus_preset(
+                "brannoc", "craft", hours=3, sql_exec=runner, db_path=db_p, runtime_dir=rt_p, now_ts=1_800_000_000
+            )
             self.assertTrue(res_p["ok"])
             self.assertEqual(res_p["hours"], 3)
-            self.assertGreater(res_p["revision"], 50)
+            self.assertEqual(res_p["revision"], 51)
             self.assertTrue(any("INSERT INTO companion_weight_overrides" in q and "'operator'" in q for q in sql_log))
 
             # 2. Manual weight slider pin + unpin + invalid key rejection
@@ -186,16 +206,33 @@ class CharacterSheetAndControlsTests(unittest.TestCase):
             res_clr = set_character_directive("brannoc", "", sql_exec=runner, db_path=db_p, now_ts=1_800_000_010)
             self.assertFalse(res_clr["directive"]["active"])
 
-            # 4. Pause / Resume AI (both when overrides exist and when none exist yet)
+            # 4. Pause / Resume AI (persists in brain.db + MySQL; rejects presets while paused or brain.disabled!)
             sql_log.clear()
-            res_pause = set_character_ai_paused("brannoc", True, sql_exec=runner, now_ts=1_800_000_000)
+            res_pause = set_character_ai_paused(
+                "brannoc", True, sql_exec=runner, db_path=db_p, runtime_dir=rt_p, now_ts=1_800_000_000
+            )
             self.assertTrue(res_pause["paused"])
+            self.assertTrue(BrainStore(db_p).is_character_paused("brannoc"))
             self.assertTrue(any("UPDATE companion_weight_overrides SET enabled = 0 WHERE guid = 1556" in q for q in sql_log))
+            with self.assertRaises(Invalid):
+                apply_focus_preset("brannoc", "craft", sql_exec=runner, db_path=db_p, runtime_dir=rt_p)
 
+            # Resume, then test global brain.disabled kill switch blocks resume & presets!
+            set_character_ai_paused("brannoc", False, sql_exec=runner, db_path=db_p, runtime_dir=rt_p, now_ts=1_800_000_005)
+            self.assertFalse(BrainStore(db_p).is_character_paused("brannoc"))
+            rt_p.mkdir(parents=True, exist_ok=True)
+            (rt_p / "brain.disabled").write_text("disabled\n", encoding="utf-8")
+            with self.assertRaises(Invalid):
+                set_character_ai_paused("brannoc", False, sql_exec=runner, db_path=db_p, runtime_dir=rt_p)
+            with self.assertRaises(Invalid):
+                apply_focus_preset("brannoc", "craft", sql_exec=runner, db_path=db_p, runtime_dir=rt_p)
+            (rt_p / "brain.disabled").unlink()
+
+            # Pause when no override rows exist yet: verify exact VALUES tuple has enabled=0 (after 'operator',)!
             sql_no_ov: list[str] = []
             runner_no_ov = _mock_sql_for_characters(sql_no_ov, is_companion=True, existing_overrides=False)
-            set_character_ai_paused("brannoc", True, sql_exec=runner_no_ov, now_ts=1_800_000_000)
-            self.assertTrue(any("INSERT INTO companion_weight_overrides" in q and ", 0, " in q for q in sql_no_ov))
+            set_character_ai_paused("brannoc", True, sql_exec=runner_no_ov, db_path=db_p, runtime_dir=rt_p, now_ts=1_800_000_000)
+            self.assertTrue(any("'operator', 0, 1800000000" in q for q in sql_no_ov))
 
             # 5. Work Order creation & Shift Schedule update
             sql_log.clear()
@@ -214,7 +251,24 @@ class CharacterSheetAndControlsTests(unittest.TestCase):
             # Reject direction controls on human characters!
             human_runner = _mock_sql_for_characters([], is_companion=False)
             with self.assertRaises(Invalid):
-                apply_focus_preset("wonky", "craft", sql_exec=human_runner)
+                apply_focus_preset("wonky", "craft", sql_exec=human_runner, db_path=db_p, runtime_dir=rt_p)
+
+            # DB credentials fail closed (never silently fall back to root!)
+            from hearthcore.character_ctl import run_operator_sql, run_read_sql
+            with mock.patch.dict(os.environ, {
+                "HEARTHCORE_ENV_PATH": str(tp / "missing.env"),
+                "HEARTHCORE_TEST_DB": "",
+                "HEARTHCORE_OPERATOR_DB_DEFAULTS_FILE": "",
+                "HEARTHCORE_OPERATOR_DB_CONTAINER_DEFAULTS_FILE": "",
+                "HEARTHCORE_OPERATOR_DB_HOST": "",
+                "AZEROTH_WATCH_DB_DEFAULTS_FILE": "",
+                "AZEROTH_WATCH_DB_CONTAINER_DEFAULTS_FILE": "",
+                "AZEROTH_WATCH_DB_HOST": "",
+            }, clear=False):
+                with self.assertRaises(Invalid):
+                    run_operator_sql("SELECT 1;")
+                with self.assertRaises(Invalid):
+                    run_read_sql("SELECT 1;")
 
     def test_operator_directive_injected_into_claude_prompt_and_marked_consumed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -225,6 +279,7 @@ class CharacterSheetAndControlsTests(unittest.TestCase):
             store.set_operator_directive("brannoc", "Prioritize Blacksmithing skillups over quests!", now_ts=1_800_000_000)
 
             captured_payloads = []
+            captured_sql = []
 
             def fake_api(payload):
                 captured_payloads.append(payload)
@@ -265,6 +320,10 @@ class CharacterSheetAndControlsTests(unittest.TestCase):
                 },
             }
 
+            def rec_sql(s: str):
+                captured_sql.append(s)
+                return [["0"]] if "SELECT GREATEST(" in s else []
+
             with mock.patch.dict(os.environ, {"ANTHROPIC_MODEL": "claude-sonnet-5-5", "HEARTHCORE_DAILY_CALL_CAP": "100"}):
                 run_cycle(
                     provider="anthropic",
@@ -274,20 +333,41 @@ class CharacterSheetAndControlsTests(unittest.TestCase):
                     runtime_dir=rt_p,
                     world_ctx_override=world,
                     http_post_fn=fake_api,
-                    sql_exec=lambda s: [["0"]] if "SELECT GREATEST(" in s else [],
+                    sql_exec=rec_sql,
                     now_ts_override=1_800_000_100,
                 )
 
             self.assertEqual(len(captured_payloads), 1)
-            user_obj = json.loads(captured_payloads[0]["messages"][0]["content"])
-            self.assertEqual(user_obj["operator_directive"], "Prioritize Blacksmithing skillups over quests!")
-            self.assertIn("operator_directive", captured_payloads[0]["system"])
+            # Directive is cleanly placed inside delimited <TRUSTED_OPERATOR_DIRECTIVE> block in system prompt!
+            self.assertIn("<TRUSTED_OPERATOR_DIRECTIVE>", captured_payloads[0]["system"])
+            self.assertIn("Prioritize Blacksmithing skillups over quests!", captured_payloads[0]["system"])
+            # apply_plan_to_db preserves unexpired operator focus presets!
+            self.assertTrue(any("NOT (`source` = 'operator' AND `enabled` = 1 AND `expires_at` >" in q for q in captured_sql))
 
-            # Verify directive was stamped as consumed!
-            after = store.get_operator_directive("brannoc", now_ts=1_800_000_200)
-            self.assertIsNotNone(after)
-            assert after is not None
-            self.assertEqual(after["consumed_at"], 1_800_000_100)
+            # Verify one-shot directive is consumed and NOT re-sent on next plan!
+            self.assertIsNone(store.get_operator_directive("brannoc", now_ts=1_800_000_200))
+            after_inc = store.get_operator_directive("brannoc", now_ts=1_800_000_200, include_consumed=True)
+            assert after_inc is not None
+            self.assertEqual(after_inc["consumed_at"], 1_800_000_100)
+
+            # Paused character MUST be skipped completely by run_cycle (zero Claude API calls)!
+            captured_payloads.clear()
+            store.set_character_paused("brannoc", True, now_ts=1_800_000_250)
+            with mock.patch.dict(os.environ, {"ANTHROPIC_MODEL": "claude-sonnet-5-5", "HEARTHCORE_DAILY_CALL_CAP": "100"}):
+                res_paused = run_cycle(
+                    provider="anthropic",
+                    apply=True,
+                    force=True,
+                    character="brannoc",
+                    db_path=db_p,
+                    runtime_dir=rt_p,
+                    world_ctx_override=world,
+                    http_post_fn=fake_api,
+                    sql_exec=rec_sql,
+                    now_ts_override=1_800_000_300,
+                )
+            self.assertEqual(len(captured_payloads), 0, "Paused companion MUST NOT call Anthropic API!")
+            self.assertEqual(res_paused["planned_count"], 0)
 
     def test_http_character_routes_and_loopback_write_csrf_security(self):
         aw_dir = str((ROOT / "azeroth-watch").resolve())
@@ -406,13 +486,16 @@ class CharacterSheetAndControlsTests(unittest.TestCase):
             port = srv.server_address[1]
             threading.Thread(target=srv.serve_forever, daemon=True).start()
             try:
-                def post(path, payload, origin=None):
+                def post(path, payload, origin=None, extra_headers=None, omit_origin=False):
                     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
                     hdrs = {
                         "Host": f"127.0.0.1:{port}",
                         "Content-Type": "application/json",
-                        "Origin": origin if origin is not None else f"http://127.0.0.1:{port}",
                     }
+                    if not omit_origin:
+                        hdrs["Origin"] = origin if origin is not None else f"http://127.0.0.1:{port}"
+                    if extra_headers:
+                        hdrs.update(extra_headers)
                     conn.request("POST", path, body=json.dumps(payload), headers=hdrs)
                     resp = conn.getresponse()
                     raw = resp.read().decode("utf-8")
@@ -422,17 +505,27 @@ class CharacterSheetAndControlsTests(unittest.TestCase):
                 # Cross-origin CSRF MUST still be blocked (403) even in loopback-open mode!
                 st_csrf, _ = post("/api/character/brannoc/preset", {"preset": "craft"}, origin="http://evil.example")
                 self.assertEqual(st_csrf, 403)
+                # Missing Origin header MUST NOT bypass auth on loopback-trusted POSTs!
+                self.assertEqual(post("/api/character/brannoc/preset", {"preset": "craft"}, omit_origin=True)[0], 401)
+                # Proxied X-Forwarded-For request MUST NOT be trusted as loopback!
+                self.assertEqual(post("/api/character/brannoc/preset", {"preset": "craft"}, extra_headers={"X-Forwarded-For": "192.168.1.50"})[0], 401)
+                # Non-character admin route (/api/brain/model) MUST STILL require token even on loopback!
+                self.assertEqual(post("/api/brain/model", {"model": "claude-haiku-5-5"})[0], 401)
 
-                # All 6 same-origin loopback actions succeed
+                # All 6 same-origin loopback character actions succeed
                 self.assertEqual(post("/api/character/brannoc/preset", {"preset": "gather", "hours": 3})[0], 200)
                 self.assertEqual(post("/api/character/brannoc/weight", {"key": "craft", "value": 1.35, "pinned": True})[0], 200)
+                dir_calls_before = sum(1 for c in calls if c[0] == "directive")
                 self.assertEqual(post("/api/character/brannoc/directive", {"note": "Smelt tin!", "replan": True})[0], 200)
                 self.assertEqual(replans, ["brannoc"])
-                # Immediate second replan is rate-limited (429)
-                self.assertEqual(post("/api/character/brannoc/directive", {"note": "Again", "replan": True})[0], 429)
+                # Immediate second replan is rate-limited (429) AND MUST NOT save the directive!
+                self.assertEqual(post("/api/character/brannoc/directive", {"note": "Should not save", "replan": True})[0], 429)
+                self.assertEqual(sum(1 for c in calls if c[0] == "directive"), dir_calls_before + 1)
                 self.assertEqual(post("/api/character/brannoc/pause", {"paused": True})[0], 200)
                 self.assertEqual(post("/api/character/brannoc/work-order", {"item_entry": 2840, "quantity": 8})[0], 200)
                 self.assertEqual(post("/api/character/brannoc/schedule", {"shift_group": "prime-time", "always_online": False})[0], 200)
+                # Non-integer hours returns 400 (not 500!)
+                self.assertEqual(post("/api/character/brannoc/preset", {"preset": "craft", "hours": "bad"})[0], 400)
 
                 # Audit log captured all actions
                 audit_lines = Path(audit_p).read_text(encoding="utf-8").splitlines()

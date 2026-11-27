@@ -18,6 +18,7 @@ Least-privilege DB separation:
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import os
@@ -35,11 +36,13 @@ from .bridge import (
     DEFAULT_SQL_TIMEOUT_SEC,
     LIVE_POS_FILE,
     PROFILE_PREF_TO_NATIVE_WEIGHTS,
+    RUNTIME_DIR,
     BrainStore,
     _clamp,
     _int_or,
     _sql_esc,
     fetch_remote_max_revision,
+    is_brain_disabled,
     parse_mysql_tsv,
     persona_baseline_weights,
     read_live_context,
@@ -295,15 +298,18 @@ PRIMARY_SKILL_IDS = {164, 165, 171, 182, 186, 197, 202, 333, 393, 755, 773}
 SECONDARY_SKILL_IDS = {129, 185, 356}
 ALL_TRACKED_SKILL_IDS = PRIMARY_SKILL_IDS | SECONDARY_SKILL_IDS
 
-# Import rich WotLK zone names from azeroth-watch/data_maps if available, else fallback
+# Import rich WotLK zone names from azeroth-watch/data_maps via importlib (never exec), else fallback
 def _load_zone_names() -> dict[int, str]:
     try:
         aw_maps = ROOT / "azeroth-watch" / "data_maps.py"
         if aw_maps.is_file():
-            ns: dict[str, Any] = {}
-            exec(aw_maps.read_text(encoding="utf-8"), ns)
-            if isinstance(ns.get("ZONE_NAMES"), dict):
-                return dict(ns["ZONE_NAMES"])
+            spec = importlib.util.spec_from_file_location("_aw_data_maps_ro", aw_maps)
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                zm = getattr(mod, "ZONE_NAMES", None)
+                if isinstance(zm, dict):
+                    return dict(zm)
     except Exception as exc:
         logger.debug("Falling back to minimal ZONE_NAMES: %s", exc)
     return {
@@ -352,6 +358,7 @@ def _read_dotenv_var(key: str) -> str:
 def _exec_mysql_with_profile(
     sql: str,
     *,
+    profile_label: str,
     defaults_env: str,
     container_defaults_env: str,
     user_env: str = "",
@@ -375,7 +382,7 @@ def _exec_mysql_with_profile(
         cmd = ["mysql", f"--defaults-extra-file={defaults_file}", "-N", "-B", db_name]
         res = subprocess.run(cmd, input=sql_bytes, capture_output=True, check=True, timeout=max(1.0, use_timeout))
         return parse_mysql_tsv(res.stdout.decode("utf-8", errors="replace"), expected_cols=expected_cols)
-    if container_defaults and not os.getenv("HEARTHCORE_DB_HOST", "").strip():
+    if container_defaults and not (os.getenv("HEARTHCORE_TEST_DB") == "1" and os.getenv("HEARTHCORE_DB_HOST", "").strip()):
         cmd = [
             "docker", "exec", "-i", DB_CONTAINER,
             "mysql", f"--defaults-extra-file={container_defaults}", "-N", "-B", db_name,
@@ -387,14 +394,18 @@ def _exec_mysql_with_profile(
         cmd = ["mysql", f"-h{db_host}", f"-P{db_port}", f"-u{db_user}", "-N", "-B", db_name]
         res = subprocess.run(cmd, input=sql_bytes, capture_output=True, check=True, timeout=max(1.0, use_timeout), env=env)
         return parse_mysql_tsv(res.stdout.decode("utf-8", errors="replace"), expected_cols=expected_cols)
-    # Fallback to bridge.run_sql (used in CI TCP integration tests & root fallback)
-    return run_sql(sql, timeout=use_timeout, expected_cols=expected_cols)
+    # Only allow CI throwaway-DB fallback when HEARTHCORE_TEST_DB=1 AND *_test DB name is explicitly configured!
+    if os.getenv("HEARTHCORE_TEST_DB") == "1" and os.getenv("HEARTHCORE_DB_HOST", "").strip() and db_name.endswith("_test"):
+        return run_sql(sql, timeout=use_timeout, expected_cols=expected_cols)
+    # Fail closed in production — NEVER silently escalate to root or hearthcore_brain!
+    raise Invalid(f"{profile_label} DB credentials not configured ({defaults_env} or {container_defaults_env})")
 
 
 def run_read_sql(sql: str, *, timeout: float | None = None, expected_cols: int | None = None) -> list[list[Any]]:
-    """Run read-only character sheet SQL using the SELECT-only azeroth_watch account."""
+    """Run read-only character sheet SQL using the SELECT-only azeroth_watch account (fail-closed)."""
     return _exec_mysql_with_profile(
         sql,
+        profile_label="azeroth_watch read-only",
         defaults_env="AZEROTH_WATCH_DB_DEFAULTS_FILE",
         container_defaults_env="AZEROTH_WATCH_DB_CONTAINER_DEFAULTS_FILE",
         user_env="AZEROTH_WATCH_DB_USER",
@@ -407,9 +418,10 @@ def run_read_sql(sql: str, *, timeout: float | None = None, expected_cols: int |
 
 
 def run_operator_sql(sql: str, *, timeout: float | None = None, expected_cols: int | None = None) -> list[list[Any]]:
-    """Run operator direction SQL using the narrowly scoped hearthcore_operator account."""
+    """Run operator direction SQL using the narrowly scoped hearthcore_operator account (fail-closed)."""
     return _exec_mysql_with_profile(
         sql,
+        profile_label="hearthcore_operator",
         defaults_env="HEARTHCORE_OPERATOR_DB_DEFAULTS_FILE",
         container_defaults_env="HEARTHCORE_OPERATOR_DB_CONTAINER_DEFAULTS_FILE",
         user_env="HEARTHCORE_OPERATOR_DB_USER",
@@ -991,25 +1003,59 @@ def fetch_character_sheet(
         except Exception as exc:
             logger.debug("Work orders query failed for guid=%s: %s", guid, exc)
 
-        # AI Brain & operator directive from brain.db
-        ai_brain = {
-            "redacted": bool(redact_admin),
-            "paused": ai_paused,
-            "override": override_summary,
-            "current_plan": None,
-            "recent_plans": [],
-            "operator_directive": None,
-            "open_intentions": [],
-            "fatigue_category": "",
-            "fatigue_streak": 0,
-            "stalled_goal_id": "",
-        }
+        # AI Brain & operator directive from brain.db (STRICTLY READ-ONLY SQLite connection; never runs DDL/UPDATE on GET!)
+        if redact_admin:
+            ai_brain = {
+                "redacted": True,
+                "paused": False,
+                "override": {"active": False, "source": "", "expires_at": 0, "rem_minutes": 0, "enabled": True},
+                "current_plan": None,
+                "recent_plans": [],
+                "operator_directive": None,
+                "open_intentions": [],
+                "fatigue_category": "",
+                "fatigue_streak": 0,
+                "stalled_goal_id": "",
+            }
+        else:
+            ai_brain = {
+                "redacted": False,
+                "paused": ai_paused,
+                "override": override_summary,
+                "current_plan": None,
+                "recent_plans": [],
+                "operator_directive": None,
+                "open_intentions": [],
+                "fatigue_category": "",
+                "fatigue_streak": 0,
+                "stalled_goal_id": "",
+            }
         if not redact_admin and db_path.is_file():
+            ro_conn: sqlite3.Connection | None = None
             try:
-                store = BrainStore(db_path)
-                ai_brain["operator_directive"] = store.get_operator_directive(slug, now_ts=ts)
-                with store._conn() as db:
-                    p_rows = db.execute(
+                ro_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.5)
+                ro_conn.row_factory = sqlite3.Row
+                tables = {r[0] for r in ro_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                if "paused_characters" in tables:
+                    if ro_conn.execute("SELECT 1 FROM paused_characters WHERE character_id = ?", (slug,)).fetchone():
+                        ai_brain["paused"] = True
+                if "operator_directives" in tables:
+                    drow = ro_conn.execute(
+                        "SELECT character_id, note, updated_at, expires_at, consumed_at "
+                        "FROM operator_directives WHERE character_id = ? AND expires_at > ?",
+                        (slug, ts),
+                    ).fetchone()
+                    if drow:
+                        ai_brain["operator_directive"] = {
+                            "character_id": str(drow["character_id"]),
+                            "note": str(drow["note"]),
+                            "active": int(drow["consumed_at"] or 0) == 0,
+                            "updated_at": int(drow["updated_at"]),
+                            "expires_at": int(drow["expires_at"]),
+                            "consumed_at": int(drow["consumed_at"] or 0),
+                        }
+                if "plans" in tables:
+                    p_rows = ro_conn.execute(
                         """
                         SELECT id, planned_at, planned_iso, expires_at, source, model, effort,
                                primary_goal_id, primary_desc, secondary_goal_ids, reason_code,
@@ -1050,15 +1096,67 @@ def fetch_character_sheet(
                         if idx == 0:
                             ai_brain["current_plan"] = item
                         ai_brain["recent_plans"].append(item)
-                mem = MemoryEngine(db_path)
-                rec = mem.analyze_recent_plans(slug, ts)
-                ai_brain["fatigue_category"] = rec.get("fatigue_category") or ""
-                ai_brain["fatigue_streak"] = int(rec.get("fatigue_streak") or 0)
-                ai_brain["stalled_goal_id"] = rec.get("stalled_goal_id") or ""
-                intents = mem.all_open_intentions().get(slug, [])
-                ai_brain["open_intentions"] = [it.get("label", "") for it in intents if isinstance(it, dict)]
+                if "intentions" in tables:
+                    i_rows = ro_conn.execute(
+                        "SELECT label FROM intentions WHERE character_id = ? AND status = 'open' ORDER BY updated_at DESC LIMIT 5",
+                        (slug,),
+                    ).fetchall()
+                    ai_brain["open_intentions"] = [str(r["label"]) for r in i_rows if r["label"]]
             except Exception as exc:
-                logger.debug("Brain DB read failed for %s: %s", slug, exc)
+                logger.debug("Read-only Brain DB read failed for %s: %s", slug, exc)
+            finally:
+                if ro_conn is not None:
+                    ro_conn.close()
+
+    # Issue #71 / PR #110 QA: Unauthenticated LAN viewers get redacted public view for human characters!
+    if not is_comp and redact_admin:
+        return {
+            "ok": True,
+            "redacted": True,
+            "generated_at": datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "can_control": False,
+            "character": {
+                "guid": guid,
+                "name": char["name"],
+                "slug": slug,
+                "is_companion": False,
+                "race_id": char["race_id"],
+                "race": race_name,
+                "class_id": char["class_id"],
+                "class_name": cls_meta["name"],
+                "class_short": cls_meta["short"],
+                "class_color": cls_meta["color"],
+                "power_type": cls_meta["power"],
+                "gender": char["gender"],
+                "level": char["level"],
+                "xp": char["xp"],
+                "xp_max": xp_max,
+                "xp_pct": xp_pct,
+                "money": None,
+                "zone_id": char["zone_id"],
+                "zone": ZONE_NAMES.get(char["zone_id"], f"Zone #{char['zone_id']}"),
+                "map_id": char["map_id"],
+                "homebind": None,
+                "online": char["online"],
+                "dead": dead,
+                "played_hours": None,
+                "avg_ilvl": None,
+                "schedule": None,
+                "profile": None,
+            },
+            "gear": [],
+            "stats": {},
+            "professions": [],
+            "quests": {"active": [], "completed_count": 0},
+            "reputations": [],
+            "weights": [],
+            "ai_brain": None,
+            "social_bonds": [],
+            "recent_events": [],
+            "recent_ledger": [],
+            "work_orders": [],
+            "controls_meta": {"presets": [], "shift_groups": [], "work_order_catalog": []},
+        }
 
     return {
         "ok": True,
@@ -1139,8 +1237,12 @@ def apply_focus_preset(
     hours: int = 2,
     *,
     sql_exec=None,
+    db_path: Path = BRAIN_DB_PATH,
+    runtime_dir: Path = RUNTIME_DIR,
     now_ts: int | None = None,
 ) -> dict[str, Any]:
+    if is_brain_disabled(runtime_dir):
+        raise Invalid("Global AI Brain kill switch (brain.disabled) is active")
     runner = sql_exec if sql_exec is not None else run_operator_sql
     ts = int(now_ts if now_ts is not None else time.time())
     pid = str(preset_id or "").strip().lower()
@@ -1150,6 +1252,8 @@ def apply_focus_preset(
     dur_hours = max(1, min(6, int(hours)))
     char = _require_companion(slug, runner)
     guid = char["guid"]
+    if db_path.is_file() and BrainStore(db_path).is_character_paused(char["slug"]):
+        raise Invalid(f"AI is paused for {char['name']}; resume AI before applying a focus preset")
     char_prof = _safe_load_profile(char["slug"])
     base = persona_baseline_weights(char_prof)
     merged = dict(base)
@@ -1157,8 +1261,10 @@ def apply_focus_preset(
         if k in CANONICAL_WEIGHT_KEYS:
             merged[k] = _clamp(v)
 
+    # Use the SAME monotonic revision counter as BrainStore (remote_max + 1, NEVER epoch ts!)
+    # so presets never trigger false brain_sequence_resync alerts!
     remote_max = fetch_remote_max_revision(sql_exec=runner)
-    revision = max(remote_max, ts) + 1
+    revision = remote_max + 1
     expires_at = ts + dur_hours * 3600
 
     stmts = ["START TRANSACTION;"]
@@ -1171,7 +1277,6 @@ def apply_focus_preset(
             "ON DUPLICATE KEY UPDATE "
             "`value` = IF(VALUES(`revision`) >= `revision`, VALUES(`value`), `value`), "
             "`source` = IF(VALUES(`revision`) >= `revision`, 'operator', `source`), "
-            "`enabled` = 1, "
             "`created_at` = IF(VALUES(`revision`) >= `revision`, VALUES(`created_at`), `created_at`), "
             "`expires_at` = IF(VALUES(`revision`) >= `revision`, VALUES(`expires_at`), `expires_at`), "
             "`revision` = GREATEST(`revision`, VALUES(`revision`));"
@@ -1267,24 +1372,31 @@ def set_character_ai_paused(
     paused: bool,
     *,
     sql_exec=None,
+    db_path: Path = BRAIN_DB_PATH,
+    runtime_dir: Path = RUNTIME_DIR,
     now_ts: int | None = None,
 ) -> dict[str, Any]:
+    if not paused and is_brain_disabled(runtime_dir):
+        raise Invalid("Global AI Brain kill switch (brain.disabled) is active; cannot resume per-character overrides")
     runner = sql_exec if sql_exec is not None else run_operator_sql
     ts = int(now_ts if now_ts is not None else time.time())
     char = _require_companion(slug, runner)
     guid = char["guid"]
     flag = 0 if paused else 1
 
+    # Persist authoritative pause state in brain.db so run_cycle skips Claude calls for paused bots!
+    BrainStore(db_path).set_character_paused(char["slug"], bool(paused), now_ts=ts)
+
     existing = runner(f"SELECT COUNT(*) FROM companion_weight_overrides WHERE guid = {guid};")
     has_rows = bool(existing and existing[0] and _int_or(existing[0][0], 0) > 0)
     if has_rows:
         runner(f"UPDATE companion_weight_overrides SET enabled = {flag} WHERE guid = {guid};\n")
     elif paused:
-        # Persist paused state even when no overrides existed yet
+        # Persist paused state in MySQL even when no overrides existed yet (using monotonic remote_max + 1)
         char_prof = _safe_load_profile(char["slug"])
         base = persona_baseline_weights(char_prof)
         remote_max = fetch_remote_max_revision(sql_exec=runner)
-        revision = max(remote_max, ts) + 1
+        revision = remote_max + 1
         stmts = ["START TRANSACTION;"]
         for k in CANONICAL_WEIGHT_KEYS:
             v = _clamp(base.get(k, 1.0))
