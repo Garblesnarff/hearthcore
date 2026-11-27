@@ -196,8 +196,8 @@ def _host_allowed(host_header: str, allowed_hosts: set[str]) -> bool:
     return host_only in allowed_hosts
 
 
-def project_snapshot(snap: dict | None, *, authenticated: bool) -> dict:
-    """Apply explicit field allow-list for public kiosk vs authenticated admin view (Issue #71)."""
+def project_snapshot(snap: dict | None, *, authenticated: bool, local_readonly: bool = False) -> dict:
+    """Apply explicit field allow-list for public kiosk vs local readonly vs authenticated admin view (Issue #71)."""
     if not isinstance(snap, dict):
         return {}
     out: dict = {}
@@ -213,10 +213,10 @@ def project_snapshot(snap: dict | None, *, authenticated: bool) -> dict:
         else:
             out[k] = snap[k]
 
-    if authenticated:
+    if authenticated or local_readonly:
         if "ai_brain" in snap:
             out["ai_brain"] = snap["ai_brain"]
-        out["view_mode"] = "admin"
+        out["view_mode"] = "admin" if authenticated else "local_readonly"
     else:
         ab = snap.get("ai_brain") if isinstance(snap.get("ai_brain"), dict) else {}
         active_list = ab.get("active_list") if isinstance(ab.get("active_list"), list) else []
@@ -391,6 +391,7 @@ def make_handler(
     max_sse_clients: int = MAX_SSE_CLIENTS,
     session_ttl_sec: int = SESSION_TTL_SEC,
     require_auth_for_reads: bool | None = None,
+    trust_loopback_reads: bool | None = None,
 ):
     # Separate mutable settings file so dashboard NEVER rewrites .env holding ANTHROPIC_API_KEY (Issue #72).
     settings_path = overrides_path if overrides_path is not None else (
@@ -402,6 +403,11 @@ def make_handler(
         bool(require_auth_for_reads)
         if require_auth_for_reads is not None
         else (os.getenv("AZEROTH_WATCH_REQUIRE_AUTH_FOR_READS") or "0").strip().lower() in ("1", "true", "yes", "on")
+    )
+    local_reads_ok = (
+        bool(trust_loopback_reads)
+        if trust_loopback_reads is not None
+        else (os.getenv("AZEROTH_WATCH_TRUST_LOOPBACK_READS") or "0").strip().lower() in ("1", "true", "yes", "on")
     )
 
     # Per-server-instance server-side session store (revocable!), SSE counter, and serialization cache
@@ -455,18 +461,21 @@ def make_handler(
         with state_lock:
             sessions.pop(sid, None)
 
-    def _cached_serialized_state(ver: int, snap: dict | None, authenticated: bool) -> bytes:
+    def _cached_serialized_state(ver: int, snap: dict | None, authenticated: bool, local_readonly: bool = False) -> bytes:
         # Bucket live data_age_sec every 5s so stale DB age NEVER freezes in cache while healthy traffic hits 100%!
         age_sec = int((snap or {}).get("data_age_sec") or 0) if isinstance(snap, dict) else 0
         age_bucket = age_sec // 5
-        key = (int(ver), bool(authenticated), age_bucket)
+        key = (int(ver), bool(authenticated), bool(local_readonly), age_bucket)
         with state_lock:
             hit = ser_cache.get(key)
             if hit is not None:
                 return hit
-        payload = json.dumps(project_snapshot(snap, authenticated=authenticated), separators=(",", ":")).encode("utf-8")
+        payload = json.dumps(
+            project_snapshot(snap, authenticated=authenticated, local_readonly=local_readonly),
+            separators=(",", ":"),
+        ).encode("utf-8")
         with state_lock:
-            if len(ser_cache) > 12:
+            if len(ser_cache) > 16:
                 ser_cache.clear()
             ser_cache[key] = payload
         return payload
@@ -597,8 +606,9 @@ def make_handler(
                 if auth_reads and not is_auth:
                     self._send_bytes(401, "application/json; charset=utf-8", b'{"ok":false,"error":"Authentication required for /api/state (use /api/kiosk for minimal view)"}', close_conn=True)
                     return
+                is_local_ro = bool(local_reads_ok and not auth_reads and self._client_ip() in ("127.0.0.1", "::1"))
                 ver, snap = collector.get_snapshot()
-                body = _cached_serialized_state(ver, snap, is_auth)
+                body = _cached_serialized_state(ver, snap, is_auth, local_readonly=is_local_ro)
                 self._send_bytes(200, "application/json; charset=utf-8", body)
                 return
 
@@ -610,6 +620,7 @@ def make_handler(
                 if auth_reads and not is_auth:
                     self._send_bytes(401, "application/json; charset=utf-8", b'{"ok":false,"error":"Authentication required for /api/stream"}', close_conn=True)
                     return
+                is_local_ro = bool(local_reads_ok and not auth_reads and self._client_ip() in ("127.0.0.1", "::1"))
                 with state_lock:
                     if sse_active["count"] >= max(1, int(max_sse_clients)):
                         self._send_bytes(
@@ -638,9 +649,9 @@ def make_handler(
                             stream_used_cookie = False
                         ver, snap = collector.get_snapshot()
                         age_bucket = int((snap or {}).get("data_age_sec") or 0) // 5 if isinstance(snap, dict) else 0
-                        cur_key = (ver, is_auth, age_bucket)
+                        cur_key = (ver, is_auth, is_local_ro, age_bucket)
                         if cur_key != last_key and snap:
-                            payload_b = _cached_serialized_state(ver, snap, is_auth)
+                            payload_b = _cached_serialized_state(ver, snap, is_auth, local_readonly=is_local_ro)
                             msg = f"id: {ver}\nevent: state\ndata: ".encode("utf-8") + payload_b + b"\n\n"
                             self.wfile.write(msg)
                             self.wfile.flush()

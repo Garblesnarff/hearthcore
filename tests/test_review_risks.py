@@ -308,6 +308,50 @@ class ReviewRiskRegressionTests(unittest.TestCase):
                 )
                 self.assertEqual(resolved_repo, (fake_home / "hearthcore").resolve())
 
+            # Verify trust_loopback_reads shows full read-only AI Brain on 127.0.0.1 while keeping POST 401!
+            class DummyCollector:
+                def get_snapshot(self):
+                    return 1, {
+                        "db_ok": True,
+                        "data_age_sec": 1,
+                        "ai_brain": {"model": "claude-sonnet-5-5", "history": [{"id": 1, "character_id": "brannoc"}]},
+                    }
+
+            handler_cls = aw_server.make_handler(
+                DummyCollector(),
+                admin_token="secret_tok",
+                env_path=os.path.join(tmp, ".env"),
+                overrides_path=os.path.join(tmp, "ov.env"),
+                audit_path=os.path.join(tmp, "audit.log"),
+                allowed_hosts={"127.0.0.1", "localhost"},
+                trust_loopback_reads=True,
+            )
+            srv = aw_server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+            port = srv.server_address[1]
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.request("GET", "/api/state", headers={"Host": f"127.0.0.1:{port}"})
+                r_get = conn.getresponse()
+                d_get = json.loads(r_get.read().decode())
+                conn.close()
+                self.assertEqual(r_get.status, 200)
+                self.assertEqual(d_get["view_mode"], "local_readonly")
+                self.assertEqual(len(d_get["ai_brain"]["history"]), 1)
+
+                conn2 = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                conn2.request(
+                    "POST", "/api/brain/model", body=json.dumps({"model": "claude-haiku-5-5"}),
+                    headers={"Host": f"127.0.0.1:{port}", "Content-Type": "application/json", "Origin": f"http://127.0.0.1:{port}"},
+                )
+                r_post = conn2.getresponse()
+                r_post.read()
+                conn2.close()
+                self.assertEqual(r_post.status, 401, "POST admin actions MUST still require admin token on loopback!")
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()
