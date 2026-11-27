@@ -1954,7 +1954,11 @@ CompanionCraft::Offer CompanionCraft::EvaluateFish(Player* bot, bool active)
         float const maxD = isSagePool ? sageSearchYards : searchYards;
         if (dist >= maxD || !CompanionLease::MayTry(low, CompanionLease::SpawnKey(true, hole.spawnId)))
             continue;
-        if (isSagePool)
+        float const score = isSagePool ? (dist - 900.0f) : dist;
+        if (score >= bestScore)
+            continue;
+        // The three danger guards apply to every fishing spot, not only sage pools. They only skip a spot, so
+        // running them after the cheap score check selects the same spot and skips the costly checks for losers.
         {
             uint32 const hz = hole.zoneId ? hole.zoneId : sCompanionBotMgr.CachedZoneAt(bot->GetMapId(), hole.x, hole.y);
             if (sCompanionBotMgr.IsZoneTooDangerous(bot, hz) ||
@@ -1962,9 +1966,6 @@ CompanionCraft::Offer CompanionCraft::EvaluateFish(Player* bot, bool active)
                 sCompanionBotMgr.IsPathTooDangerous(bot, bot->GetMapId(), hole.x, hole.y, hole.z))
                 continue;
         }
-        float const score = isSagePool ? (dist - 900.0f) : dist;
-        if (score >= bestScore)
-            continue;
         bestScore = score;
         run.water.valid = true;
         run.water.isGo = true;
@@ -2270,7 +2271,8 @@ CompanionCraft::Offer CompanionCraft::EvaluateGatherFarm(Player* bot, bool activ
 
     uint32 const cfgBatch = std::max<uint32>(20, sPlayerbotAIConfig.companionGatherFarmBatchSize);
     uint32 const bagScaled = FreeSlots(bot) * 8;
-    uint32 const targetCount = std::clamp(std::max(cfgBatch, bagScaled), cfgBatch, 80u);
+    // Upper bound is never below the lower bound, so this is defined for any configured batch size.
+    uint32 const targetCount = std::min(std::max(cfgBatch, bagScaled), std::max(cfgBatch, 80u));
     for (GatherNeed const& need : needs)
     {
         if (!need.source)
