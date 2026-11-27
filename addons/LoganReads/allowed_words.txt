@@ -1,0 +1,133 @@
+# LoganReads allowed words (early reader list) - every word in the step-3 kid text.
+# Names live in names.txt. Case-insensitive match.
+a
+am
+are
+back
+bad
+beat
+big
+by
+can
+come
+did
+do
+for
+get
+glad
+go
+good
+has
+have
+he
+help
+here
+hi
+house
+i
+in
+is
+it
+job
+kobolds
+me
+meat
+mine
+more
+need
+needs
+out
+see
+thank
+the
+then
+they
+to
+wolf
+wolves
+you
+yum
+
+# ---- batch 1 common words ----
+letter
+warrior
+prize
+bridge
+careful
+stable
+wagon
+friend
+buckets
+grapes
+save
+paper
+safe
+road
+helper
+pay
+east
+fish
+hear
+south
+send
+another
+full
+news
+knows
+camp
+log
+far
+box
+walk
+drink
+lake
+secret
+fast
+strong
+sit
+tired
+rest
+inn
+farm
+tower
+west
+thief
+pumpkin
+ring
+# ---- batch 1 item-name words (tooltip vocabulary) ----
+gold
+dust
+burlap
+bandana
+candle
+head
+harvest
+grape
+manifest
+documents
+marshal
+marker
+armor
+shipment
+kelp
+crystal
+frond
+crystals
+liquor
+invisibility
+# ---- base sight words from batch 1 text ----
+and at be bring brother by coming does down farms find found give got guard happy helped
+helps her him his keep long look looking make man men mines name now of one our papers red
+saved sent takes talk them there this time too us wants warriors watch what will with work your
+my we she so about away any wait hello thanks bandanas candles large murlocs
+goodbye
+take
+not
+# ---- batch 2 words ----
+sun hot necklace ask took pie first eat teeth pig note two woods village lost river sad
+must many clothes something scared class easy funny show moves luck hero closer
+well done
+refreshing spring water chunk boar pork belly brass collar painted armband torn fin
+linen bundle wood medallions medallion mug love
+bears boars guards ha ma mm oh that their all an armbands been best bundles busy eats fins
+food friends from gone hurt know like old pies things want was who

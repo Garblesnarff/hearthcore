@@ -1,0 +1,3 @@
+# Binary MP3 audio clips are generated locally (tools/make_coach_audio.py) and live in the WoW client AddOns folder.
+audio/
+__pycache__/
