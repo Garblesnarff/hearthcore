@@ -87,10 +87,12 @@ public:
     static void UpsertBankRequest(BankRequest const& req);
     static void RemoveBankRequest(uint32 itemEntry);
 
-    // Native proposal binding vertical slice (Issue #3): returns true if this companion currently
+    // Native proposal binding vertical slice (Issue #3 / #27): returns true if this companion currently
     // has a C++-validated executing guild work-order proposal.
-    static bool ActiveOrderProposal(uint32 lowGuid, uint64& outProposalId, uint64& outOrderId, uint32& outItemEntry);
-    static void MarkProposalCompleted(uint32 lowGuid, uint64 proposalId, uint32 progressDelta);
+    static bool ActiveOrderProposal(uint32 lowGuid, uint64& outProposalId, uint64& outOrderId, uint32& outItemEntry,
+                                    uint32* outSnapshotRev = nullptr);
+    static bool MarkProposalCompleted(uint32 lowGuid, uint64 proposalId, uint32 progressDelta,
+                                      uint64 expectedOrderId = 0, uint32 expectedSnapshotRev = 0);
     static void ReloadProposals();
 
     // Phase II Cooperative Mode (Cards II-05/II-06, gated by AiPlayerbot.Companion.Coop.Enabled = 0 by default).

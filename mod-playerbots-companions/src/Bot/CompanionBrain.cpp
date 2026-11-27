@@ -9,6 +9,7 @@
 #include "CompanionDuty.h"
 #include "CompanionCraft.h"
 #include "CompanionLife.h"
+#include "CompanionWorkOrderLogic.h"
 
 #include <algorithm>
 #include <cmath>
@@ -44,10 +45,13 @@ struct ActiveOrderProp
     uint64 proposalId = 0;
     uint64 orderId = 0;
     uint32 itemEntry = 0;
+    uint32 snapshotRev = 1;
     uint32 expiresAt = 0;
+    std::string status;
 };
 std::mutex gPropMutex;
 std::unordered_map<uint32, ActiveOrderProp> gActiveOrderProps;  // lowGuid -> active validated work-order proposal
+CompanionWorkOrderLogic::BoundedIdSet gCompletedPropIds;        // prevents stale ReloadProposals from re-inserting completed proposals
 bool gPropMissingLogged = false;
 bool gOverrideMissingLogged = false;
 
@@ -181,6 +185,12 @@ CompanionBrain::ItemClass CompanionBrain::ClassifyItem(PlayerbotAI* botAI, Item*
         return ItemClass::KEEP;
     if (IsProfessionTool(proto))
         return ItemClass::KEEP;
+    // Verified guild work-order delivery (Issue #27): a transferable item crafted for this companion's active
+    // claimed work order must be classified BANK so RunCompanionBankDuty deposits it for verified receipt.
+    if (Player* const orderBot = botAI->GetBot();
+        orderBot && !item->IsSoulBound() && CompanionLife::IsGuildBankTransferable(proto) &&
+        CompanionLife::HasPendingDeliveryFor(orderBot->GetGUID().GetCounter(), proto->ItemId))
+        return ItemClass::BANK;
     // Class play hook: this companion's consumables list (AiPlayerbot.Companion.<Name>.Consumables) always stays.
     if (CompanionClass::IsKeepItem(botAI->GetBot(), proto->ItemId))
         return ItemClass::KEEP;
@@ -600,7 +610,7 @@ void CompanionBrain::ReloadProposals()
     std::unordered_map<uint32, ActiveOrderProp> nextOrders;
 
     QueryResult res = CharacterDatabase.Query(
-        "SELECT `id`, `guid`, `goal_type`, `target_id`, `advisory_only`, `status`, `expires_at` "
+        "SELECT `id`, `guid`, `goal_type`, `target_id`, `advisory_only`, `status`, `expires_at`, `snapshot_rev` "
         "FROM `companion_proposals` "
         "WHERE `status` IN ('proposed', 'accepted', 'executing') "
         "ORDER BY `id` DESC LIMIT 80");
@@ -617,6 +627,14 @@ void CompanionBrain::ReloadProposals()
             bool const advisory = f[4].Get<uint8>() != 0;
             std::string const status = f[5].Get<std::string>();
             uint32 const expiresAt = f[6].Get<uint32>();
+            uint32 const snapshotRev = f[7].Get<uint32>();
+
+            // Skip proposals that were already completed natively before this DB read landed (Issue #27).
+            {
+                std::lock_guard<std::mutex> lock(gPropMutex);
+                if (gCompletedPropIds.Contains(propId))
+                    continue;
+            }
 
             // Expire past-TTL proposals natively (even if Python planner is stopped)
             if (expiresAt <= now)
@@ -641,7 +659,7 @@ void CompanionBrain::ReloadProposals()
                 {
                     CharacterDatabase.Execute(
                         "UPDATE companion_proposals SET status = 'interrupted', outcome_reason = 'owner_group_priority', "
-                        "ended_at = {} WHERE id = {}",
+                        "ended_at = {} WHERE id = {} AND status IN ('accepted', 'executing')",
                         now, propId);
                 }
                 continue;
@@ -654,38 +672,53 @@ void CompanionBrain::ReloadProposals()
                 {
                     CharacterDatabase.Execute(
                         "UPDATE companion_proposals SET status = 'rejected', outcome_reason = 'order_unavailable', "
-                        "ended_at = {} WHERE id = {}",
+                        "ended_at = {} WHERE id = {} AND status IN ('proposed', 'accepted', 'executing')",
                         now, propId);
                     continue;
                 }
+                std::string effectiveStatus = status;
                 if (status == "proposed")
                 {
                     CharacterDatabase.Execute(
                         "UPDATE companion_proposals SET status = 'executing', outcome_reason = 'native_order_bound', "
-                        "started_at = IF(started_at = 0, {}, started_at) WHERE id = {}",
-                        now, propId);
+                        "started_at = IF(started_at = 0, {}, started_at) "
+                        "WHERE id = {} AND status = 'proposed' AND expires_at > {}",
+                        now, propId, now);
+                    effectiveStatus = "executing";
                 }
-                nextOrders[guid] = ActiveOrderProp{propId, targetId, itemEntry, expiresAt};
+                nextOrders[guid] = ActiveOrderProp{propId, targetId, itemEntry, snapshotRev, expiresAt, effectiveStatus};
             }
             else if (bot && status == "proposed")
             {
                 CharacterDatabase.Execute(
                     "UPDATE companion_proposals SET status = 'accepted', outcome_reason = 'native_weight_bound', "
-                    "started_at = IF(started_at = 0, {}, started_at) WHERE id = {}",
-                    now, propId);
+                    "started_at = IF(started_at = 0, {}, started_at) "
+                    "WHERE id = {} AND status = 'proposed' AND expires_at > {}",
+                    now, propId, now);
             }
         } while (res->NextRow());
     }
 
     std::lock_guard<std::mutex> lock(gPropMutex);
+    // Filter out any proposal that completed while ReloadProposals was running.
+    for (auto it = nextOrders.begin(); it != nextOrders.end();)
+    {
+        if (gCompletedPropIds.Contains(it->second.proposalId))
+            it = nextOrders.erase(it);
+        else
+            ++it;
+    }
     gActiveOrderProps.swap(nextOrders);
 }
 
-bool CompanionBrain::ActiveOrderProposal(uint32 lowGuid, uint64& outProposalId, uint64& outOrderId, uint32& outItemEntry)
+bool CompanionBrain::ActiveOrderProposal(uint32 lowGuid, uint64& outProposalId, uint64& outOrderId, uint32& outItemEntry,
+                                         uint32* outSnapshotRev)
 {
     outProposalId = 0;
     outOrderId = 0;
     outItemEntry = 0;
+    if (outSnapshotRev)
+        *outSnapshotRev = 0;
     uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
     std::lock_guard<std::mutex> lock(gPropMutex);
     auto it = gActiveOrderProps.find(lowGuid);
@@ -694,24 +727,45 @@ bool CompanionBrain::ActiveOrderProposal(uint32 lowGuid, uint64& outProposalId, 
     outProposalId = it->second.proposalId;
     outOrderId = it->second.orderId;
     outItemEntry = it->second.itemEntry;
+    if (outSnapshotRev)
+        *outSnapshotRev = it->second.snapshotRev;
     return true;
 }
 
-void CompanionBrain::MarkProposalCompleted(uint32 lowGuid, uint64 proposalId, uint32 progressDelta)
+bool CompanionBrain::MarkProposalCompleted(uint32 lowGuid, uint64 proposalId, uint32 progressDelta,
+                                           uint64 expectedOrderId, uint32 expectedSnapshotRev)
 {
-    if (!proposalId)
-        return;
+    if (!lowGuid || !proposalId || !progressDelta)
+        return false;
     uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    ActiveOrderProp prop;
     {
         std::lock_guard<std::mutex> lock(gPropMutex);
         auto it = gActiveOrderProps.find(lowGuid);
-        if (it != gActiveOrderProps.end() && it->second.proposalId == proposalId)
-            gActiveOrderProps.erase(it);
+        if (it == gActiveOrderProps.end() || it->second.proposalId != proposalId)
+            return false;
+        prop = it->second;
+        uint64 const orderIdToCheck = expectedOrderId ? expectedOrderId : prop.orderId;
+        CompanionWorkOrderLogic::ProposalState pstate{
+            prop.proposalId, lowGuid, prop.orderId, prop.itemEntry, prop.snapshotRev, prop.status, prop.expiresAt};
+        if (!CompanionWorkOrderLogic::CanCompleteProposal(pstate, orderIdToCheck, lowGuid, now))
+            return false;
+        if (expectedSnapshotRev && prop.snapshotRev != expectedSnapshotRev)
+            return false;
+        gCompletedPropIds.Insert(proposalId);
+        gActiveOrderProps.erase(it);
     }
+
+    // Conditional SQL update (Issue #27): expired or interrupted proposals cannot be silently overwritten.
+    uint64 const boundOrderId = expectedOrderId ? expectedOrderId : prop.orderId;
+    uint32 const boundRev = expectedSnapshotRev ? expectedSnapshotRev : prop.snapshotRev;
     CharacterDatabase.Execute(
         "UPDATE companion_proposals SET status = 'completed', outcome_reason = 'order_delivered', "
-        "ended_at = {}, progress_delta = {} WHERE id = {}",
-        now, progressDelta, proposalId);
+        "ended_at = {}, progress_delta = {} "
+        "WHERE id = {} AND guid = {} AND target_id = {} AND snapshot_rev = {} "
+        "AND status IN ('accepted', 'executing') AND expires_at > {}",
+        now, progressDelta, proposalId, lowGuid, boundOrderId, boundRev, now);
+    return true;
 }
 
 bool CompanionBrain::CoopEnabled()
