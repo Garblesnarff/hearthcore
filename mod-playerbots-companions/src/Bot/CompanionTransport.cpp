@@ -198,6 +198,8 @@ struct Run
     uint64 phaseStartMs = 0;
     uint64 waitUntilMs = 0;
     uint64 nearSinceMs = 0;
+    uint64 combatWaitSinceMs = 0;
+    uint64 triggerWalkSinceMs = 0;
     bool departLogged = false;   // one depart line per leg (a fight may pull the bot off the dock and back)
     uint32 waitSec = 0;
     uint32 fails = 0;
@@ -1000,16 +1002,60 @@ void StoreRun(uint32 low, Run const& run)
     gRuns[low] = run;
 }
 
+constexpr uint64 COMBAT_WAIT_MAX_MS = 120000;
+constexpr uint64 TRIGGER_WALK_MAX_MS = 15000;
+
+enum class TriggerStep : uint8
+{
+    Walking,
+    Fired,
+    Unreachable,
+    Invalid,
+    Refused
+};
+
 bool FireTrigger(Player* bot, uint32 triggerId)
 {
+    if (!bot || !bot->IsAlive() || bot->IsInCombat() || bot->IsBeingTeleported())
+        return false;
     AreaTrigger const* at = sObjectMgr->GetAreaTrigger(triggerId);
     if (!at || !bot->IsInAreaTriggerRadius(at))
         return false;
+    bool const wasTeleporting = bot->IsBeingTeleported();
+    uint32 const mapBefore = bot->GetMapId();
+    float const xBefore = bot->GetPositionX();
+    float const yBefore = bot->GetPositionY();
     WorldPacket packet(CMSG_AREATRIGGER);
     packet << triggerId;
     packet.rpos(0);
     bot->GetSession()->HandleAreaTriggerOpcode(packet);
-    return true;
+    // Confirm the stock handler actually accepted the trigger (started a new teleport or moved the bot) rather than
+    // refusing access due to level, quest, or item requirements (issue #80).
+    return (!wasTeleporting && bot->IsBeingTeleported()) || bot->GetMapId() != mapBefore ||
+           Dist2d(bot->GetPositionX(), bot->GetPositionY(), xBefore, yBefore) > 10.0f;
+}
+
+// Walk the companion onto an area trigger before firing the stock handler (issue #80). Never teleports on refusal.
+TriggerStep WalkAndFireTrigger(Player* bot, uint32 triggerId, uint64 nowMs, uint64& walkSinceMs)
+{
+    if (!bot || bot->IsBeingTeleported())
+        return TriggerStep::Walking;
+    AreaTrigger const* at = sObjectMgr->GetAreaTrigger(triggerId);
+    if (!at || at->map != bot->GetMapId())
+        return TriggerStep::Invalid;
+    if (!bot->IsInAreaTriggerRadius(at))
+    {
+        if (!walkSinceMs)
+            walkSinceMs = nowMs;
+        if (nowMs - walkSinceMs > TRIGGER_WALK_MAX_MS)
+            return TriggerStep::Unreachable;
+        if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
+            bot->GetMotionMaster()->MovePoint(0, at->x, at->y, at->z);
+        return TriggerStep::Walking;
+    }
+    walkSinceMs = 0;
+    bot->StopMoving();
+    return FireTrigger(bot, triggerId) ? TriggerStep::Fired : TriggerStep::Refused;
 }
 
 void Dismount(PlayerbotAI* botAI, Player* bot)
@@ -1022,8 +1068,10 @@ void Dismount(PlayerbotAI* botAI, Player* bot)
     }
 }
 
-// The only teleports the transport system performs. Every one names an approved reason and is logged with its leg.
-// A stock area trigger or portal that refuses the companion is NOT a reason to teleport: the leg waits and retries.
+// The only teleports the transport system performs (issue #80). Every one names an owner-approved reason and is
+// logged with its leg and positions; the owner-approved stuck teleport lives separately in upstream
+// NewRpgBaseAction::MoveFarTo. A stock area trigger or portal that refuses the companion is NOT an approved reason:
+// the companion walks onto the trigger and fails the leg if the stock handler does not fire.
 enum class TeleportReason : uint8
 {
     BoatDock,  // dock-to-dock boat move (owner-approved)
@@ -1032,11 +1080,26 @@ enum class TeleportReason : uint8
 
 char const* TeleportReasonName(TeleportReason reason)
 {
-    return reason == TeleportReason::BoatDock ? "boat-dock" : "tram-ride";
+    switch (reason)
+    {
+        case TeleportReason::BoatDock:
+            return "boat-dock";
+        case TeleportReason::TramRide:
+            return "tram-ride";
+    }
+    return "unknown";
 }
 
 bool Teleport(Player* bot, Point const& p, TeleportReason reason, uint32 legId)
 {
+    // Safety backstop inside the single Teleport() helper (issue #80): never teleport while dead or in combat.
+    if (!bot || !bot->IsAlive() || bot->IsInCombat())
+    {
+        LOG_WARN("playerbots", "Companion {}: transport teleport refused leg={} reason={} alive={} combat={}",
+                 bot ? bot->GetName() : "null", legId, TeleportReasonName(reason),
+                 bot && bot->IsAlive() ? 1 : 0, bot && bot->IsInCombat() ? 1 : 0);
+        return false;
+    }
     LOG_INFO("playerbots",
              "Companion {}: transport teleport leg={} reason={} from={}:{:.1f},{:.1f},{:.1f} "
              "to={}:{:.1f},{:.1f},{:.1f}",
@@ -1226,22 +1289,66 @@ CompanionTransport::Drive CompanionTransport::Step(PlayerbotAI* botAI, std::stri
         return Drive::Failed;
     if (!Ready() || !Enabled())
         return bot->GetMapId() != mapId ? Drive::Failed : Drive::NotNeeded;
-    if (bot->IsBeingTeleported() || !bot->IsInWorld())
-        return Drive::Busy;
-    // No transport phase advances while the companion is dead or in combat (issue #80): it waits here.
-    if (!bot->IsAlive() || bot->IsInCombat())
+    if (!bot->IsInWorld())
         return Drive::Busy;
 
     uint32 const low = bot->GetGUID().GetCounter();
+    if (bot->IsBeingTeleported())
+    {
+        CompanionLease::KeepAlive(low);
+        return Drive::Busy;
+    }
     uint32 const leaseStart = CompanionLease::Current(low).startSec;
+    uint64 const nowMs = NowMs();
     Run run;
+    bool hadRun = false;
     {
         std::lock_guard<std::mutex> lock(gRunMutex);
         auto it = gRuns.find(low);
         if (it != gRuns.end())
+        {
             run = it->second;
+            hadRun = true;
+        }
     }
-    bool const same = run.owner == owner && run.leaseStart == leaseStart && run.map == mapId &&
+
+    // No transport phase advances while dead or in combat (issue #80):
+    // - Dead: abandon the leg neutrally (no failure/cooldown) and clear run state so revive logic runs unimpeded.
+    // - In combat: suspend the lease and hold phase up to COMBAT_WAIT_MAX_MS before abandoning neutrally.
+    if (!bot->IsAlive())
+    {
+        if (hadRun)
+        {
+            LOG_INFO("playerbots", "Companion {}: transport abandoned owner={} reason=dead leg={}", bot->GetName(),
+                     owner, run.idx);
+            Reset(low);
+        }
+        if (hadRun || CompanionLease::Holds(low, owner))
+            CompanionLease::End(low, owner, "transport:dead", CompanionLease::Outcome::Neutral);
+        return Drive::Busy;
+    }
+    if (bot->IsInCombat())
+    {
+        CompanionLease::RequestInterrupt(bot, CompanionLease::Interrupt::Combat);
+        if (hadRun)
+        {
+            CompanionLease::KeepAlive(low);
+            if (!run.combatWaitSinceMs)
+                run.combatWaitSinceMs = nowMs;
+            if (nowMs - run.combatWaitSinceMs > COMBAT_WAIT_MAX_MS)
+            {
+                LOG_INFO("playerbots", "Companion {}: transport abandoned owner={} reason=combat-timeout leg={}",
+                         bot->GetName(), owner, run.idx);
+                Reset(low);
+                CompanionLease::End(low, owner, "transport:combat-timeout", CompanionLease::Outcome::Neutral);
+                return Drive::Busy;
+            }
+            StoreRun(low, run);
+        }
+        return Drive::Busy;
+    }
+
+    bool const same = hadRun && run.owner == owner && run.leaseStart == leaseStart && run.map == mapId &&
                       std::fabs(run.x - x) < 1.0f && std::fabs(run.y - y) < 1.0f;
     if (!same)
     {
@@ -1254,7 +1361,7 @@ CompanionTransport::Drive CompanionTransport::Step(PlayerbotAI* botAI, std::stri
         run.z = z;
         run.noHearth = !allowHearth;
     }
-    uint64 const nowMs = NowMs();
+    run.combatWaitSinceMs = 0;
     uint32 const nowSec = NowSec();
     Point target;
     target.map = mapId;
@@ -1342,10 +1449,21 @@ CompanionTransport::Drive CompanionTransport::Step(PlayerbotAI* botAI, std::stri
         run.legs.clear();
         run.idx = 0;
         run.phase = Phase::ToDeparture;
+        run.nearSinceMs = 0;
+        run.triggerWalkSinceMs = 0;
         if (dropHearth)
             run.noHearth = true;
         StoreRun(low, run);
         return Drive::Busy;
+    };
+
+    auto failLeg = [&](char const* reason) -> Drive
+    {
+        run.failed = true;
+        StoreRun(low, run);
+        LOG_INFO("playerbots", "Companion {}: transport fail owner={} reason={} leg={}", bot->GetName(), owner, reason,
+                 run.idx);
+        return Drive::Failed;
     };
 
     if (run.idx >= run.legs.size())
@@ -1389,6 +1507,7 @@ CompanionTransport::Drive CompanionTransport::Step(PlayerbotAI* botAI, std::stri
         run.phase = Phase::ToDeparture;
         run.phaseStartMs = 0;
         run.nearSinceMs = 0;
+        run.triggerWalkSinceMs = 0;
         run.departLogged = false;
         run.fails = 0;
         if (legsLeft > 1)
@@ -1436,7 +1555,7 @@ CompanionTransport::Drive CompanionTransport::Step(PlayerbotAI* botAI, std::stri
             float const d = Dist2d(bot->GetPositionX(), bot->GetPositionY(), from.x, from.y);
             CompanionLease::Progress(low, -(LEG_PROGRESS * legsLeft + d));
             float const reach = kind == LegKind::Tram || kind == LegKind::Portal ? 3.0f : DOCK_REACH_YARDS;
-            if (d > reach)
+            if (!run.triggerWalkSinceMs && d > reach)
             {
                 run.nearSinceMs = d < 25.0f ? (run.nearSinceMs ? run.nearSinceMs : nowMs) : 0;
                 // Near the point for 30 s without reaching it (no path to the last yards): close enough.
@@ -1447,9 +1566,12 @@ CompanionTransport::Drive CompanionTransport::Step(PlayerbotAI* botAI, std::stri
                     return Drive::Busy;
                 }
             }
-            bot->StopMoving();
-            Dismount(botAI, bot);
-            run.phaseStartMs = nowMs;
+            if (!run.triggerWalkSinceMs)
+            {
+                bot->StopMoving();
+                Dismount(botAI, bot);
+                run.phaseStartMs = nowMs;
+            }
             if (kind == LegKind::Boat)
             {
                 std::string sched;
@@ -1468,23 +1590,45 @@ CompanionTransport::Drive CompanionTransport::Step(PlayerbotAI* botAI, std::stri
             }
             else if (kind == LegKind::Tram)
             {
+                TriggerStep const step = WalkAndFireTrigger(bot, leg->id, nowMs, run.triggerWalkSinceMs);
+                if (step == TriggerStep::Walking)
+                {
+                    CompanionLease::KeepAlive(low);
+                    StoreRun(low, run);
+                    return Drive::Busy;
+                }
+                if (step == TriggerStep::Unreachable)
+                    return replan("tram-trigger-unreachable", false);
+                if (step == TriggerStep::Invalid)
+                    return failLeg("tram-trigger-data");
+                if (step == TriggerStep::Refused)
+                    return failLeg("tram-trigger-refused");
                 run.waitSec = urand(30, 90);
                 LOG_INFO("playerbots",
                          "Companion {}: transport depart from={} to={} wait={} kind=tram id={} sched=random",
                          bot->GetName(), from.name, to.name, run.waitSec, leg->id);
-                if (!FireTrigger(bot, leg->id))
-                    return replan("tram-trigger-refused", false);   // walk back to the dock; fails after repeats
                 run.phase = Phase::InTram;
                 run.waitUntilMs = 0;
             }
             else if (kind == LegKind::Portal)
             {
+                TriggerStep const step = WalkAndFireTrigger(bot, leg->id, nowMs, run.triggerWalkSinceMs);
+                if (step == TriggerStep::Walking)
+                {
+                    CompanionLease::KeepAlive(low);
+                    StoreRun(low, run);
+                    return Drive::Busy;
+                }
+                if (step == TriggerStep::Unreachable)
+                    return replan("portal-trigger-unreachable", false);
+                if (step == TriggerStep::Invalid)
+                    return failLeg("portal-trigger-data");
+                if (step == TriggerStep::Refused)
+                    return failLeg("portal-trigger-refused");
                 run.waitSec = 0;
                 LOG_INFO("playerbots",
                          "Companion {}: transport depart from={} to={} wait=0 kind=portal id={} sched=portal",
                          bot->GetName(), from.name, to.name, leg->id);
-                if (!FireTrigger(bot, leg->id))
-                    return replan("portal-trigger-refused", false);   // walk back to the dock; fails after repeats
                 run.phase = Phase::Arriving;
             }
             else   // Dalaran portal object
@@ -1563,9 +1707,16 @@ CompanionTransport::Drive CompanionTransport::Step(PlayerbotAI* botAI, std::stri
             if (nowMs >= run.waitUntilMs)
             {
                 // The ride: platform to platform on map 369, then the exit trigger.
-                Teleport(bot, leg->tramOut, TeleportReason::TramRide, leg->id);
+                if (!Teleport(bot, leg->tramOut, TeleportReason::TramRide, leg->id))
+                {
+                    if (++run.fails >= 3)
+                        return replan("tram-teleport-failed", false);
+                    StoreRun(low, run);
+                    return Drive::Busy;
+                }
                 run.phase = Phase::TramExit;
                 run.nearSinceMs = nowMs;
+                run.triggerWalkSinceMs = 0;
             }
             StoreRun(low, run);
             return Drive::Busy;
@@ -1575,10 +1726,14 @@ CompanionTransport::Drive CompanionTransport::Step(PlayerbotAI* botAI, std::stri
             CompanionLease::KeepAlive(low);
             if (bot->GetMapId() == MAP_TRAM)
             {
-                // Stock exit trigger only. If it never fires, the 60 s replan below fails the leg.
-                FireTrigger(bot, leg->exitTrigger);
-                if (nowMs - run.nearSinceMs > 60000)
-                    return replan("tram-exit-failed", false);
+                // Walk onto the stock exit trigger and fire it; never bypass with a fallback teleport (issue #80).
+                TriggerStep const step = WalkAndFireTrigger(bot, leg->exitTrigger, nowMs, run.triggerWalkSinceMs);
+                if (step == TriggerStep::Invalid)
+                    return failLeg("tram-exit-data");
+                if (step == TriggerStep::Refused)
+                    return failLeg("tram-exit-refused");
+                if (step == TriggerStep::Unreachable || nowMs - run.nearSinceMs > 60000)
+                    return failLeg("tram-exit-failed");
             }
             run.phase = bot->GetMapId() == MAP_TRAM ? Phase::TramExit : Phase::Arriving;
             StoreRun(low, run);
