@@ -24,6 +24,7 @@
 #include "CompanionDuty.h"
 #include "CompanionGatherStrategy.h"
 #include "Creature.h"
+#include "EncounterHelpers.h"
 #include "Event.h"
 #include "Group.h"
 #include "GameTime.h"
@@ -32,6 +33,8 @@
 #include "Log.h"
 #include "Map.h"
 #include "MovementActions.h"
+#include "Multiplier.h"
+#include "ObjectAccessor.h"
 #include "PathGenerator.h"
 #include "Spell.h"
 #include "SpellInfo.h"
@@ -118,22 +121,32 @@ bool LeadActive(Player* bot)
     return bot->GetMap()->IsDungeon() && !bot->GetMap()->IsRaid() && mgr.IsInAuthorizedCoopGroup(bot);
 }
 
-// Ready check before a pull. Always: nobody in the group is in combat, every member is alive and above
-// MinMemberHealthPct, the owner is not AFK or drinking and has at least MinHealerManaPct mana, and the PauseSeconds
-// since the last group fight have passed. withRange adds: every member within GroupRange of the tank.
-Player* FindCompanionTank(Group* group)
+// Per-companion state written from map threads: gStateMutex covers per-bot/kill-order tables below.
+// gLeadMutex is kept strictly separate from gStateMutex so GroupLead/IsGroupLead can never self-deadlock.
+std::mutex gStateMutex;
+std::mutex gLeadMutex;
+std::unordered_map<uint32, ObjectGuid> gGroupLead;   // group low guid -> elected lead tank guid
+uint32 gLastLeadPruneMs = 0;
+
+bool GroupInCombat(Group* group)
 {
     if (!group)
-        return nullptr;
-    CompanionBotMgr& mgr = sCompanionBotMgr;
+        return false;
     for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
     {
         Player* member = itr->GetSource();
-        if (member && member->IsAlive() && member->IsInWorld() && mgr.IsCompanion(member) &&
-            PlayerbotAI::IsTank(member))
-            return member;
+        if (member && member->IsInWorld() && member->IsInCombat())
+            return true;
     }
-    return nullptr;
+    return false;
+}
+
+// Convenience wrapper inside this translation unit: returns the elected lead ONLY when alive (so callers like
+// MeleeFollowTarget and AssistTarget never follow or assist a corpse).
+Player* FindCompanionTank(Group* group, Player const* reference = nullptr)
+{
+    Player* lead = CompanionLead::GroupLead(group, reference);
+    return (lead && lead->IsAlive()) ? lead : nullptr;
 }
 
 // Lead v2 (3c): healer is the group member with the heal role; if none, the owner.
@@ -159,9 +172,6 @@ bool IsCrowdControlled(Unit* unit)
     return unit && (unit->IsPolymorphed() || unit->HasBreakableByDamageCrowdControlAura());
 }
 
-// Per-companion state written from map threads: the mutex covers every table below.
-std::mutex gStateMutex;
-
 // Lead v2: soft healer tether state per companion tank (before a new pull only).
 struct HealerTetherState
 {
@@ -171,6 +181,9 @@ struct HealerTetherState
 };
 std::unordered_map<uint32, HealerTetherState> gHealerTether; // tank low guid -> tether state
 
+// Ready check before a pull. Always: nobody in the group is in combat, every member is alive and above
+// MinMemberHealthPct, the owner is not AFK or drinking and has at least MinHealerManaPct mana, and the PauseSeconds
+// since the last group fight have passed. withRange adds: every member within GroupRange of the tank.
 bool ReadyToPull(PlayerbotAI* botAI, bool withRange)
 {
     Player* bot = botAI->GetBot();
@@ -694,6 +707,110 @@ void RefuseOnce(PlayerbotAI* botAI, Unit* skull, std::string const& reason)
 
 namespace CompanionLead
 {
+Player* GroupLead(Group* group, Player const* reference)
+{
+    if (!group)
+        return nullptr;
+
+    // Group-level eligibility (independent of caller's map so an out-of-instance member can never evict the active
+    // dungeon lead from gGroupLead). LeadActive already requires dungeon/raid map, LeadModeOn, and authorized group;
+    // IsCompanion is kept explicitly here as defense-in-depth.
+    CompanionBotMgr& mgr = sCompanionBotMgr;
+    auto eligible = [group, &mgr](Player* p) -> bool {
+        return p && p->IsInWorld() && p->GetGroup() == group && mgr.IsCompanion(p) && LeadActive(p) &&
+               PlayerbotAI::IsTank(p);
+    };
+
+    Map* const refMap = (reference && reference->IsInWorld()) ? reference->GetMap() : nullptr;
+    auto matchRefMap = [refMap](Player* p) -> Player* {
+        if (!p)
+            return nullptr;
+        return (!refMap || p->GetMap() == refMap) ? p : nullptr;
+    };
+
+    uint32 const gid = group->GetGUID().GetCounter();
+    ObjectGuid cached;
+    {
+        std::lock_guard<std::mutex> lock(gLeadMutex);
+        auto it = gGroupLead.find(gid);
+        if (it != gGroupLead.end())
+            cached = it->second;
+    }
+
+    Player* cur = !cached.IsEmpty() ? ObjectAccessor::FindConnectedPlayer(cached) : nullptr;
+    bool const valid = eligible(cur);
+    // Stability policy (issue #83): keep the current lead while alive OR while the group is in combat so lead
+    // never flips mid-fight on a tank death and bounces back on resurrection.
+    if (valid && (cur->IsAlive() || GroupInCombat(group)))
+        return matchRefMap(cur);
+
+    // Deterministic re-election out of combat (or when no valid lead exists): alive eligible tank with lowest GUID.
+    Player* best = nullptr;
+    uint32 bestLow = UINT32_MAX;
+    for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
+    {
+        Player* member = itr->GetSource();
+        if (!member || !member->IsAlive() || !eligible(member))
+            continue;
+        uint32 const low = member->GetGUID().GetCounter();
+        if (!best || low < bestLow)
+        {
+            best = member;
+            bestLow = low;
+        }
+    }
+
+    // If no alive eligible tank exists (e.g. solo tank died out of combat) and the cached lead is still valid in
+    // the group, retain it to avoid strategy churn and repeated "lead elected" log spam while resurrecting.
+    if (!best && valid)
+        return matchRefMap(cur);
+
+    ObjectGuid const elected = best ? best->GetGUID() : ObjectGuid::Empty;
+    uint32 const nowMs = getMSTime();
+    std::vector<std::pair<uint32, ObjectGuid>> pruneSnapshot;
+    {
+        std::lock_guard<std::mutex> lock(gLeadMutex);
+        if (elected.IsEmpty())
+            gGroupLead.erase(gid);
+        else
+            gGroupLead[gid] = elected;
+        if (gGroupLead.size() > 64 && getMSTimeDiff(gLastLeadPruneMs, nowMs) >= 60000)
+        {
+            gLastLeadPruneMs = nowMs;
+            pruneSnapshot.assign(gGroupLead.begin(), gGroupLead.end());
+        }
+    }
+    if (!pruneSnapshot.empty())
+    {
+        std::vector<std::pair<uint32, ObjectGuid>> staleEntries;
+        for (auto const& [k, v] : pruneSnapshot)
+        {
+            if (k == gid)
+                continue;
+            Player* p = ObjectAccessor::FindConnectedPlayer(v);
+            if (!p || !p->GetGroup() || p->GetGroup()->GetGUID().GetCounter() != k)
+                staleEntries.emplace_back(k, v);
+        }
+        if (!staleEntries.empty())
+        {
+            std::lock_guard<std::mutex> lock(gLeadMutex);
+            for (auto const& [k, v] : staleEntries)
+                if (auto it = gGroupLead.find(k); it != gGroupLead.end() && it->second == v)
+                    gGroupLead.erase(it);
+        }
+    }
+    if (best && elected != cached)
+        LOG_INFO("playerbots", "[Companion] group={} lead elected -> {}[{}]", gid, best->GetName(), bestLow);
+    return matchRefMap(best);
+}
+
+bool IsGroupLead(Player* bot)
+{
+    if (!bot || !bot->GetGroup() || !LeadActive(bot))
+        return false;
+    return bot == GroupLead(bot->GetGroup(), bot);
+}
+
 bool GroupHasActiveFight(Group* group)
 {
     if (!group)
@@ -715,10 +832,10 @@ Player* MeleeFollowTarget(PlayerbotAI* botAI)
     if (!sPlayerbotAIConfig.companionLeadMeleeFollowTank || !botAI)
         return nullptr;
     Player* bot = botAI->GetBot();
-    if (!bot || !LeadActive(bot) || PlayerbotAI::IsTank(bot) || PlayerbotAI::IsHeal(bot) ||
+    if (!bot || !LeadActive(bot) || IsGroupLead(bot) || PlayerbotAI::IsHeal(bot) ||
         !PlayerbotAI::IsMelee(bot))
         return nullptr;
-    Player* tank = FindCompanionTank(bot->GetGroup());
+    Player* tank = FindCompanionTank(bot->GetGroup(), bot);
     if (!tank || tank == bot || tank->GetMapId() != bot->GetMapId())
         return nullptr;
     return tank;
@@ -729,7 +846,7 @@ bool NotifyOwnerPullCommand(PlayerbotAI* botAI, Player* requester)
     if (!botAI || !sPlayerbotAIConfig.companionLeadHealerTetherEnabled)
         return false;
     Player* bot = botAI->GetBot();
-    if (!bot || !PlayerbotAI::IsTank(bot) || !LeadActive(bot))
+    if (!bot || !LeadActive(bot) || !IsGroupLead(bot))
         return false;
     if (requester && !sCompanionBotMgr.IsOwner(requester))
         return false;
@@ -755,7 +872,7 @@ Unit* PickPullTarget(PlayerbotAI* botAI, bool* far)
     if (far)
         *far = false;
     Player* bot = botAI->GetBot();
-    if (!bot || !PlayerbotAI::IsTank(bot) || !ReadyToPull(botAI, false))
+    if (!bot || !IsGroupLead(bot) || !ReadyToPull(botAI, false))
         return nullptr;
 
     Unit* chosen = nullptr;
@@ -830,7 +947,7 @@ Unit* AssistTarget(PlayerbotAI* botAI, std::string* reason)
     if (reason)
         reason->clear();
     Player* bot = botAI->GetBot();
-    if (!bot || PlayerbotAI::IsTank(bot) || !LeadActive(bot))
+    if (!bot || !LeadActive(bot) || IsGroupLead(bot))
         return nullptr;
 
     Group* group = bot->GetGroup();
@@ -853,7 +970,7 @@ Unit* AssistTarget(PlayerbotAI* botAI, std::string* reason)
                 *reason = "skull";
             return skull;
         }
-        if (Player* tank = FindCompanionTank(group))
+        if (Player* tank = FindCompanionTank(group, bot))
         {
             Unit* victim = tank->GetVictim();
             if (usable(victim))
@@ -890,7 +1007,7 @@ Unit* AssistTarget(PlayerbotAI* botAI, std::string* reason)
     // Lead v2 (2a-2d): Target persistence for companion DPS in lead mode.
     uint32 const low = bot->GetGUID().GetCounter();
     uint32 const now = getMSTime();
-    Player* tank = FindCompanionTank(group);
+    Player* tank = FindCompanionTank(group, bot);
     if (tank && tank->GetVictim() && tank->GetVictim()->IsCreature() && tank->IsHostileTo(tank->GetVictim()))
         NoteTankAttack(tank->GetVictim());
 
@@ -1070,7 +1187,7 @@ Unit* LeadDpsTarget(PlayerbotAI* botAI, bool* handled)
     if (!botAI || !sPlayerbotAIConfig.companionLeadTargetPersistence)
         return nullptr;
     Player* bot = botAI->GetBot();
-    if (!bot || PlayerbotAI::IsTank(bot) || !LeadActive(bot))
+    if (!bot || !LeadActive(bot) || IsGroupLead(bot))
         return nullptr;
     if (handled)
         *handled = true;
@@ -1086,7 +1203,7 @@ void LockFallbackTarget(PlayerbotAI* botAI, Unit* target)
     if (!botAI || !target || !sPlayerbotAIConfig.companionLeadTargetPersistence)
         return;
     Player* bot = botAI->GetBot();
-    if (!bot || PlayerbotAI::IsTank(bot) || !LeadActive(bot))
+    if (!bot || !LeadActive(bot) || IsGroupLead(bot))
         return;
     if (CompanionClass::IsOffTankUnit(botAI, target) || IsCrowdControlled(target))
         return;
@@ -1107,7 +1224,7 @@ void LockFallbackTarget(PlayerbotAI* botAI, Unit* target)
 bool IconHeldUnengaged(PlayerbotAI* botAI, ObjectGuid guid)
 {
     Player* bot = botAI->GetBot();
-    if (!bot || PlayerbotAI::IsTank(bot) || guid.IsEmpty() || !LeadActive(bot))
+    if (!bot || guid.IsEmpty() || !LeadActive(bot) || IsGroupLead(bot))
         return false;
     Group* group = bot->GetGroup();
     if (!group)
@@ -1116,7 +1233,7 @@ bool IconHeldUnengaged(PlayerbotAI* botAI, ObjectGuid guid)
     if (!unit || !unit->IsAlive())
         return false;
     if (sPlayerbotAIConfig.companionLeadTargetPersistence)
-        return !TankEngagedForDps(FindCompanionTank(group), unit, group, getMSTime());
+        return !TankEngagedForDps(FindCompanionTank(group, bot), unit, group, getMSTime());
     return !EngagedWithGroup(unit, group);
 }
 
@@ -1139,8 +1256,8 @@ Unit* ChainTarget(PlayerbotAI* botAI, std::string* refusal)
     if (refusal)
         refusal->clear();
     Player* bot = botAI->GetBot();
-    if (!bot || !sPlayerbotAIConfig.companionChainEnabled || !PlayerbotAI::IsTank(bot) || !bot->IsInCombat() ||
-        !LeadActive(bot))
+    if (!bot || !sPlayerbotAIConfig.companionChainEnabled || !bot->IsInCombat() || !LeadActive(bot) ||
+        !IsGroupLead(bot))
         return nullptr;
     Unit* skull = SkullUnit(botAI, false);
     if (!skull)
@@ -1154,7 +1271,7 @@ Unit* ChainTarget(PlayerbotAI* botAI, std::string* refusal)
 void NoteAttackTarget(PlayerbotAI* botAI, Unit* target, std::string const& reason)
 {
     Player* bot = botAI->GetBot();
-    if (!bot || !LeadActive(bot) || PlayerbotAI::IsTank(bot))
+    if (!bot || !LeadActive(bot) || IsGroupLead(bot))
         return;
     uint32 low = bot->GetGUID().GetCounter();
     ObjectGuid guid = target ? target->GetGUID() : ObjectGuid();
@@ -1180,7 +1297,7 @@ void NoteAttackTarget(PlayerbotAI* botAI, Unit* target, std::string const& reaso
     std::string after = target ? (std::string("attack ") + target->GetName() + "[" +
                                   std::to_string(guid.GetCounter()) + "]")
                                : std::string("follow tank");
-    Player* tank = FindCompanionTank(bot->GetGroup());
+    Player* tank = FindCompanionTank(bot->GetGroup(), bot);
     float const tankDist = (tank && tank->GetMapId() == bot->GetMapId()) ? bot->GetDistance(tank) : -1.0f;
     std::string const why = reason.empty() ? (target ? "other" : "combat_end") : reason;
     LOG_INFO("playerbots", "[Companion] {} lead: {} -> {} reason={} tankDist={:.1f}", bot->GetName(), before, after,
@@ -1216,7 +1333,7 @@ void UpdateKillOrder(PlayerbotAI* botAI)
     if (!botAI || !sPlayerbotAIConfig.companionLeadKillOrder)
         return;
     Player* tank = botAI->GetBot();
-    if (!tank || !PlayerbotAI::IsTank(tank) || !LeadActive(tank) || !tank->IsAlive())
+    if (!tank || !LeadActive(tank) || !tank->IsAlive() || !IsGroupLead(tank))
         return;
     Group* group = tank->GetGroup();
     if (!group)
@@ -1545,7 +1662,28 @@ bool SetLeadFromOwner(PlayerbotAI* botAI, Player* from, bool on)
     std::string const reply = on ? "Lead mode on." : "Lead mode off.";
     if (mgr.IsGroupedWithOwner(bot))
     {
-        if (PlayerbotAI::IsTank(bot))
+        // Deterministic single party reply independent of chat-event delivery order or lead-on/off state:
+        // only the lowest-GUID in-world companion tank in the group announces the toggle.
+        Group* group = bot->GetGroup();
+        Player* speaker = nullptr;
+        uint32 bestLow = UINT32_MAX;
+        if (group)
+        {
+            for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
+            {
+                Player* member = itr->GetSource();
+                if (!member || !member->IsInWorld() || !mgr.IsCompanion(member) || !mgr.IsGroupedWithOwner(member) ||
+                    !PlayerbotAI::IsTank(member))
+                    continue;
+                uint32 const low = member->GetGUID().GetCounter();
+                if (!speaker || low < bestLow)
+                {
+                    speaker = member;
+                    bestLow = low;
+                }
+            }
+        }
+        if (bot == speaker)
             botAI->SayToParty(reply);
     }
     else
@@ -1760,6 +1898,77 @@ public:
         return CompanionLead::SetLeadFromOwner(botAI, from, false);
     }
 };
+
+// Non-lead tank in lead mode (issue #83): suppresses upstream tank-assist targeting and taunt wars against the
+// group's elected lead tank. Still permits single-target peels on mobs actively hitting a non-tank party member
+// (or explicit off-tank Diamond targets), and unlocks fully if the lead tank dies mid-fight.
+class CompanionOffTankAssistMultiplier : public Multiplier
+{
+public:
+    CompanionOffTankAssistMultiplier(PlayerbotAI* botAI) : Multiplier(botAI, "companion off-tank assist") {}
+
+    float GetValue(Action* action) override
+    {
+        if (!action || !botAI)
+            return 1.0f;
+        Player* bot = botAI->GetBot();
+        if (!bot || !LeadActive(bot) || !PlayerbotAI::IsTank(bot))
+            return 1.0f;
+        // Raid encounters rely on encounter-specific tank swaps via taunt; only suppress dungeon taunt-wars.
+        if (bot->GetMap() && bot->GetMap()->IsRaid())
+            return 1.0f;
+
+        std::string const& name = action->getName();
+        bool const isTankAssist = (name == "tank assist");
+        bool const isAoeTaunt = (name == "challenging shout" || name == "challenging roar");
+        bool const isTaunt = isAoeTaunt || EncounterHelpers::IsTauntAction(bot, action) ||
+                             name == "taunt on snare target" || name == "heroic throw taunt" ||
+                             name == "mocking blow";
+        if (!isTankAssist && !isTaunt)
+            return 1.0f;
+
+        Group* group = bot->GetGroup();
+        Player* lead = CompanionLead::GroupLead(group, bot);
+        if (!lead || lead == bot || !lead->IsAlive())
+            return 1.0f;   // we are the lead, or lead tank is down: unlock tank assist & taunts immediately
+
+        if (isTankAssist)
+            return 0.0f;
+
+        if (isAoeTaunt)
+            return 0.0f;   // never AoE-taunt the pack off a live lead tank
+
+        Unit* target = action->GetTarget();
+        if (!target)
+            target = botAI->GetAiObjectContext()->GetValue<Unit*>("current target")->Get();
+        if (!target)
+            return 0.0f;
+
+        // Friendly-targeted taunts (e.g. Righteous Defense): never peel off the lead tank.
+        if (bot->IsFriendlyTo(target))
+            return (target == lead || target == bot) ? 0.0f : 1.0f;
+
+        // Already targeting us: no need to waste a taunt.
+        if (target->GetVictim() == bot)
+            return 0.0f;
+
+        // Explicit off-tank mark (Diamond) may always be taunted off the lead after a pull.
+        if (CompanionClass::IsOffTankUnit(botAI, target))
+            return 1.0f;
+
+        // Hostile-targeted taunts: never taunt the lead's current victim or a mob already targeting the lead.
+        if (target == lead->GetVictim() || target->GetVictim() == lead)
+            return 0.0f;
+
+        // Allow peeling a loose mob actively hitting a non-tank party member.
+        if (Unit* mobVictim = target->GetVictim();
+            mobVictim && mobVictim->IsPlayer() && mobVictim != lead && mobVictim != bot && group &&
+            group->IsMember(mobVictim->GetGUID()))
+            return 1.0f;
+
+        return 0.0f;
+    }
+};
 }  // namespace
 
 // Exposed for the context registries (StrategyContext.h, ActionContext.h, TriggerContext.h).
@@ -1780,6 +1989,11 @@ void CompanionLeadStrategy::InitTriggers(std::vector<TriggerNode*>& triggers)
 void CompanionAssistStrategy::InitTriggers(std::vector<TriggerNode*>& triggers)
 {
     triggers.push_back(new TriggerNode("companion assist ready", { NextAction("companion assist", 55.0f) }));
+}
+
+void CompanionAssistStrategy::InitMultipliers(std::vector<Multiplier*>& multipliers)
+{
+    multipliers.push_back(new CompanionOffTankAssistMultiplier(botAI));
 }
 
 void CompanionChainStrategy::InitTriggers(std::vector<TriggerNode*>& triggers)
