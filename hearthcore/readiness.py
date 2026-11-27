@@ -35,7 +35,7 @@ from typing import Any
 
 from .core import profile, profiles
 from .dungeons import evaluate_live_role_capability
-from .identity import persona_id_for_slug
+from .identity import PersonaRegistry, persona_id_for_slug
 
 logger = logging.getLogger("hearthcore.readiness")
 
@@ -397,51 +397,27 @@ def _read_persona_map_readonly(
     db_path: Path | None,
     *,
     allow_no_persona_db: bool = False,
-) -> tuple[dict[int, str], bool, list[str]]:
-    """Strictly read-only lookup of character_guid -> persona_id from brain.db (P0-1 & P2-7 fail-closed!).
-
-    Fails closed (`db_ok=False`) when `db_path` is None (unless `allow_no_persona_db=True`),
-    missing on disk, lacks persona tables, has conflicting mappings, or fails to open.
-    """
+) -> tuple[dict[str, Any], bool, list[str]]:
+    """Strictly read-only lookup of (realm_id, character_guid) -> persona record + active sessions from brain.db."""
+    empty = {"by_key": {}, "by_persona_session": {}, "open_dual_session_personas": set()}
     if db_path is None:
         if allow_no_persona_db:
-            return {}, True, []
-        return {}, False, ["persona_db_path_missing"]
+            return empty, True, []
+        return empty, False, ["persona_db_path_missing"]
     if not db_path.is_file():
-        return {}, False, [f"persona_db_missing:{db_path}"]
+        return empty, False, [f"persona_db_missing:{db_path}"]
 
-    conn: sqlite3.Connection | None = None
-    out: dict[int, str] = {}
-    errors: list[str] = []
-    found_table = False
-    try:
-        quoted = urllib.parse.quote(str(db_path.resolve()), safe="/")
-        conn = sqlite3.connect(f"file:{quoted}?mode=ro", uri=True, timeout=3.0)
-        conn.row_factory = sqlite3.Row
-        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-        for pc_tbl in ("persona_characters", "companion_persona_characters"):
-            if pc_tbl in tables:
-                found_table = True
-                rows = conn.execute(f"SELECT character_guid, persona_id FROM {pc_tbl}").fetchall()
-                for r in rows:
-                    g = int(r["character_guid"])
-                    pid = str(r["persona_id"])
-                    if g in out and out[g] != pid:
-                        errors.append(f"persona_mapping_conflict:guid_{g}:{out[g]}!={pid}")
-                    else:
-                        out[g] = pid
-        if not found_table:
-            errors.append("persona_tables_missing")
-        if errors:
-            return out, False, errors
-        return out, True, []
-    except sqlite3.Error as exc:
-        errors.append(f"{type(exc).__name__}: {exc}")
-        logger.warning("Read-only persona lookup failed for %s: %s", db_path, exc)
-        return {}, False, errors
-    finally:
-        if conn is not None:
-            conn.close()
+    snap = PersonaRegistry.read_only_snapshot(db_path)
+    bundle = {
+        "by_key": dict(snap["by_key"]),
+        "by_persona_session": dict(snap["by_persona_session"]),
+        "open_dual_session_personas": set(snap["open_dual_session_personas"]),
+    }
+    if not snap["ok"]:
+        return bundle, False, list(snap["errors"])
+    if not snap["has_registry"]:
+        return empty, False, ["persona_tables_missing"]
+    return bundle, True, []
 
 
 def _is_raid_locked(locked_instances: Any, spec: RaidSpec, *, now_ts: int) -> tuple[bool, bool]:
@@ -1107,6 +1083,7 @@ def evaluate_raid_roster(
     owner_excluded_slugs: set[str] | list[str] | None = None,
     owner_pinned_roles: dict[str, str] | None = None,
     owner_group_id: int | None = None,
+    exclude_core_protected: bool = False,
     access_verified_against_db: bool = True,
     db_legal_min_level: int | None = None,
     db_path: Path | None = None,
@@ -1135,9 +1112,12 @@ def evaluate_raid_roster(
     bank_pool_known = bank_consumable_pool is not None
     total_bank_pool = max(0, int(bank_consumable_pool)) if bank_pool_known else 0
 
-    persona_map, db_ok, db_errors = _read_persona_map_readonly(
+    persona_bundle, db_ok, db_errors = _read_persona_map_readonly(
         db_path, allow_no_persona_db=allow_no_persona_db
     )
+    persona_map = persona_bundle["by_key"]
+    by_persona_session = persona_bundle["by_persona_session"]
+    open_dual_session_personas = persona_bundle["open_dual_session_personas"]
 
     sel_filter = {s.strip().lower() for s in owner_selected_slugs} if owner_selected_slugs is not None else None
     exc_filter = {s.strip().lower() for s in owner_excluded_slugs} if owner_excluded_slugs is not None else set()
@@ -1201,14 +1181,41 @@ def evaluate_raid_roster(
     for comp in sorted(companions.values(), key=lambda c: (-int(c.get("level") or 0), str(c.get("slug") or ""))):
         slug = str(comp["slug"]).strip().lower()
         guid = int(comp["guid"])
-        if slug not in known and guid not in persona_map:
+        raw_realm = comp.get("realm_id")
+        if raw_realm is not None:
+            realm_id = int(raw_realm)
+            if realm_id <= 0:
+                continue
+        else:
+            realm_id = 1
+        ckey = (realm_id, guid)
+        pmap_rec = persona_map.get(ckey)
+        if slug not in known and pmap_rec is None:
             continue
         if sel_filter is not None and slug not in sel_filter:
             continue
         if slug in exc_filter:
             continue
 
-        pid = str(comp.get("persona_id") or persona_map.get(guid) or persona_id_for_slug(slug))
+        # When a real PersonaRegistry was loaded, enforce resolution, quarantine, dual-session, and optional core latch!
+        unresolved_or_quarantined = False
+        if db_path is not None and db_ok:
+            if pmap_rec is None:
+                unresolved_or_quarantined = True
+                pid = str(comp.get("persona_id") or f"unresolved_r{realm_id}_g{guid}")
+            else:
+                pid = str(pmap_rec["persona_id"])
+                if pmap_rec.get("state") != "active" or not pmap_rec.get("char_active", True):
+                    unresolved_or_quarantined = True
+                if pid in open_dual_session_personas:
+                    unresolved_or_quarantined = True
+                active_sess = by_persona_session.get(pid)
+                if active_sess is not None and active_sess != (realm_id, guid, int(pmap_rec["incarnation"])):
+                    unresolved_or_quarantined = True
+                if exclude_core_protected and pmap_rec.get("core_protected") and not pmap_rec.get("enrolled_coop"):
+                    unresolved_or_quarantined = True
+        else:
+            pid = str(comp.get("persona_id") or persona_id_for_slug(slug))
         comp_with_pid = {**comp, "persona_id": pid}
         t = telem.get(slug) or {}
         char_prof = profile(slug) if slug in known else None
@@ -1252,7 +1259,13 @@ def evaluate_raid_roster(
             if cdata["state"] == "unknown":
                 unknown_reason_histogram[cname] = unknown_reason_histogram.get(cname, 0) + 1
 
-        if db_ok and rec["available_now"] and rec["non_consumable_ready"] and rec["consumables_shortfall_before_bank"] is not None:
+        if (
+            db_ok
+            and not unresolved_or_quarantined
+            and rec["available_now"]
+            and rec["non_consumable_ready"]
+            and rec["consumables_shortfall_before_bank"] is not None
+        ):
             if rec["consumables_shortfall_before_bank"] == 0:
                 avail_obtained_by_persona.setdefault(pid, []).append(rec)
                 avail_bank_eligible_by_persona.setdefault(pid, []).append(rec)

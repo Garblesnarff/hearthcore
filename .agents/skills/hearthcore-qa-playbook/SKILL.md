@@ -64,6 +64,9 @@ This is a living skill updated continuously after every Claude Opus 5.5 High QA 
 - **Consume one-shot directives once, and ONLY on real AI plans:** Filter `consumed_at = 0` when reading one-shot notes and stamp `consumed_at` only when `source == 'anthropic'` (never on fallback/holdout).
 - **Fail-closed crash reconciliation & correlation keys:** Never treat `None` or unverified empty sets as "nothing is running" during crash reconciliation — require an explicit `authoritative=True` snapshot and persist a deterministic `correlation_key` BEFORE external handoffs so lost responses can be adopted rather than cancelled into orphans.
 - **Guard SQLite rollbacks & persist TTL sweeps:** Always use `if conn.in_transaction: conn.rollback()` (avoiding "no transaction is active" masking the real error), and commit TTL expiry sweeps on early returns rather than rolling them back.
+- **Keep DDL migrations & check-then-write admission atomic:** Wrap `CREATE TABLE`/`ALTER TABLE`/backfill/index creation inside ONE `BEGIN IMMEDIATE ... COMMIT` (tracking `PRAGMA user_version`) and verify persona/enrollment inside the same `BEGIN IMMEDIATE` transaction as `INSERT`/`UPDATE` to eliminate TOCTOU races.
+- **Hash WAL + SHM + `iterdump()` to prove read-only SQLite isolation:** In WAL mode, stray writes land in `db-wal`, so hashing only the main `.db` file misses mutations.
+- **Never bind persistent identity by name or coerce `realm_id = 0` to `1`:** Always check `val is not None` explicitly (never `val or 1`), resolve omitted incarnations from active DB rows (never reviving retired rows), and preserve owner overrides (`coop_override_at`) across sync ticks.
 - **Forward-only idempotent replays & strict native run binding:** Reject conflicting non-empty IDs or backward native state transitions on callback replays, reject shadow rows on live native endpoints, and require exact `native_run_id` match before recording `completed`.
 
 ### HTTP Security, Auth & Loopback Trust

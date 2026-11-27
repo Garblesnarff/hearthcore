@@ -219,7 +219,8 @@ class Issue16RaidReadinessTests(unittest.TestCase):
             db_p = tp / "brain.db"
             reg = PersonaRegistry(db_p)
             reg.sync_from_companions({"ironbulwark": {"guid": 201, "shift_group": "early-birds"}}, now_ts=now)
-            reg.register_alt(persona_id=persona_id_for_slug("ironbulwark"), slug="kelda", character_guid=202, slot_kind="alt", now_ts=now)
+            pid_iron = reg.persona_for_guid(201).persona_id
+            reg.register_alt(persona_id=pid_iron, slug="kelda", character_guid=202, slot_kind="alt", now_ts=now)
             c1_0, t1_0 = _raider("ironbulwark", 201, class_id=2, spec_tab=1, native_role_mask=LFG_ROLE_TANK, known_spells=[25780], has_shield=True, personal_consumables=0, now_ts=now)
             c2_0, t2_0 = _raider("kelda", 202, class_id=5, spec_tab=1, native_role_mask=LFG_ROLE_HEALER, known_spells=[2061], personal_consumables=0, now_ts=now)
             rep_same = evaluate_raid_roster(
@@ -305,7 +306,8 @@ class Issue16RaidReadinessTests(unittest.TestCase):
                 "solara": {"guid": 206, "shift_group": "prime-time"},
                 "vespera": {"guid": 207, "shift_group": "prime-time"},
             }, now_ts=now)
-            reg.register_alt(persona_id=persona_id_for_slug("brannoc"), slug="ironbulwark", character_guid=201, slot_kind="alt", now_ts=now)
+            pid_brannoc = reg.persona_for_guid(101).persona_id
+            reg.register_alt(persona_id=pid_brannoc, slug="ironbulwark", character_guid=201, slot_kind="alt", now_ts=now)
             sha_before = hashlib.sha256(db_p.read_bytes()).hexdigest()
 
             # Vespera (bench) needs 4 bank potions -> P1-8: bench MUST NOT subtract from bank_consumables_unallocated!

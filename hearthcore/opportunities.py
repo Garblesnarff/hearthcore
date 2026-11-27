@@ -38,7 +38,12 @@ from .dungeons import (
     evaluate_live_role_capability,
     faction_from_race,
 )
-from .identity import PROTECTED_OWNER_GROUPS, PersonaRegistry, persona_id_for_slug
+from .identity import (
+    PROTECTED_OWNER_GROUPS,
+    PersonaRegistry,
+    is_protected_owner_group,
+    persona_id_for_slug,
+)
 
 SCHEMA_VERSION = 1
 DEFAULT_RECRUIT_TTL_SEC = 20 * 60
@@ -398,6 +403,41 @@ class OpportunityCoordinator:
         offline/locked/short shift, wrong faction, protected core, disabled/unsupported dungeon,
         unknown live state) BEFORE writing to the database.
         """
+        return self._express_interest_tx(
+            opportunity_id=opportunity_id,
+            expected_revision=expected_revision,
+            persona_id=persona_id,
+            character_guid=character_guid,
+            character_slug=character_slug,
+            role=role,
+            reason_code=reason_code,
+            available_until=available_until,
+            realm_id=realm_id,
+            incarnation=incarnation,
+            now_ts=now_ts,
+            eligibility=eligibility,
+            require_persona_registry=False,
+        )["ok"]
+
+    def _express_interest_tx(
+        self,
+        *,
+        opportunity_id: int,
+        expected_revision: int,
+        persona_id: str,
+        character_guid: int,
+        character_slug: str,
+        role: str,
+        reason_code: str,
+        available_until: int,
+        realm_id: int = 1,
+        incarnation: int = 1,
+        now_ts: int | None = None,
+        eligibility: dict[str, Any] | None = None,
+        require_persona_registry: bool = False,
+        allow_legacy_no_registry: bool = False,
+    ) -> dict[str, Any]:
+        """Atomic BEGIN IMMEDIATE interest registration with optional in-transaction PersonaRegistry verification (P1-2/P1-3)."""
         ts = int(now_ts if now_ts is not None else time.time())
         conn = self._conn()
         try:
@@ -405,15 +445,20 @@ class OpportunityCoordinator:
             opp = conn.execute("SELECT * FROM opportunities WHERE id = ?", (opportunity_id,)).fetchone()
             if not opp or str(opp["state"]) != "recruiting" or int(opp["revision"]) != int(expected_revision):
                 conn.execute("ROLLBACK")
-                return False
+                return {"ok": False, "reason": "opportunity_not_recruiting_or_revision_mismatch"}
             if int(opp["recruit_until"]) <= ts or int(available_until) <= ts:
                 conn.execute("ROLLBACK")
-                return False
+                return {"ok": False, "reason": "opportunity_or_availability_expired"}
+
+            verified_inc = int(incarnation)
             if eligibility is not None:
                 spec = DUNGEON_BY_ID.get(str(opp["dungeon_id"]))
                 if spec is None:
                     conn.execute("ROLLBACK")
-                    return False
+                    return {"ok": False, "reason": f"unknown_dungeon:{opp['dungeon_id']}"}
+                if is_protected_owner_group(eligibility.get("shift_group")):
+                    conn.execute("ROLLBACK")
+                    return {"ok": False, "reason": "protected_core_excluded"}
                 ev = validate_candidate_for_dungeon(
                     eligibility,
                     spec,
@@ -425,7 +470,51 @@ class OpportunityCoordinator:
                 )
                 if not ev["available"]:
                     conn.execute("ROLLBACK")
-                    return False
+                    return {"ok": False, "reason": ev["reason"], "evaluation": ev}
+
+            if require_persona_registry:
+                # P1-3: Check PersonaRegistry INSIDE the same BEGIN IMMEDIATE transaction (zero TOCTOU gap!)
+                psnap = PersonaRegistry.read_only_snapshot(self.path, conn=conn)
+                if not psnap["ok"]:
+                    conn.execute("ROLLBACK")
+                    return {"ok": False, "reason": "persona_registry_unreadable"}
+                if not psnap["has_registry"]:
+                    if not allow_legacy_no_registry:
+                        conn.execute("ROLLBACK")
+                        return {"ok": False, "reason": "persona_registry_missing"}
+                else:
+                    if int(realm_id) <= 0:
+                        conn.execute("ROLLBACK")
+                        return {"ok": False, "reason": "invalid_realm_id"}
+                    prec = psnap["by_key"].get((int(realm_id), int(character_guid)))
+                    if prec is None:
+                        conn.execute("ROLLBACK")
+                        return {"ok": False, "reason": "unresolved_persona_mapping"}
+                    if prec["persona_id"] != persona_id:
+                        conn.execute("ROLLBACK")
+                        return {"ok": False, "reason": "persona_id_mismatch"}
+                    if prec["state"] != "active":
+                        conn.execute("ROLLBACK")
+                        return {"ok": False, "reason": f"quarantined_persona:{prec['state']}"}
+                    if not prec["char_active"]:
+                        conn.execute("ROLLBACK")
+                        return {"ok": False, "reason": "inactive_persona_character"}
+                    if prec["core_protected"] and not prec["enrolled_coop"]:
+                        conn.execute("ROLLBACK")
+                        return {"ok": False, "reason": "protected_core_excluded"}
+                    if not prec["enrolled_coop"]:
+                        conn.execute("ROLLBACK")
+                        return {"ok": False, "reason": "not_enrolled_coop"}
+                    # P1-2: Enforce one active session per persona at admission!
+                    if persona_id in psnap["open_dual_session_personas"]:
+                        conn.execute("ROLLBACK")
+                        return {"ok": False, "reason": "persona_dual_session_conflict"}
+                    active_sess = psnap["by_persona_session"].get(persona_id)
+                    if active_sess is not None and active_sess != (int(realm_id), int(character_guid), int(prec["incarnation"])):
+                        conn.execute("ROLLBACK")
+                        return {"ok": False, "reason": "persona_session_on_other_character"}
+                    verified_inc = int(prec["incarnation"])
+
             conn.execute(
                 """
                 INSERT INTO opportunity_interests (
@@ -447,12 +536,12 @@ class OpportunityCoordinator:
                 """,
                 (
                     int(opportunity_id), int(expected_revision), persona_id, int(realm_id), int(character_guid),
-                    int(incarnation), character_slug.lower(), role.lower(), "interested", reason_code[:64],
+                    verified_inc, character_slug.lower(), role.lower(), "interested", reason_code[:64],
                     int(available_until), ts, ts,
                 ),
             )
             conn.execute("COMMIT")
-            return True
+            return {"ok": True, "reason": "admitted", "role": role.lower(), "incarnation": verified_inc, "available_until": int(available_until)}
         except Exception:
             if conn.in_transaction:
                 conn.rollback()
@@ -474,11 +563,11 @@ class OpportunityCoordinator:
         raid_stage: int = 0,
         now_ts: int | None = None,
         tz=None,
+        allow_legacy_no_registry: bool = False,
     ) -> dict[str, Any]:
-        """Strict fail-closed AC1 admission gate + voluntary interest registration (Issue #14).
+        """Strict fail-closed AC1 & Issue #25 admission gate + voluntary interest registration.
 
-        Rejects wrong role, stale/offline/locked/short shift, wrong faction, protected core,
-        ineligible/disabled dungeon, or unknown live telemetry before touching opportunity_interests.
+        Runs eligibility AND PersonaRegistry verification atomically inside the write transaction.
         """
         ts = int(now_ts if now_ts is not None else time.time())
         opp = self.get_opportunity(opportunity_id)
@@ -487,6 +576,18 @@ class OpportunityCoordinator:
         spec = DUNGEON_BY_ID.get(str(opp["dungeon_id"]))
         if spec is None:
             return {"ok": False, "reason": f"unknown_dungeon:{opp['dungeon_id']}"}
+
+        # P0-2: Validate realm_id explicitly (never coerce 0 -> 1!)
+        raw_realm = candidate.get("realm_id")
+        if raw_realm is not None:
+            try:
+                realm_id = int(raw_realm)
+            except (TypeError, ValueError):
+                return {"ok": False, "reason": "invalid_realm_id"}
+            if realm_id <= 0:
+                return {"ok": False, "reason": "invalid_realm_id"}
+        else:
+            realm_id = 1
 
         ev = validate_candidate_for_dungeon(
             candidate,
@@ -502,7 +603,7 @@ class OpportunityCoordinator:
 
         avail_mins = int(ev["available_minutes"])
         avail_until = ts + max(60, avail_mins * 60)
-        ok = self.express_interest(
+        return self._express_interest_tx(
             opportunity_id=opportunity_id,
             expected_revision=expected_revision,
             persona_id=persona_id,
@@ -511,11 +612,12 @@ class OpportunityCoordinator:
             role=role,
             reason_code=reason_code,
             available_until=avail_until,
+            realm_id=realm_id,
             now_ts=ts,
+            eligibility={**candidate, "raid_stage": raid_stage, "tz": tz},
+            require_persona_registry=True,
+            allow_legacy_no_registry=allow_legacy_no_registry,
         )
-        if not ok:
-            return {"ok": False, "reason": "opportunity_not_recruiting_or_revision_mismatch"}
-        return {"ok": True, "reason": "admitted", "role": role.lower(), "available_until": avail_until}
 
     def withdraw_interest(self, opportunity_id: int, persona_id: str, reason: str = "withdrawn", now_ts: int | None = None) -> dict[str, Any]:
         ts = int(now_ts if now_ts is not None else time.time())
@@ -1372,32 +1474,33 @@ class OpportunityCoordinator:
             conn.close()
 
 
-def _read_existing_enrollments_readonly(db_path: Path) -> dict[int, tuple[str, bool]]:
-    """Strictly read-only lookup of existing persona enrollments; NEVER creates or mutates db_path (Issue #15)."""
+def _read_existing_enrollments_readonly(db_path: Path) -> dict[tuple[int, int], tuple[str, bool]]:
+    """Strictly read-only lookup of existing persona enrollments keyed by (realm_id, guid); NEVER creates or mutates db_path."""
     ctx = _read_shadow_db_context_readonly(db_path, now_ts=int(time.time()))
     return {
-        guid: (rec["persona_id"], rec["enrolled_coop"])
-        for guid, rec in ctx["enrollments"].items()
+        key: (rec["persona_id"], rec["enrolled_coop"])
+        for key, rec in ctx["enrollments"].items()
     }
 
 
 def _read_shadow_db_context_readonly(db_path: Path, *, now_ts: int) -> dict[str, Any]:
-    """Strictly read-only lookup of persona enrollments, paused characters, and unexpired live interests.
+    """Strictly read-only single-snapshot lookup of persona enrollments, active sessions, pauses, and unexpired live interests.
 
-    Guarantees (Issues #14 & #15):
+    Guarantees (Issues #14, #15 & #25):
+    - Uses ONE single read-only SQLite connection so persona & opportunity views are consistent (P2-9).
     - NEVER creates or mutates db_path.
-    - Maps ALL persona_characters rows (regardless of `active`) so inactive alts NEVER mint new personas!
-    - Filters expired interests (`available_until > now_ts`) and expired opportunities.
-    - Separates `active` in-run interests into `busy_personas` (excluded from `queued` and `available`).
-    - Fails closed (`ok=False`, `errors=[...]`) on any SQLite read error on an existing db_path!
+    - Fails closed (`ok=False`, `errors=[...]`) on any SQLite read error or mapping conflict.
     """
     out: dict[str, Any] = {
         "ok": True,
+        "has_registry": False,
         "errors": [],
-        "enrollments": {},         # guid -> {"persona_id", "enrolled_coop", "state", "char_active"}
-        "paused_slugs": set(),     # slugs currently paused in brain.db
-        "busy_personas": set(),    # persona_ids reserved/accepted/active in live opportunities
-        "queued_by_dungeon": {},   # dungeon_id -> {persona_id -> {"character_guid", "role", "state"}}
+        "enrollments": {},                  # (realm_id, guid) -> record dict
+        "by_persona_session": {},           # persona_id -> (realm_id, guid, inc)
+        "open_dual_session_personas": set(),
+        "paused_slugs": set(),
+        "busy_personas": set(),
+        "queued_by_dungeon": {},
     }
     if not db_path.is_file():
         return out
@@ -1406,29 +1509,17 @@ def _read_shadow_db_context_readonly(db_path: Path, *, now_ts: int) -> dict[str,
         quoted = urllib.parse.quote(str(db_path.resolve()), safe="/")
         conn = sqlite3.connect(f"file:{quoted}?mode=ro", uri=True, timeout=3.0)
         conn.row_factory = sqlite3.Row
-        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
 
-        # P1-6: Read ALL persona_characters links (NO `WHERE c.active = 1`) so inactive alts stay bound to their persona!
-        for p_tbl, pc_tbl in (
-            ("personas", "persona_characters"),
-            ("companion_personas", "companion_persona_characters"),
-        ):
-            if p_tbl in tables and pc_tbl in tables:
-                rows = conn.execute(
-                    f"""
-                    SELECT c.character_guid, c.active, p.persona_id, p.enrolled_coop, p.state
-                    FROM {pc_tbl} c
-                    JOIN {p_tbl} p ON p.persona_id = c.persona_id
-                    ORDER BY c.incarnation ASC
-                    """
-                ).fetchall()
-                for r in rows:
-                    out["enrollments"][int(r["character_guid"])] = {
-                        "persona_id": str(r["persona_id"]),
-                        "enrolled_coop": bool(int(r["enrolled_coop"])),
-                        "state": str(r["state"] or "active").lower(),
-                        "char_active": bool(int(r["active"])),
-                    }
+        psnap = PersonaRegistry.read_only_snapshot(db_path, conn=conn)
+        out["has_registry"] = bool(psnap["has_registry"])
+        if not psnap["ok"]:
+            out["ok"] = False
+            out["errors"].extend(psnap["errors"])
+        out["enrollments"] = dict(psnap["by_key"])
+        out["by_persona_session"] = dict(psnap["by_persona_session"])
+        out["open_dual_session_personas"] = set(psnap["open_dual_session_personas"])
+
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
 
         if "paused_characters" in tables:
             for r in conn.execute("SELECT character_id FROM paused_characters WHERE paused = 1").fetchall():
@@ -1991,8 +2082,11 @@ def run_shadow_match_snapshot(
     ts = int(now_ts if now_ts is not None else time.time())
     db_ctx = _read_shadow_db_context_readonly(Path(db_path), now_ts=ts)
     db_ok = bool(db_ctx["ok"])
+    has_registry = bool(db_ctx["has_registry"])
     db_errors = list(db_ctx["errors"])
     existing_enrollments = db_ctx["enrollments"]
+    by_persona_session = db_ctx["by_persona_session"]
+    open_dual_session_personas = db_ctx["open_dual_session_personas"]
     paused_slugs = db_ctx["paused_slugs"]
     busy_personas = db_ctx["busy_personas"]
     queued_by_dungeon = db_ctx["queued_by_dungeon"]
@@ -2049,34 +2143,63 @@ def run_shadow_match_snapshot(
 
         for slug, comp in sorted(companions.items()):
             guid = int(comp["guid"])
-            if slug not in known and guid not in existing_enrollments:
+            raw_realm = comp.get("realm_id")
+            if raw_realm is not None:
+                try:
+                    realm_id = int(raw_realm)
+                except (TypeError, ValueError):
+                    _bump("invalid_realm_id")
+                    continue
+                if realm_id <= 0:
+                    _bump("invalid_realm_id")
+                    continue
+            else:
+                realm_id = 1
+            char_key = (realm_id, guid)
+            if slug not in known and char_key not in existing_enrollments:
                 _bump("unknown_profile")
                 continue
             if not comp.get("online"):
                 _bump("offline")
                 continue
 
-            if guid in seen_guids:
+            if char_key in seen_guids:
                 _bump("duplicate_character")
                 continue
-            seen_guids.add(guid)
+            seen_guids.add(char_key)
 
             shift_group = str(comp.get("shift_group") or "").strip().lower()
-            if guid in existing_enrollments:
-                rec = existing_enrollments[guid]
+            if char_key in existing_enrollments:
+                rec = existing_enrollments[char_key]
                 persona_id = rec["persona_id"]
                 enrolled_coop = rec["enrolled_coop"]
+                core_protected = rec["core_protected"]
                 persona_state = rec["state"]
                 char_active = rec["char_active"]
+                char_inc = int(rec["incarnation"])
+                # P1-2: Enforce one active session per persona & exclude open dual-session conflicts!
+                if persona_id in open_dual_session_personas:
+                    _bump("persona_dual_session_conflict")
+                    continue
+                active_sess = by_persona_session.get(persona_id)
+                if active_sess is not None and active_sess != (realm_id, guid, char_inc):
+                    _bump("persona_session_on_other_character")
+                    continue
+            elif has_registry:
+                # Issue #25: When a PersonaRegistry exists, unresolved mappings MUST exclude admission!
+                missing_identity += 1
+                _bump("unresolved_persona_mapping")
+                continue
             else:
                 missing_identity += 1
                 persona_id = str(comp.get("persona_id") or persona_id_for_slug(slug))
-                enrolled_coop = shift_group not in PROTECTED_OWNER_GROUPS
+                core_protected = is_protected_owner_group(shift_group)
+                enrolled_coop = not core_protected
                 persona_state = str(comp.get("persona_state") or "active").lower()
                 char_active = True
 
-            # Hard protected-core override
-            if not enrolled_coop or shift_group in PROTECTED_OWNER_GROUPS:
+            # Hard protected-core override (honors sticky core_protected latch even after schedule changes!)
+            if (core_protected and not enrolled_coop) or not enrolled_coop or is_protected_owner_group(shift_group):
                 excluded_core += 1
                 _bump("protected_core_excluded")
                 continue
