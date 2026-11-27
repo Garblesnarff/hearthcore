@@ -406,7 +406,13 @@ class Issue14DungeonEligibilityTests(unittest.TestCase):
         """P0-3 regression: OpportunityCoordinator.admit_candidate rejects wrong role, Horde, locked, short shift, core, disabled."""
         now = 1_800_000_000
         with tempfile.TemporaryDirectory() as tmp:
-            coord = OpportunityCoordinator(Path(tmp) / "opp.db")
+            db_p = Path(tmp) / "opp.db"
+            reg = PersonaRegistry(db_p)
+            reg.sync_from_companions({
+                "ironbulwark": {"guid": 201, "slug": "ironbulwark", "race_id": 3, "class_id": 2, "shift_group": "early-birds", "online": True},
+            }, realm_id=1, now_ts=now)
+            pid_iron = reg.persona_for_guid(201).persona_id
+            coord = OpportunityCoordinator(db_p)
             opp_shadow = coord.create_opportunity(dungeon_id="stockade_n", creator_guid=201, is_shadow=True, now_ts=now)
             opp_live = coord.create_opportunity(dungeon_id="stockade_n", creator_guid=201, is_shadow=False, now_ts=now)
 
@@ -418,7 +424,7 @@ class Issue14DungeonEligibilityTests(unittest.TestCase):
             # 1. Live admission rejected when HEARTHCORE_COOP_DUNGEONS does not enable stockade_n!
             r_live = coord.admit_candidate(
                 opportunity_id=opp_live["id"], expected_revision=1,
-                persona_id=persona_id_for_slug("ironbulwark"), character_guid=201,
+                persona_id=pid_iron, character_guid=201,
                 character_slug="ironbulwark", role="tank", reason_code="vol",
                 candidate=good_tank, now_ts=now,
             )
@@ -428,7 +434,7 @@ class Issue14DungeonEligibilityTests(unittest.TestCase):
             # 2. Shadow admission rejects wrong role (tank trying to join as healer when native_role_mask=TANK)
             r_role = coord.admit_candidate(
                 opportunity_id=opp_shadow["id"], expected_revision=1,
-                persona_id=persona_id_for_slug("ironbulwark"), character_guid=201,
+                persona_id=pid_iron, character_guid=201,
                 character_slug="ironbulwark", role="healer", reason_code="vol",
                 candidate=good_tank, now_ts=now,
             )
@@ -445,7 +451,7 @@ class Issue14DungeonEligibilityTests(unittest.TestCase):
             for label, cand, expected in bad_variants:
                 res = coord.admit_candidate(
                     opportunity_id=opp_shadow["id"], expected_revision=1,
-                    persona_id=persona_id_for_slug("ironbulwark"), character_guid=201,
+                    persona_id=pid_iron, character_guid=201,
                     character_slug="ironbulwark", role="tank", reason_code="vol",
                     candidate=cand, now_ts=now,
                 )
@@ -455,7 +461,7 @@ class Issue14DungeonEligibilityTests(unittest.TestCase):
             # 4. Valid candidate succeeds!
             r_ok = coord.admit_candidate(
                 opportunity_id=opp_shadow["id"], expected_revision=1,
-                persona_id=persona_id_for_slug("ironbulwark"), character_guid=201,
+                persona_id=pid_iron, character_guid=201,
                 character_slug="ironbulwark", role="tank", reason_code="vol",
                 candidate=good_tank, now_ts=now,
             )
@@ -524,10 +530,18 @@ class Issue14DungeonEligibilityTests(unittest.TestCase):
                 "alaric": {"guid": 203, "shift_group": "early-birds"},
                 "pipwick": {"guid": 204, "shift_group": "early-birds"},
                 "nightstep": {"guid": 205, "shift_group": "prime-time"},
+                "kraghammer": {"guid": 206, "shift_group": "prime-time"},
+                "solara": {"guid": 207, "shift_group": "prime-time"},
             }, now_ts=now)
+            pid_iron = reg.persona_for_guid(201).persona_id
+            pid_ael = reg.persona_for_guid(202).persona_id
+            pid_alaric = reg.persona_for_guid(203).persona_id
+            pid_pip = reg.persona_for_guid(204).persona_id
+            pid_krag = reg.persona_for_guid(206).persona_id
+            pid_sol = reg.persona_for_guid(207).persona_id
             # Active alt `vespera` under same persona as `pipwick`
             reg.register_alt(
-                persona_id=persona_id_for_slug("pipwick"),
+                persona_id=pid_pip,
                 slug="vespera",
                 character_guid=299,
                 slot_kind="alt",
@@ -535,7 +549,7 @@ class Issue14DungeonEligibilityTests(unittest.TestCase):
             )
             # P1-6: Inactive alt `lyraeth` (active=0) under same persona as `alaric` -> MUST NOT mint new persona!
             reg.register_alt(
-                persona_id=persona_id_for_slug("alaric"),
+                persona_id=pid_alaric,
                 slug="lyraeth",
                 character_guid=298,
                 slot_kind="alt",
@@ -551,19 +565,19 @@ class Issue14DungeonEligibilityTests(unittest.TestCase):
             opp = coord.create_opportunity(dungeon_id="stockade_n", creator_guid=201, is_shadow=False, now_ts=now)
             coord.express_interest(
                 opportunity_id=opp["id"], expected_revision=1,
-                persona_id=persona_id_for_slug("ironbulwark"), character_guid=201,
+                persona_id=pid_iron, character_guid=201,
                 character_slug="ironbulwark", role="tank", reason_code="vol",
                 available_until=now + 3600, now_ts=now,
             )
             coord.express_interest(
                 opportunity_id=opp["id"], expected_revision=1,
-                persona_id=persona_id_for_slug("aelindra"), character_guid=202,
+                persona_id=pid_ael, character_guid=202,
                 character_slug="aelindra", role="healer", reason_code="vol",
                 available_until=now + 3600, now_ts=now,
             )
             coord.express_interest(
                 opportunity_id=opp["id"], expected_revision=1,
-                persona_id=persona_id_for_slug("kraghammer"), character_guid=206,
+                persona_id=pid_krag, character_guid=206,
                 character_slug="kraghammer", role="damage", reason_code="vol",
                 available_until=now + 3600, now_ts=now,
             )
@@ -573,8 +587,8 @@ class Issue14DungeonEligibilityTests(unittest.TestCase):
                     "INSERT INTO opportunity_interests (opportunity_id, opportunity_revision, persona_id, realm_id, "
                     "character_guid, incarnation, character_slug, role, state, reason_code, available_until, "
                     "reserved_until, confirmed_at, ack_token, created_at, updated_at) "
-                    "VALUES (?, 1, 'per_solara', 1, 207, 1, 'solara', 'damage', 'interested', 'old', ?, 0, 0, '', ?, ?)",
-                    (opp["id"], now - 10, now - 500, now - 500),
+                    "VALUES (?, 1, ?, 1, 207, 1, 'solara', 'damage', 'interested', 'old', ?, 0, 0, '', ?, ?)",
+                    (opp["id"], pid_sol, now - 10, now - 500, now - 500),
                 )
                 conn.commit()
 
@@ -641,11 +655,11 @@ class Issue14DungeonEligibilityTests(unittest.TestCase):
             self.assertEqual(stock["stages"]["available"]["count"], 6)
             # P1-2 un-nested check: kraghammer STILL appears in `willing` (6) and `queued` (3), NOT in `available`!
             self.assertEqual(stock["stages"]["willing"]["count"], 6)
-            self.assertIn("per_kraghammer", stock["stages"]["queued"]["personas"])
-            self.assertNotIn("per_kraghammer", stock["stages"]["available"]["personas"])
+            self.assertIn(pid_krag, stock["stages"]["queued"]["personas"])
+            self.assertNotIn(pid_krag, stock["stages"]["available"]["personas"])
             # P1-5 expired interest check: solara is NOT in willing or queued!
-            self.assertNotIn("per_solara", stock["stages"]["willing"]["personas"])
-            self.assertNotIn("per_solara", stock["stages"]["queued"]["personas"])
+            self.assertNotIn(pid_sol, stock["stages"]["willing"]["personas"])
+            self.assertNotIn(pid_sol, stock["stages"]["queued"]["personas"])
             # Matched strictly from willing_and_available (5), with aelindra flexing cleanly into healer!
             self.assertTrue(stock["feasible_now"])
             self.assertEqual(stock["stages"]["matched"]["count"], 5)
