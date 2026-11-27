@@ -83,6 +83,9 @@ public:
         std::string note;
     };
     static std::vector<BankRequest> ListBankRequests();
+    // Updates the in-memory cache to match a write that was just queued (async DB write).
+    static void UpsertBankRequest(BankRequest const& req);
+    static void RemoveBankRequest(uint32 itemEntry);
 
     // Native proposal binding vertical slice (Issue #3): returns true if this companion currently
     // has a C++-validated executing guild work-order proposal.
