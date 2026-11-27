@@ -12,8 +12,10 @@ Design guarantees (docs/PHASE_II_LIVING_GUILD.md Sections 5 & 10):
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -49,8 +51,19 @@ SCHEMA_VERSION = 1
 DEFAULT_RECRUIT_TTL_SEC = 20 * 60
 DEFAULT_CONFIRM_TTL_SEC = 2 * 60
 DEFAULT_MAX_GROUPS = 1
+DEFAULT_MAX_TOTAL_INSTANCES = 4
+DEFAULT_MAX_ONLINE_POPULATION = 45
+DEFAULT_MAX_HEADROOM_TELEMETRY_AGE_SEC = 300
 MIN_AVAIL_RAM_MIB = 512.0
+RECOVER_AVAIL_RAM_MIB = 640.0
 MAX_TICK_P99_MS = 45.0
+RECOVER_TICK_P99_MS = 38.0
+MAX_SWAP_IO_PAGES_PER_SEC = 25.0
+RECOVER_SWAP_IO_PAGES_PER_SEC = 10.0
+MAX_CPU_PSI_SOME_AVG10 = 20.0
+RECOVER_CPU_PSI_SOME_AVG10 = 10.0
+MAX_CPU_THROTTLED_PCT = 15.0
+RECOVER_CPU_THROTTLED_PCT = 5.0
 NATIVE_STATE_ORDER: dict[str, int] = {
     "queued": 1,
     "proposal_sent": 2,
@@ -79,44 +92,195 @@ def coop_enabled() -> bool:
     return (os.getenv("HEARTHCORE_COOP_ENABLED") or "0").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _valid_nonneg_float(val: Any) -> float | None:
+    """Return finite non-negative float or None (rejecting bool, None, NaN, +/-inf, negative)."""
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f) or f < 0.0:
+        return None
+    return f
+
+
+def _valid_nonneg_int(val: Any) -> int | None:
+    """Return non-negative int or None (rejecting bool, None, NaN, negative)."""
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        if isinstance(val, float) and not math.isfinite(val):
+            return None
+        iv = int(val)
+    except (TypeError, ValueError):
+        return None
+    return iv if iv >= 0 else None
+
+
 def check_resource_headroom(
     *,
     mem_avail_mib: float | None,
     tick_p99_ms: float | None,
-    active_managed_groups: int,
+    active_managed_groups: int | None,
     max_managed_groups: int = DEFAULT_MAX_GROUPS,
     prev_paused: bool = False,
+    pending_proposals: int = 0,
+    active_instances: int | None = None,
+    human_instances: int = 0,
+    max_total_instances: int = DEFAULT_MAX_TOTAL_INSTANCES,
+    swap_io_pages_per_sec: float | None = None,
+    cpu_psi_some_avg10: float | None = None,
+    cpu_throttled_pct: float | None = None,
+    online_population: int | None = None,
+    max_online_population: int = DEFAULT_MAX_ONLINE_POPULATION,
+    telemetry_ts: int | None = None,
+    now_ts: int | None = None,
+    max_telemetry_age_sec: int = DEFAULT_MAX_HEADROOM_TELEMETRY_AGE_SEC,
+    require_extended_telemetry: bool = False,
 ) -> dict[str, Any]:
-    """Check Acer i5-7400 hardware headroom with FAIL-CLOSED telemetry & hysteresis (Issue #61)."""
+    """Check Acer i5-7400 hardware headroom with FAIL-CLOSED telemetry, NaN/staleness checks & hysteresis (Issues #12 & #61).
+
+    Guards ONLY new automated queue admissions and proposal acceptances (never interrupts existing combat or humans).
+    """
     reasons: list[str] = []
-    if active_managed_groups >= max_managed_groups:
-        reasons.append(f"group_cap_reached:{active_managed_groups}/{max_managed_groups}")
+    headroom_reasons: list[str] = []
+    cap_reasons: list[str] = []
 
-    # Hysteresis: pause at <512 MiB / >45 ms; recover only once >=640 MiB and <=38 ms
-    ram_thresh = 640.0 if prev_paused else MIN_AVAIL_RAM_MIB
-    tick_thresh = 38.0 if prev_paused else MAX_TICK_P99_MS
+    def _add_hr(msg: str) -> None:
+        reasons.append(msg)
+        headroom_reasons.append(msg)
 
-    # Fail closed on missing telemetry (Issue #61): missing data means DO NOT ADMIT!
+    def _add_cap(msg: str) -> None:
+        reasons.append(msg)
+        cap_reasons.append(msg)
+
+    # 1. Telemetry freshness (rejects stale or future-skewed timestamps; fails closed when required)
+    if telemetry_ts is not None:
+        t_ts = _valid_nonneg_int(telemetry_ts)
+        n_ts = _valid_nonneg_int(now_ts if now_ts is not None else int(time.time()))
+        if t_ts is None or t_ts <= 0 or n_ts is None:
+            _add_hr("invalid_telemetry_timestamp")
+        else:
+            age = n_ts - t_ts
+            if age < 0 or age > int(max_telemetry_age_sec):
+                _add_hr(f"stale_telemetry:{age}s>{int(max_telemetry_age_sec)}s")
+    elif require_extended_telemetry:
+        _add_hr("missing_telemetry_timestamp")
+
+    # 2. Managed groups + pending proposals cap (cap blocks do NOT trigger hardware headroom hysteresis pause!)
+    act_grps = _valid_nonneg_int(active_managed_groups)
+    pend_props = _valid_nonneg_int(pending_proposals)
+    if act_grps is None:
+        _add_hr("missing_group_count_telemetry")
+        effective_groups: int | None = None
+    elif pend_props is None:
+        _add_hr("invalid_pending_proposals")
+        effective_groups = None
+    else:
+        effective_groups = act_grps + pend_props
+        if effective_groups >= int(max_managed_groups):
+            _add_cap(f"group_cap_reached:{effective_groups}/{int(max_managed_groups)}")
+
+    # 3. Hysteresis thresholds (pause vs recover — applies ONLY to hardware/telemetry headroom!)
+    ram_thresh = RECOVER_AVAIL_RAM_MIB if prev_paused else MIN_AVAIL_RAM_MIB
+    tick_thresh = RECOVER_TICK_P99_MS if prev_paused else MAX_TICK_P99_MS
+    swap_thresh = RECOVER_SWAP_IO_PAGES_PER_SEC if prev_paused else MAX_SWAP_IO_PAGES_PER_SEC
+    cpu_psi_thresh = RECOVER_CPU_PSI_SOME_AVG10 if prev_paused else MAX_CPU_PSI_SOME_AVG10
+    cpu_thr_thresh = RECOVER_CPU_THROTTLED_PCT if prev_paused else MAX_CPU_THROTTLED_PCT
+
+    # 4. RAM & world tick p99 (ALWAYS required, NaN/Inf/negative fail closed!)
+    ram_val = _valid_nonneg_float(mem_avail_mib)
     if mem_avail_mib is None:
-        reasons.append("missing_ram_telemetry")
-    elif mem_avail_mib < ram_thresh:
-        reasons.append(f"low_ram_headroom:{mem_avail_mib:.0f}MiB<{ram_thresh:.0f}MiB")
+        _add_hr("missing_ram_telemetry")
+    elif ram_val is None:
+        _add_hr("invalid_ram_telemetry")
+    elif ram_val < ram_thresh:
+        _add_hr(f"low_ram_headroom:{ram_val:.0f}MiB<{ram_thresh:.0f}MiB")
 
+    tick_val = _valid_nonneg_float(tick_p99_ms)
     if tick_p99_ms is None:
-        reasons.append("missing_tick_telemetry")
-    elif tick_p99_ms > tick_thresh:
-        reasons.append(f"high_tick_p99:{tick_p99_ms:.1f}ms>{tick_thresh:.1f}ms")
+        _add_hr("missing_tick_telemetry")
+    elif tick_val is None:
+        _add_hr("invalid_tick_telemetry")
+    elif tick_val > tick_thresh:
+        _add_hr(f"high_tick_p99:{tick_val:.1f}ms>{tick_thresh:.1f}ms")
+
+    # 5. Swap I/O rate (fail closed on NaN/negative/above-threshold, or missing when extended required)
+    swap_val = _valid_nonneg_float(swap_io_pages_per_sec)
+    if swap_io_pages_per_sec is None:
+        if require_extended_telemetry:
+            _add_hr("missing_swap_telemetry")
+    elif swap_val is None:
+        _add_hr("invalid_swap_telemetry")
+    elif swap_val > swap_thresh:
+        _add_hr(f"high_swap_io:{swap_val:.1f}/s>{swap_thresh:.1f}/s")
+
+    # 6. CPU PSI & cgroup CPU throttling
+    psi_val = _valid_nonneg_float(cpu_psi_some_avg10)
+    if cpu_psi_some_avg10 is None:
+        if require_extended_telemetry:
+            _add_hr("missing_cpu_psi_telemetry")
+    elif psi_val is None:
+        _add_hr("invalid_cpu_psi_telemetry")
+    elif psi_val > cpu_psi_thresh:
+        _add_hr(f"high_cpu_psi:{psi_val:.1f}%>{cpu_psi_thresh:.1f}%")
+
+    thr_val = _valid_nonneg_float(cpu_throttled_pct)
+    if cpu_throttled_pct is not None:
+        if thr_val is None:
+            _add_hr("invalid_cpu_throttle_telemetry")
+        elif thr_val > cpu_thr_thresh:
+            _add_hr(f"high_cpu_throttle:{thr_val:.1f}%>{cpu_thr_thresh:.1f}%")
+
+    # 7. Active + optional additive human instances + pending proposals cap
+    #    Note: when passing total sMapMgr->GetNumInstances (which already includes human instances), pass human_instances=0.
+    inst_val = _valid_nonneg_int(active_instances)
+    hum_inst = _valid_nonneg_int(human_instances)
+    effective_instances: int | None = None
+    if active_instances is None:
+        if require_extended_telemetry:
+            _add_hr("missing_instance_telemetry")
+    elif inst_val is None or hum_inst is None:
+        _add_hr("invalid_instance_telemetry")
+    else:
+        effective_instances = inst_val + hum_inst + (pend_props or 0)
+        if effective_instances >= int(max_total_instances):
+            _add_cap(f"instance_cap_reached:{effective_instances}/{int(max_total_instances)}")
+
+    # 8. Online population cap (no forced mass logins)
+    pop_val = _valid_nonneg_int(online_population)
+    if online_population is None:
+        if require_extended_telemetry:
+            _add_hr("missing_population_telemetry")
+    elif pop_val is None:
+        _add_hr("invalid_population_telemetry")
+    elif pop_val >= int(max_online_population):
+        _add_cap(f"population_cap_reached:{pop_val}/{int(max_online_population)}")
 
     admit_ok = len(reasons) == 0
+    headroom_paused = len(headroom_reasons) > 0
     return {
         "admit_ok": admit_ok,
-        "paused": not admit_ok,
+        "paused": headroom_paused,
+        "headroom_paused": headroom_paused,
+        "cap_blocked": len(cap_reasons) > 0,
         "prev_paused": bool(prev_paused),
         "reasons": reasons,
-        "active_managed_groups": active_managed_groups,
-        "max_managed_groups": max_managed_groups,
-        "mem_avail_mib": round(mem_avail_mib, 1) if mem_avail_mib is not None else None,
-        "tick_p99_ms": round(tick_p99_ms, 1) if tick_p99_ms is not None else None,
+        "headroom_reasons": headroom_reasons,
+        "cap_reasons": cap_reasons,
+        "active_managed_groups": act_grps,
+        "pending_proposals": pend_props,
+        "effective_groups": effective_groups,
+        "max_managed_groups": int(max_managed_groups),
+        "effective_instances": effective_instances,
+        "max_total_instances": int(max_total_instances),
+        "online_population": pop_val,
+        "max_online_population": int(max_online_population),
+        "mem_avail_mib": round(ram_val, 1) if ram_val is not None else None,
+        "tick_p99_ms": round(tick_val, 1) if tick_val is not None else None,
+        "swap_io_pages_per_sec": round(swap_val, 1) if swap_val is not None else None,
+        "cpu_psi_some_avg10": round(psi_val, 1) if psi_val is not None else None,
     }
 
 
@@ -125,39 +289,98 @@ def evaluate_persisted_headroom(
     *,
     mem_avail_mib: float | None,
     tick_p99_ms: float | None,
-    active_managed_groups: int,
+    active_managed_groups: int | None,
     max_managed_groups: int = DEFAULT_MAX_GROUPS,
     now_ts: int | None = None,
+    pending_proposals: int = 0,
+    active_instances: int | None = None,
+    human_instances: int = 0,
+    max_total_instances: int = DEFAULT_MAX_TOTAL_INSTANCES,
+    swap_io_pages_per_sec: float | None = None,
+    cpu_psi_some_avg10: float | None = None,
+    cpu_throttled_pct: float | None = None,
+    online_population: int | None = None,
+    max_online_population: int = DEFAULT_MAX_ONLINE_POPULATION,
+    telemetry_ts: int | None = None,
+    max_telemetry_age_sec: int = DEFAULT_MAX_HEADROOM_TELEMETRY_AGE_SEC,
+    require_extended_telemetry: bool = False,
 ) -> dict[str, Any]:
-    """Evaluate headroom using persisted hysteresis state on disk so pause/recover survives runs (Issue #61)."""
+    """Evaluate headroom with flock-serialized persisted hysteresis on disk (Issues #12 & #61)."""
     ts = int(now_ts if now_ts is not None else time.time())
-    prev_paused = False
-    try:
-        if state_path.is_file():
-            saved = json.loads(state_path.read_text(encoding="utf-8"))
-            prev_paused = bool(saved.get("paused", False))
-    except Exception as exc:
-        logger.warning("Corrupt headroom state at %s (%s); failing closed", state_path, exc)
-        prev_paused = True  # fail closed on corrupt state
+    lock_path = state_path.with_suffix(".lock")
 
-    res = check_resource_headroom(
-        mem_avail_mib=mem_avail_mib,
-        tick_p99_ms=tick_p99_ms,
-        active_managed_groups=active_managed_groups,
-        max_managed_groups=max_managed_groups,
-        prev_paused=prev_paused,
-    )
+    def _run_eval(prev_paused: bool) -> dict[str, Any]:
+        return check_resource_headroom(
+            mem_avail_mib=mem_avail_mib,
+            tick_p99_ms=tick_p99_ms,
+            active_managed_groups=active_managed_groups,
+            max_managed_groups=max_managed_groups,
+            prev_paused=prev_paused,
+            pending_proposals=pending_proposals,
+            active_instances=active_instances,
+            human_instances=human_instances,
+            max_total_instances=max_total_instances,
+            swap_io_pages_per_sec=swap_io_pages_per_sec,
+            cpu_psi_some_avg10=cpu_psi_some_avg10,
+            cpu_throttled_pct=cpu_throttled_pct,
+            online_population=online_population,
+            max_online_population=max_online_population,
+            telemetry_ts=telemetry_ts,
+            now_ts=ts,
+            max_telemetry_age_sec=max_telemetry_age_sec,
+            require_extended_telemetry=require_extended_telemetry,
+        )
+
     try:
         state_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = state_path.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps({"paused": bool(res["paused"]), "updated_at": ts, "reasons": res["reasons"]}, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        tmp.replace(state_path)
+        with lock_path.open("a+", encoding="utf-8") as lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            try:
+                prev_paused = False
+                try:
+                    if state_path.is_file():
+                        saved = json.loads(state_path.read_text(encoding="utf-8"))
+                        if not isinstance(saved, dict) or not isinstance(saved.get("paused"), bool):
+                            raise ValueError("missing boolean 'paused' key")
+                        prev_paused = saved["paused"]
+                except Exception as exc:
+                    logger.warning("Corrupt headroom state at %s (%s); failing closed", state_path, exc)
+                    prev_paused = True  # fail closed on corrupt state
+
+                res = _run_eval(prev_paused)
+                try:
+                    tmp = state_path.with_suffix(".json.tmp")
+                    tmp.write_text(
+                        json.dumps(
+                            {"paused": bool(res["headroom_paused"]), "updated_at": ts, "reasons": res["headroom_reasons"]},
+                            indent=2,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    tmp.replace(state_path)
+                except OSError as exc:
+                    logger.warning("Failed persisting headroom state to %s: %s; failing closed", state_path, exc)
+                    res["admit_ok"] = False
+                    res["paused"] = True
+                    res["headroom_paused"] = True
+                    if "headroom_state_unwritable" not in res["reasons"]:
+                        res["reasons"].append("headroom_state_unwritable")
+                        res["headroom_reasons"].append("headroom_state_unwritable")
+                return res
+            finally:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
     except OSError as exc:
-        logger.warning("Failed persisting headroom state to %s: %s", state_path, exc)
-    return res
+        logger.warning("Unable to open/lock headroom state dir for %s (%s); failing closed", state_path, exc)
+        # Fail closed when runtime directory is read-only / lock cannot be opened
+        res = _run_eval(prev_paused=True)
+        res["admit_ok"] = False
+        res["paused"] = True
+        res["headroom_paused"] = True
+        if "headroom_state_unwritable" not in res["reasons"]:
+            res["reasons"].append("headroom_state_unwritable")
+            res["headroom_reasons"].append("headroom_state_unwritable")
+        return res
 
 
 def admit_cooperative_opportunity(
@@ -171,8 +394,23 @@ def admit_cooperative_opportunity(
     active_managed_groups: int,
     max_managed_groups: int = DEFAULT_MAX_GROUPS,
     now_ts: int | None = None,
+    active_instances: int | None = None,
+    human_instances: int = 0,
+    max_total_instances: int = DEFAULT_MAX_TOTAL_INSTANCES,
+    swap_io_pages_per_sec: float | None = None,
+    cpu_psi_some_avg10: float | None = None,
+    cpu_throttled_pct: float | None = None,
+    online_population: int | None = None,
+    max_online_population: int = DEFAULT_MAX_ONLINE_POPULATION,
+    telemetry_ts: int | None = None,
+    max_telemetry_age_sec: int = DEFAULT_MAX_HEADROOM_TELEMETRY_AGE_SEC,
+    enforce_live_flags: bool = True,
+    require_extended_telemetry: bool = False,
+    additional_logins_needed: int = 0,
 ) -> dict[str, Any]:
-    """Live cooperative admission path enforcing fail-closed persisted headroom & hysteresis (Issue #61)."""
+    """Cooperative admission path enforcing persisted headroom, hysteresis & atomic DB caps (Issues #12 & #61)."""
+    if additional_logins_needed > 0:
+        return {"ok": False, "reason": "forced_mass_login_forbidden"}
     hr = evaluate_persisted_headroom(
         state_path,
         mem_avail_mib=mem_avail_mib,
@@ -180,6 +418,17 @@ def admit_cooperative_opportunity(
         active_managed_groups=active_managed_groups,
         max_managed_groups=max_managed_groups,
         now_ts=now_ts,
+        active_instances=active_instances,
+        human_instances=human_instances,
+        max_total_instances=max_total_instances,
+        swap_io_pages_per_sec=swap_io_pages_per_sec,
+        cpu_psi_some_avg10=cpu_psi_some_avg10,
+        cpu_throttled_pct=cpu_throttled_pct,
+        online_population=online_population,
+        max_online_population=max_online_population,
+        telemetry_ts=telemetry_ts,
+        max_telemetry_age_sec=max_telemetry_age_sec,
+        require_extended_telemetry=require_extended_telemetry,
     )
     if not hr["admit_ok"]:
         logger.warning(
@@ -196,9 +445,74 @@ def admit_cooperative_opportunity(
         opportunity_id,
         expected_revision=expected_revision,
         now_ts=now_ts,
+        enforce_live_flags=enforce_live_flags,
+        max_managed_groups=max_managed_groups,
+        external_active_groups=active_managed_groups,
+        active_instances=(int(active_instances) + int(human_instances)) if active_instances is not None else None,
+        max_total_instances=max_total_instances,
+        online_population=online_population,
+        max_online_population=max_online_population,
     )
     res["headroom"] = hr
     return res
+
+
+def admit_live_cooperative_opportunity(
+    coordinator: "OpportunityCoordinator",
+    opportunity_id: int,
+    *,
+    expected_revision: int,
+    state_path: Path,
+    mem_avail_mib: float | None,
+    tick_p99_ms: float | None,
+    swap_io_pages_per_sec: float | None,
+    cpu_psi_some_avg10: float | None,
+    active_managed_groups: int,
+    active_instances: int | None,
+    online_population: int | None,
+    telemetry_ts: int | None,
+    human_instances: int = 0,
+    cpu_throttled_pct: float | None = None,
+    max_managed_groups: int = DEFAULT_MAX_GROUPS,
+    max_total_instances: int = DEFAULT_MAX_TOTAL_INSTANCES,
+    max_online_population: int = DEFAULT_MAX_ONLINE_POPULATION,
+    max_telemetry_age_sec: int = DEFAULT_MAX_HEADROOM_TELEMETRY_AGE_SEC,
+    additional_logins_needed: int = 0,
+    now_ts: int | None = None,
+) -> dict[str, Any]:
+    """Strict production/staging live admission entrypoint (Issue #12).
+
+    Enforces ALL gates fail-closed:
+    - HEARTHCORE_COOP_ENABLED=1 & dungeon in HEARTHCORE_COOP_DUNGEONS
+    - Fresh timestamped telemetry (RAM, tick p99, swap I/O, CPU PSI, live instances, population; rejects NaN/stale)
+    - Persisted hysteresis (flock-serialized)
+    - Zero forced mass logins (additional_logins_needed == 0)
+    - Atomic BEGIN IMMEDIATE group/instance/population cap enforcement across concurrent proposals!
+    """
+    return admit_cooperative_opportunity(
+        coordinator,
+        opportunity_id,
+        expected_revision=expected_revision,
+        state_path=state_path,
+        mem_avail_mib=mem_avail_mib,
+        tick_p99_ms=tick_p99_ms,
+        active_managed_groups=active_managed_groups,
+        max_managed_groups=max_managed_groups,
+        now_ts=now_ts,
+        active_instances=active_instances,
+        human_instances=human_instances,
+        max_total_instances=max_total_instances,
+        swap_io_pages_per_sec=swap_io_pages_per_sec,
+        cpu_psi_some_avg10=cpu_psi_some_avg10,
+        cpu_throttled_pct=cpu_throttled_pct,
+        online_population=online_population,
+        max_online_population=max_online_population,
+        telemetry_ts=telemetry_ts,
+        max_telemetry_age_sec=max_telemetry_age_sec,
+        enforce_live_flags=True,
+        require_extended_telemetry=True,
+        additional_logins_needed=additional_logins_needed,
+    )
 
 
 def adapt_work_orders_as_opportunities(work_orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -762,12 +1076,19 @@ class OpportunityCoordinator:
         expected_revision: int,
         now_ts: int | None = None,
         confirm_ttl_sec: int = DEFAULT_CONFIRM_TTL_SEC,
+        enforce_live_flags: bool = False,
+        max_managed_groups: int | None = DEFAULT_MAX_GROUPS,
+        external_active_groups: int = 0,
+        active_instances: int | None = None,
+        max_total_instances: int | None = None,
+        online_population: int | None = None,
+        max_online_population: int | None = None,
     ) -> dict[str, Any]:
         """Atomically reserve 1 tank, 1 healer, 3 damage among voluntary interests.
 
-        Enforces unique active reservation/commitment per `persona_id` across ALL opportunities so two
-        competing opportunities can never double-book the same tank/healer/DPS. Accepted & active
-        commitments remain strictly exclusive regardless of confirmation TTL (Issue #13).
+        Enforces unique active reservation/commitment per `persona_id` across ALL opportunities AND
+        (for live opportunities) atomically enforces feature flags, supported/enabled dungeon allowlist,
+        and group/instance/population caps inside the same `BEGIN IMMEDIATE` transaction (Issues #12 & #13).
         """
         ts = int(now_ts if now_ts is not None else time.time())
         conn = self._conn()
@@ -793,8 +1114,22 @@ class OpportunityCoordinator:
                 conn.execute("COMMIT")
                 return {"ok": False, "reason": "expired"}
 
-            roles_needed: dict[str, int] = json.loads(str(opp["roles_json"]))
             opp_is_shadow = int(opp["is_shadow"])
+            dungeon_id = str(opp["dungeon_id"])
+            if opp_is_shadow == 0:
+                spec = DUNGEON_BY_ID.get(dungeon_id)
+                if spec is None or not spec.supported:
+                    conn.execute("COMMIT")
+                    return {"ok": False, "reason": f"unsupported_dungeon:{dungeon_id}"}
+                if enforce_live_flags:
+                    if not coop_enabled():
+                        conn.execute("COMMIT")
+                        return {"ok": False, "reason": "coop_disabled"}
+                    if dungeon_id not in enabled_dungeon_ids():
+                        conn.execute("COMMIT")
+                        return {"ok": False, "reason": f"dungeon_disabled_live:{dungeon_id}"}
+
+            roles_needed: dict[str, int] = json.loads(str(opp["roles_json"]))
             # Issue #13 & #15: Accepted/active commitments stay strictly exclusive regardless of reserved_until;
             # shadow reservations NEVER block live slots and vice versa!
             busy_rows = conn.execute(
@@ -852,6 +1187,57 @@ class OpportunityCoordinator:
             if shortfalls:
                 conn.execute("COMMIT")
                 return {"ok": False, "reason": "insufficient_roles", "shortfalls": shortfalls}
+
+            if opp_is_shadow == 0:
+                # Atomic BEGIN IMMEDIATE cap check across concurrent proposals (Issue #12):
+                # Count ALL unexpired live non-shadow assembling/confirmed/active/cancelling groups in DB!
+                live_row = conn.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS total_live,
+                        SUM(CASE WHEN state IN ('assembling', 'confirmed') THEN 1 ELSE 0 END) AS pending_live
+                    FROM opportunities
+                    WHERE is_shadow = 0
+                      AND id != ?
+                      AND (
+                          (state IN ('assembling', 'confirmed') AND (confirm_until = 0 OR confirm_until > ?))
+                          OR state IN ('active', 'cancelling')
+                      )
+                    """,
+                    (int(opportunity_id), ts),
+                ).fetchone()
+                db_live_groups = int(live_row["total_live"] or 0) if live_row else 0
+                db_pending_live = int(live_row["pending_live"] or 0) if live_row else 0
+
+                if max_managed_groups is not None:
+                    eff_groups = max(db_live_groups, int(external_active_groups or 0))
+                    if eff_groups >= int(max_managed_groups):
+                        conn.execute("COMMIT")
+                        return {
+                            "ok": False,
+                            "reason": "group_cap_reached",
+                            "active_managed_groups": eff_groups,
+                            "max_managed_groups": int(max_managed_groups),
+                        }
+                if active_instances is not None and max_total_instances is not None:
+                    eff_instances = int(active_instances) + db_pending_live
+                    if eff_instances >= int(max_total_instances):
+                        conn.execute("COMMIT")
+                        return {
+                            "ok": False,
+                            "reason": "instance_cap_reached",
+                            "effective_instances": eff_instances,
+                            "max_total_instances": int(max_total_instances),
+                        }
+                if online_population is not None and max_online_population is not None:
+                    if int(online_population) >= int(max_online_population):
+                        conn.execute("COMMIT")
+                        return {
+                            "ok": False,
+                            "reason": "population_cap_reached",
+                            "online_population": int(online_population),
+                            "max_online_population": int(max_online_population),
+                        }
 
             # Atomically advance opportunity to 'assembling' (revision + 1) with explicit confirm_until TTL
             res_until = ts + max(1, int(confirm_ttl_sec))
@@ -1503,6 +1889,8 @@ def _read_shadow_db_context_readonly(db_path: Path, *, now_ts: int) -> dict[str,
         "queued_by_dungeon": {},
         "future_intents_by_dungeon": {},
         "future_commitments_by_dungeon": {},
+        "active_live_groups": 0,
+        "pending_live_proposals": 0,
     }
     if not db_path.is_file():
         return out
@@ -1530,6 +1918,27 @@ def _read_shadow_db_context_readonly(db_path: Path, *, now_ts: int) -> dict[str,
         if "opportunities" in tables and "opportunity_interests" in tables:
             opp_cols = {r[1] for r in conn.execute("PRAGMA table_info(opportunities)").fetchall()}
             has_confirm = "confirm_until" in opp_cols
+            # Issue #12: Count ACTUAL live active & pending assembling/confirmed groups (never hardcode 0 in shadow!)
+            live_cnt_clause = (
+                "((state IN ('assembling','confirmed') AND (confirm_until = 0 OR confirm_until > ?)) "
+                "OR state IN ('active','cancelling'))"
+                if has_confirm
+                else "state IN ('assembling','confirmed','active','cancelling')"
+            )
+            live_cnt_params: tuple[Any, ...] = (int(now_ts),) if has_confirm else ()
+            cnt_row = conn.execute(
+                f"""
+                SELECT
+                    SUM(CASE WHEN state IN ('active','cancelling') THEN 1 ELSE 0 END) AS active_cnt,
+                    SUM(CASE WHEN state IN ('assembling','confirmed') THEN 1 ELSE 0 END) AS pending_cnt
+                FROM opportunities
+                WHERE is_shadow = 0 AND {live_cnt_clause}
+                """,
+                live_cnt_params,
+            ).fetchone()
+            if cnt_row:
+                out["active_live_groups"] = int(cnt_row["active_cnt"] or 0)
+                out["pending_live_proposals"] = int(cnt_row["pending_cnt"] or 0)
             opp_ttl_clause = (
                 "((o.state = 'recruiting' AND o.recruit_until > ?) "
                 "OR (o.state IN ('assembling','confirmed') AND (o.confirm_until = 0 OR o.confirm_until > ?)) "
@@ -2174,24 +2583,75 @@ def run_shadow_match_snapshot(
     companions = world_ctx.get("companions") or {}
 
     known = set(profiles())
-    v = vitals or {}
-    mem_avail_mib = float(v["mem_avail_gib"]) * 1024.0 if v.get("mem_avail_gib") is not None else None
-    tick_p99 = float(v["tick_p99"]) if v.get("tick_p99") is not None else None
-    # Issue #15: Shadow pass reads persisted headroom state READ-ONLY and NEVER writes headroom_state.json!
+    v = vitals if isinstance(vitals, dict) else {}
+    raw_mem_gib = v.get("mem_avail_gib")
+    if raw_mem_gib is None:
+        mem_avail_mib: float | None = None
+    else:
+        valid_gib = _valid_nonneg_float(raw_mem_gib)
+        mem_avail_mib = (valid_gib * 1024.0) if valid_gib is not None else math.nan
+
+    raw_tick = v.get("tick_p99")
+    if raw_tick is None:
+        tick_p99: float | None = None
+    else:
+        valid_tick = _valid_nonneg_float(raw_tick)
+        tick_p99 = valid_tick if valid_tick is not None else math.nan
+
+    # Issue #12 & #15: Shadow reads persisted headroom state READ-ONLY (never writes headroom_state.json)
+    # AND uses ACTUAL live active/pending group counts from brain.db + vitals (never hardcoding 0!).
     prev_paused = False
     hr_path = runtime_dir / "headroom_state.json"
     try:
         if hr_path.is_file():
-            prev_paused = bool(json.loads(hr_path.read_text(encoding="utf-8")).get("paused", False))
+            saved = json.loads(hr_path.read_text(encoding="utf-8"))
+            if not isinstance(saved, dict) or not isinstance(saved.get("paused"), bool):
+                raise ValueError("invalid headroom_state.json")
+            prev_paused = saved["paused"]
     except Exception as exc:
         logger.warning("Corrupt headroom state at %s during shadow read (%s); assuming paused", hr_path, exc)
         prev_paused = True
+
+    def _safe_int_vital(key: str, default: int) -> int | None:
+        raw = v.get(key)
+        if raw is None:
+            return default
+        return _valid_nonneg_int(raw)
+
+    v_act = _safe_int_vital("active_managed_groups", 0)
+    v_pend = _safe_int_vital("pending_proposals", 0)
+    actual_active_groups: int | None = None if v_act is None else max(int(db_ctx.get("active_live_groups") or 0), v_act)
+    actual_pending_proposals: int | None = None if v_pend is None else max(int(db_ctx.get("pending_live_proposals") or 0), v_pend)
+
+    max_grp = _safe_int_vital("max_managed_groups", DEFAULT_MAX_GROUPS)
+    max_inst = _safe_int_vital("max_total_instances", DEFAULT_MAX_TOTAL_INSTANCES)
+    max_pop = _safe_int_vital("max_online_population", DEFAULT_MAX_ONLINE_POPULATION)
+    hum_inst = _safe_int_vital("human_instances", 0)
+
+    vitals_ts = v.get("observed_at")
+    if isinstance(vitals_ts, str) and vitals_ts.strip():
+        try:
+            vitals_ts = int(datetime.strptime(vitals_ts.strip(), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp())
+        except ValueError:
+            vitals_ts = -1  # malformed timestamp -> fail closed
     headroom = check_resource_headroom(
         mem_avail_mib=mem_avail_mib,
         tick_p99_ms=tick_p99,
-        active_managed_groups=0,
-        max_managed_groups=DEFAULT_MAX_GROUPS,
+        active_managed_groups=actual_active_groups,
+        pending_proposals=actual_pending_proposals if actual_pending_proposals is not None else -1,
+        max_managed_groups=max_grp if (max_grp is not None and max_grp > 0) else DEFAULT_MAX_GROUPS,
         prev_paused=prev_paused,
+        active_instances=v.get("active_instances"),
+        human_instances=hum_inst if hum_inst is not None else -1,
+        max_total_instances=max_inst if (max_inst is not None and max_inst > 0) else DEFAULT_MAX_TOTAL_INSTANCES,
+        swap_io_pages_per_sec=v.get("swap_io_pages_per_sec"),
+        cpu_psi_some_avg10=v.get("cpu_psi_some_avg10"),
+        cpu_throttled_pct=v.get("cpu_throttled_pct"),
+        online_population=v.get("online_population"),
+        max_online_population=max_pop if (max_pop is not None and max_pop > 0) else DEFAULT_MAX_ONLINE_POPULATION,
+        telemetry_ts=vitals_ts,
+        now_ts=ts,
+        max_telemetry_age_sec=max_telemetry_age_sec,
     )
 
     shadow_dungeons: list[dict[str, Any]] = []
