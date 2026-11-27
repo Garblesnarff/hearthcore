@@ -50,6 +50,7 @@
 #include "QuestDef.h"
 #include "QuestPackets.h"
 #include "SharedDefines.h"
+#include "Spell.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "WorldPacket.h"
@@ -75,6 +76,7 @@ constexpr uint32 NO_CROSS_MAP = std::numeric_limits<uint32>::max();
 constexpr uint32 PICK_LOG_SECONDS = 300;
 constexpr uint32 ABANDON_CHECK_SECONDS = 300;
 constexpr uint32 MOUNT_LOG_SECONDS = 600;
+constexpr uint32 MOUNT_RETRY_SEC = 10;          // between mount attempts
 constexpr uint32 REP_RELOAD_MS = 600000;
 constexpr uint32 SWITCH_RELOAD_MS = 30000;        // runtime switches re-read (reload config)
 constexpr uint32 OWNER_LIVE_MS = 10000;           // owner online: copy of his live quest log
@@ -104,6 +106,7 @@ std::atomic<float> gWMount{1.0f};
 std::atomic<float> gCompletionist{0.5f};
 std::atomic<bool> gKeepOwnerQuests{true};
 std::atomic<uint32> gFreeSlots{3};
+std::atomic<uint32> gMountGoldReserve{1};
 std::atomic<float> gGreyMinValue{25.0f};
 std::atomic<float> gWaitBonusPerMin{1.5f};
 std::atomic<float> gWaitBonusMax{60.0f};
@@ -286,6 +289,7 @@ void LoadSwitches()
     gCompletionist.store(std::min(1.0f, readFloat("AiPlayerbot.Companion.Weight.Completionist", 0.5f)));
     gKeepOwnerQuests.store(sConfigMgr->GetOption<bool>("AiPlayerbot.Companion.Quest.KeepOwnerQuests", true));
     gFreeSlots.store(std::min(20u, sConfigMgr->GetOption<uint32>("AiPlayerbot.Companion.Quest.FreeSlots", 3)));
+    gMountGoldReserve.store(sConfigMgr->GetOption<uint32>("AiPlayerbot.Companion.Quest.MountGoldReserve", 1));
     gGreyMinValue.store(readFloat("AiPlayerbot.Companion.Quest.GreyMinValue", 25.0f));
     gWaitBonusPerMin.store(readFloat("AiPlayerbot.Companion.Quest.TurnInWaitBonusPerMin", 1.5f));
     gWaitBonusMax.store(readFloat("AiPlayerbot.Companion.Quest.TurnInWaitBonusMax", 60.0f));
@@ -1169,6 +1173,27 @@ bool HostileNear(Player* bot, float range)
     return false;
 }
 
+// Shared pre-purchase legality check for mount items (issue #68): Player::CanUseItem(ItemTemplate const*) checks
+// faction, class, race, riding skill, spell, level, and holiday; reputation rank is checked explicitly here to match
+// Player::CanUseItem(Item*) and Player::BuyItemFromVendorSlot.
+InventoryResult CanUseMountTemplate(Player* bot, ItemTemplate const* proto)
+{
+    if (!bot || !proto)
+        return EQUIP_ERR_ITEM_NOT_FOUND;
+    InventoryResult const res = bot->CanUseItem(proto);
+    if (res != EQUIP_ERR_OK)
+        return res;
+    if (proto->RequiredReputationFaction &&
+        static_cast<uint32>(bot->GetReputationRank(proto->RequiredReputationFaction)) < proto->RequiredReputationRank)
+        return EQUIP_ERR_CANT_EQUIP_REPUTATION;
+    return EQUIP_ERR_OK;
+}
+
+uint64 MountReserveCopper()
+{
+    return static_cast<uint64>(gMountGoldReserve.load()) * 10000ull;
+}
+
 // Mount project status line (rate limited) and the mount option, if any.
 void MountOption(Player* bot, uint32 low, RoutePlanner const& planner, float travelW, std::vector<Option>& out,
                  uint32 now)
@@ -1186,76 +1211,131 @@ void MountOption(Player* bot, uint32 low, RoutePlanner const& planner, float tra
         status = "blocked reason=no-riding-skill (the train duty learns riding)";
     else
     {
-        uint32 const raceMask = bot->getRaceMask();
-        bool const transportOn = CompanionTransport::Enabled() && CompanionTransport::Ready();
-        uint32 const hostileBit = bot->GetTeamId() == TEAM_HORDE ? 4u : 2u;
-        auto raceIt = gRaceVendors.find(bot->getRace());
-        uint32 const ownEntry = raceIt == gRaceVendors.end() ? 0 : raceIt->second;
-        uint32 ownMap = 0;
-        bool ownSeen = false;
-        uint32 cheapest = 0;
-        MountOffer const* own = nullptr;
-        MountOffer const* any = nullptr;
-        float ownDist = 0.0f;
-        float anyDist = 0.0f;
+        // Recover a mount item already sitting in bags (e.g. an earlier use-cast was delayed or interrupted):
+        // never plan a vendor trip while holding an unlearned mount item; cast it directly once idle (issue #68).
+        bool handledFromBag = false;
         for (MountOffer const& offer : gMountOffers)
         {
-            if ((offer.races && !(offer.races & raceMask)) || offer.skillRank > riding ||
-                (offer.hostileMask & hostileBit))
+            if (offer.spellId && bot->HasSpell(offer.spellId))
                 continue;
-            if (!cheapest || offer.price < cheapest)
-                cheapest = offer.price;
-            bool const isOwn = offer.entry == ownEntry;
-            if (isOwn)
+            Item* bagMount = bot->GetItemByEntry(offer.itemId);
+            if (!bagMount || bot->CanUseItem(bagMount) != EQUIP_ERR_OK)
+                continue;
+            handledFromBag = true;
+            bool const canCastNow = bot->IsAlive() && !bot->IsInCombat() && !bot->IsInFlight() && !bot->GetVehicle() &&
+                                    !bot->IsNonMeleeSpellCast(false);
+            bool cooldownOk = false;
+            if (canCastNow)
             {
-                ownSeen = true;
-                ownMap = offer.map;
+                std::lock_guard<std::mutex> lock(gStateMutex);
+                QuestBotState& st = gStates[low];
+                if (now - st.lastMountTrySec >= MOUNT_RETRY_SEC)
+                {
+                    st.lastMountTrySec = now;
+                    cooldownOk = true;
+                }
             }
-            if ((offer.map != bot->GetMapId() && !transportOn) || offer.price > bot->GetMoney() ||
-                !ZoneSafe(offer.zone, bot->GetLevel()))
-                continue;
-            float d = Dist2d(bot->GetPositionX(), bot->GetPositionY(), offer.x, offer.y);
-            if (transportOn && CompanionTransport::NeedsLegs(bot, offer.map, offer.x, offer.y, offer.z, offer.zone))
+            if (canCastNow && cooldownOk)
             {
-                // Across the sea (boat, tram, portal or hearth): compare by travel time, in walking yards.
-                Route route = planner.Plan(offer.map, offer.x, offer.y, offer.z, offer.zone);
-                if (!route.ok)
+                if (bot->isMoving())
+                    bot->StopMoving();
+                SpellCastTargets targets;
+                targets.SetUnitTarget(bot);
+                bot->CastItemUseSpell(bagMount, targets, 1, 0);
+                status = "use-from-bag item=" + std::to_string(offer.itemId) + " spell=" +
+                         std::to_string(offer.spellId);
+            }
+            else
+            {
+                status = "use-pending item=" + std::to_string(offer.itemId) + " spell=" +
+                         std::to_string(offer.spellId);
+            }
+            break;
+        }
+        if (!handledFromBag)
+        {
+            uint32 const raceMask = bot->getRaceMask();
+            bool const transportOn = CompanionTransport::Enabled() && CompanionTransport::Ready();
+            uint32 const hostileBit = bot->GetTeamId() == TEAM_HORDE ? 4u : 2u;
+            uint64 const reserveCopper = MountReserveCopper();
+            auto raceIt = gRaceVendors.find(bot->getRace());
+            uint32 const ownEntry = raceIt == gRaceVendors.end() ? 0 : raceIt->second;
+            uint32 ownMap = 0;
+            bool ownSeen = false;
+            uint32 cheapest = 0;
+            MountOffer const* own = nullptr;
+            MountOffer const* any = nullptr;
+            float ownDist = 0.0f;
+            float anyDist = 0.0f;
+            for (MountOffer const& offer : gMountOffers)
+            {
+                if ((offer.races && !(offer.races & raceMask)) || offer.skillRank > riding ||
+                    (offer.hostileMask & hostileBit))
                     continue;
-                d = route.seconds * WALK_SPEED;
+                if (offer.spellId && bot->HasSpell(offer.spellId))
+                    continue;
+                ItemTemplate const* proto = sObjectMgr->GetItemTemplate(offer.itemId);
+                if (!proto || CanUseMountTemplate(bot, proto) != EQUIP_ERR_OK)
+                    continue;
+                if (!cheapest || offer.price < cheapest)
+                    cheapest = offer.price;
+                bool const isOwn = offer.entry == ownEntry;
+                if (isOwn)
+                {
+                    ownSeen = true;
+                    ownMap = offer.map;
+                }
+                // Conservative against list price before vendor reputation discount, so BuyMount never fails reserve.
+                if ((offer.map != bot->GetMapId() && !transportOn) ||
+                    static_cast<uint64>(offer.price) + reserveCopper > static_cast<uint64>(bot->GetMoney()) ||
+                    !ZoneSafe(offer.zone, bot->GetLevel()))
+                    continue;
+                float d = Dist2d(bot->GetPositionX(), bot->GetPositionY(), offer.x, offer.y);
+                if (transportOn && CompanionTransport::NeedsLegs(bot, offer.map, offer.x, offer.y, offer.z, offer.zone))
+                {
+                    // Across the sea (boat, tram, portal or hearth): compare by travel time, in walking yards.
+                    Route route = planner.Plan(offer.map, offer.x, offer.y, offer.z, offer.zone);
+                    if (!route.ok)
+                        continue;
+                    d = route.seconds * WALK_SPEED;
+                }
+                if (isOwn && (!own || d < ownDist))
+                {
+                    own = &offer;
+                    ownDist = d;
+                }
+                if (!any || d < anyDist)
+                {
+                    any = &offer;
+                    anyDist = d;
+                }
             }
-            if (isOwn && (!own || d < ownDist))
+            if (own)
             {
-                own = &offer;
-                ownDist = d;
+                pick = own;
+                pickDist = ownDist;
             }
-            if (!any || d < anyDist)
+            else if (any && gAnyRaceVendor.load())
             {
-                any = &offer;
-                anyDist = d;
+                pick = any;
+                pickDist = anyDist;
             }
-        }
-        if (own)
-        {
-            pick = own;
-            pickDist = ownDist;
-        }
-        else if (any && gAnyRaceVendor.load())
-        {
-            pick = any;
-            pickDist = anyDist;
-        }
 
-        if (!cheapest)
-            status = "blocked reason=no-vendor-sells-a-mount-for-this-race";
-        else if (bot->GetMoney() < cheapest)
-            status = "save-gold need=" + std::to_string(cheapest) + " have=" + std::to_string(bot->GetMoney());
-        else if (pick)
-            status = std::string("buy vendor=") + std::to_string(pick->entry) + " item=" + std::to_string(pick->itemId) +
-                     " price=" + std::to_string(pick->price) + " gold=" + std::to_string(bot->GetMoney()) +
-                     (pick == own ? " own-race=1" : " own-race=0 own-vendor-map=" + std::to_string(ownMap) +
-                                                        (ownSeen ? " reason=no-transport" : " reason=no-own-vendor"));
-        else
-            status = "blocked reason=no-transport (no vendor on this map) gold=" + std::to_string(bot->GetMoney());
+            if (!pick && !cheapest)
+                status = "blocked reason=no-usable-mount-offer";
+            else if (!pick && static_cast<uint64>(bot->GetMoney()) < static_cast<uint64>(cheapest) + reserveCopper)
+                status = "save-gold need=" + std::to_string(static_cast<uint64>(cheapest) + reserveCopper) +
+                         " have=" + std::to_string(bot->GetMoney());
+            else if (pick)
+                status = std::string("buy vendor=") + std::to_string(pick->entry) + " item=" +
+                         std::to_string(pick->itemId) + " price=" + std::to_string(pick->price) + " gold=" +
+                         std::to_string(bot->GetMoney()) +
+                         (pick == own ? " own-race=1"
+                                      : " own-race=0 own-vendor-map=" + std::to_string(ownMap) +
+                                            (ownSeen ? " reason=no-transport" : " reason=no-own-vendor"));
+            else
+                status = "blocked reason=no-transport (no vendor on this map) gold=" + std::to_string(bot->GetMoney());
+        }
     }
 
     bool logIt = false;
@@ -1699,7 +1779,6 @@ bool CompanionQuest::MayAccept(Player* bot, Quest const* quest)
 
 namespace
 {
-constexpr uint32 MOUNT_RETRY_SEC = 10;          // between mount attempts
 constexpr uint32 MOUNT_RETRY_HOSTILE_SEC = 3;   // after a hostile-near block, with TripAvoid on
 }  // namespace
 
@@ -1755,37 +1834,118 @@ bool CompanionQuest::BuyMount(PlayerbotAI* botAI, Creature* vendor, uint32 itemI
     if (!items || !proto)
         return false;
     int32 slot = -1;
+    VendorItem const* vendorItem = nullptr;
     for (uint32 i = 0; i < items->m_items.size(); ++i)
+    {
         if (items->m_items[i] && items->m_items[i]->item == itemId)
+        {
             slot = static_cast<int32>(i);
-    if (slot < 0)
+            vendorItem = items->m_items[i];
+            break;
+        }
+    }
+    if (slot < 0 || !vendorItem)
     {
         LOG_INFO("playerbots", "Companion {}: mount blocked reason=vendor-lacks-item vendor={} item={}", bot->GetName(),
                  vendor->GetEntry(), itemId);
         return false;
     }
-    uint32 const moneyBefore = bot->GetMoney();
-    bot->BuyItemFromVendorSlot(vendor->GetGUID(), static_cast<uint32>(slot), itemId, 1, NULL_BAG, NULL_SLOT);
-    if (!bot->HasItemCount(itemId, 1))
-    {
-        LOG_INFO("playerbots", "Companion {}: mount blocked reason=buy-failed vendor={} item={} gold={}",
-                 bot->GetName(), vendor->GetEntry(), itemId, bot->GetMoney());
-        return false;
-    }
-    uint32 const cost = moneyBefore > bot->GetMoney() ? moneyBefore - bot->GetMoney() : 0;
-    // Same result as using the item: the taught spell is learned and the item is consumed.
+
+    // Decide before paying (issue #68): inspect spells, reject already-known mounts, enforce full CanUseItem +
+    // reputation requirements, and keep the configured gold reserve after purchase.
     uint32 taught = 0;
+    bool hasUseSpell = (proto->Spells[0].SpellId == 483 || proto->Spells[0].SpellId == 55884);
     for (auto const& spell : proto->Spells)
+    {
         if (spell.SpellTrigger == ITEM_SPELLTRIGGER_LEARN_SPELL_ID && spell.SpellId > 0)
             taught = static_cast<uint32>(spell.SpellId);
-    if (taught && !bot->HasSpell(taught))
-    {
-        bot->learnSpell(taught);
-        bot->DestroyItemCount(itemId, 1, true);
+        if (spell.SpellTrigger == ITEM_SPELLTRIGGER_ON_USE && spell.SpellId > 0)
+            hasUseSpell = true;
     }
-    LOG_INFO("playerbots", "Companion {}: mount bought item={} spell={} cost={} vendor={} gold={}", bot->GetName(),
-             itemId, taught, cost, vendor->GetEntry(), bot->GetMoney());
-    CompanionDuty::RecordLedger(bot->GetGUID().GetCounter(), "mount", itemId, cost, -1, "mount project");
+    if (taught && bot->HasSpell(taught))
+    {
+        LOG_INFO("playerbots", "Companion {}: mount blocked reason=already-known item={} spell={}", bot->GetName(),
+                 itemId, taught);
+        return false;
+    }
+    if (!taught && !hasUseSpell)
+    {
+        LOG_INFO("playerbots", "Companion {}: mount blocked reason=no-use-spell item={}", bot->GetName(), itemId);
+        return false;
+    }
+    if (InventoryResult const res = CanUseMountTemplate(bot, proto); res != EQUIP_ERR_OK)
+    {
+        LOG_INFO("playerbots", "Companion {}: mount blocked reason=cannot-use item={} res={}", bot->GetName(), itemId,
+                 static_cast<uint32>(res));
+        return false;
+    }
+
+    // Reuse a copy already sitting in bags rather than buying a duplicate; otherwise purchase from the vendor.
+    uint32 cost = 0;
+    Item* item = bot->GetItemByEntry(itemId);
+    if (!item)
+    {
+        if (vendorItem->ExtendedCost != 0)
+        {
+            LOG_INFO("playerbots", "Companion {}: mount blocked reason=extended-cost vendor={} item={} extCost={}",
+                     bot->GetName(), vendor->GetEntry(), itemId, vendorItem->ExtendedCost);
+            return false;
+        }
+        // Match Player::BuyItemFromVendorSlot's reputation discount formula before checking gold reserve.
+        uint64 const effectivePrice = static_cast<uint64>(
+            std::floor(static_cast<double>(proto->BuyPrice) * bot->GetReputationPriceDiscount(vendor)));
+        uint64 const reserveCopper = MountReserveCopper();
+        if (static_cast<uint64>(bot->GetMoney()) < effectivePrice + reserveCopper)
+        {
+            LOG_INFO("playerbots",
+                     "Companion {}: mount blocked reason=gold-reserve item={} price={} reserve={} gold={}",
+                     bot->GetName(), itemId, effectivePrice, reserveCopper, bot->GetMoney());
+            return false;
+        }
+        uint32 const moneyBefore = bot->GetMoney();
+        uint32 const countBefore = bot->GetItemCount(itemId);
+        bool const bought =
+            bot->BuyItemFromVendorSlot(vendor->GetGUID(), static_cast<uint32>(slot), itemId, 1, NULL_BAG, NULL_SLOT);
+        if (!bought || bot->GetItemCount(itemId) <= countBefore)
+        {
+            LOG_INFO("playerbots", "Companion {}: mount blocked reason=buy-failed vendor={} item={} gold={}",
+                     bot->GetName(), vendor->GetEntry(), itemId, bot->GetMoney());
+            return false;
+        }
+        cost = moneyBefore > bot->GetMoney() ? moneyBefore - bot->GetMoney() : 0;
+        item = bot->GetItemByEntry(itemId);
+    }
+
+    if (!item)
+    {
+        LOG_INFO("playerbots", "Companion {}: mount blocked reason=item-missing item={}", bot->GetName(), itemId);
+        return false;
+    }
+    if (InventoryResult const itemRes = bot->CanUseItem(item); itemRes != EQUIP_ERR_OK)
+    {
+        LOG_INFO("playerbots", "Companion {}: mount blocked reason=cannot-use-item item={} res={}", bot->GetName(),
+                 itemId, static_cast<uint32>(itemRes));
+        return false;
+    }
+
+    // Use the item through the stock item-use path (handles both learn-trigger mounts and non-learn on-use items,
+    // enforcing level, class, skill, and reputation checks). If the cast has a cast time or is interrupted by GCD,
+    // MountOption retries using the item directly from bags without buying again.
+    if (cost > 0)
+        CompanionDuty::RecordLedger(bot->GetGUID().GetCounter(), "mount", itemId, cost, -1, "mount project");
+    if (bot->IsAlive() && !bot->IsInCombat() && !bot->IsInFlight() && !bot->GetVehicle() &&
+        !bot->IsNonMeleeSpellCast(false))
+    {
+        if (bot->isMoving())
+            bot->StopMoving();
+        SpellCastTargets targets;
+        targets.SetUnitTarget(bot);
+        bot->CastItemUseSpell(item, targets, 1, 0);
+    }
+
+    bool const learnedNow = taught && bot->HasSpell(taught);
+    LOG_INFO("playerbots", "Companion {}: mount {} item={} spell={} cost={} vendor={} gold={}", bot->GetName(),
+             learnedNow ? "learned" : "use-pending", itemId, taught, cost, vendor->GetEntry(), bot->GetMoney());
     return true;
 }
 
@@ -1993,6 +2153,7 @@ static void StartForced(PlayerbotAI* botAI, CompanionTransport::ForceRequest con
     else if (req.kind == Kind::Vendor)
     {
         uint32 const riding = bot->GetSkillValue(SKILL_RIDING);
+        uint64 const reserveCopper = MountReserveCopper();
         bool found = false;
         bool seen = false;
         uint32 bestPrice = 0;
@@ -2001,8 +2162,15 @@ static void StartForced(PlayerbotAI* botAI, CompanionTransport::ForceRequest con
             if (offer.entry != req.id)
                 continue;
             seen = true;
-            if ((offer.races && !(offer.races & bot->getRaceMask())) || offer.skillRank > riding ||
-                offer.price > bot->GetMoney())
+            if ((offer.races && !(offer.races & bot->getRaceMask())) || offer.skillRank > riding)
+                continue;
+            if (offer.spellId && bot->HasSpell(offer.spellId))
+                continue;
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(offer.itemId);
+            if (!proto || CanUseMountTemplate(bot, proto) != EQUIP_ERR_OK)
+                continue;
+            if (!bot->HasItemCount(offer.itemId, 1) &&
+                static_cast<uint64>(offer.price) + reserveCopper > static_cast<uint64>(bot->GetMoney()))
                 continue;
             if (found && offer.price >= bestPrice)
                 continue;   // the cheapest mount the bot can use
