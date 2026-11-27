@@ -14,6 +14,8 @@
 #include <vector>
 
 class Creature;
+class Guild;
+struct ItemTemplate;
 class Player;
 class PlayerbotAI;
 class Quest;
@@ -69,11 +71,17 @@ public:
         std::string requesterName;
         uint32 crafterGuid = 0;
         std::string crafterName;
+        uint64 attemptId = 0;
         uint32 itemEntry = 0;
         std::string itemName;
         uint32 quantity = 1;
+        uint32 producedQty = 0;
+        uint32 transferredQty = 0;
+        uint32 receivedQty = 0;
+        uint8 deliveryTab = 255;
         std::string story;
         std::string status;
+        uint32 revision = 1;
         uint32 createdAt = 0;
         uint32 updatedAt = 0;
     };
@@ -95,7 +103,14 @@ public:
     static void OnLevelUp(Player* player);
     static void OnQuestComplete(Player* player, Quest const* quest);
     static void OnSkillMilestone(Player* player, uint32 skillId, uint32 newValue);
-    static void OnCraftMade(Player* bot, uint32 itemEntry, std::string const& itemName, uint32 skillId);
+    static void OnCraftMade(Player* bot, uint32 itemEntry, std::string const& itemName, uint32 skillId,
+                            uint32 producedCount = 1, uint64 callbackEventId = 0);
+    // Verified guild-bank deposit hook (Issue #27): called ONLY after legal SwapItemsWithInventory moves items
+    // out of crafter's bags into bankTab. Completes a claimed order only on DB-confirmed full accessible receipt.
+    static void OnBankDepositVerified(Player* bot, uint32 itemEntry, uint32 transferredCount, uint32 receivedCount,
+                                      uint8 bankTab, uint64 callbackEventId = 0);
+    // Explicit atomic claim of an open work order by a crafter (never steals another crafter's active claim).
+    static bool ClaimWorkOrder(uint64 orderId, Player* crafter, uint64& outAttemptId);
     static void OnCreatureKill(Player* killer, Creature* killed);
     static void OnPlayerDeath(Player* victim, Creature* killer);
 
@@ -113,6 +128,11 @@ public:
     // Guild Life v2: autonomous work-order priority, neighbourhood presence, and weekly guild events.
     static bool HasOpenWorkOrderFor(uint32 itemEntry, uint32 crafterGuid);
     static bool HasOpenWorkOrderById(uint64 orderId, uint32 crafterGuid, uint32& outItemEntry);
+    static bool HasPendingDeliveryFor(uint32 crafterGuid, uint32 itemEntry);
+    static uint32 PendingDeliveryQty(uint32 crafterGuid, uint32 itemEntry);
+    static uint32 ReservedBankQty(uint32 itemEntry, uint32 excludeRequesterGuid = 0);
+    static bool IsGuildBankTransferable(ItemTemplate const* proto);
+    static bool RequesterCanAccessBankTab(Guild const* guild, uint32 crafterGuid, uint32 itemEntry, uint8 bankTab);
     static float NeighborhoodHubBonus(Player* bot, uint32 hubZoneId);
     static float WeeklyFishingBonus();
     static float WeeklyCraftBonus();

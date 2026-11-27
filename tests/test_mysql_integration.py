@@ -545,6 +545,65 @@ class MySQLIntegrationTests(unittest.TestCase):
             wmap2 = {w["key"]: w for w in sheet2["weights"]}
             self.assertFalse(wmap2["gather"]["pinned"])
 
+    def test_issue27_work_order_migration_and_conditional_cas_sql(self) -> None:
+        """Issue #27: verify migration 003 idempotency and conditional work-order/proposal CAS SQL on real MySQL 8.0."""
+        mig_path = ROOT / "ops" / "sql" / "migrations" / "003_work_order_verification.sql"
+        mig_sql = mig_path.read_text(encoding="utf-8")
+        # Running migration 003 twice against real MySQL 8.0 must succeed idempotently.
+        run_sql(mig_sql)
+        run_sql(mig_sql)
+
+        run_sql(
+            """
+            INSERT INTO companion_work_orders
+              (id, requester_guid, requester_name, crafter_guid, crafter_name, attempt_id,
+               item_entry, item_name, quantity, produced_qty, transferred_qty, received_qty,
+               delivery_tab, story, status, revision, created_at, updated_at)
+            VALUES
+              (7001, 10, 'Aldric', 0, '', 0, 118, 'Minor Healing Potion', 20, 0, 0, 0, 255, 'Need potions', 'open', 1, 1000, 1000);
+            INSERT INTO companion_proposals
+              (id, plan_id, guid, character_name, goal_id, goal_type, target_id, advisory_only,
+               snapshot_rev, status, outcome_reason, created_at, expires_at, started_at, ended_at, active_seconds, progress_delta)
+            VALUES
+              (8001, 9001, 20, 'Kelda', 'wo:7001', 'guild_order', 7001, 0, 2, 'executing', '', 1000, 2000, 1005, 0, 0, 0),
+              (8002, 9002, 20, 'Kelda', 'wo:7001:exp', 'guild_order', 7001, 0, 2, 'executing', '', 1000, 1500, 1005, 0, 0, 0),
+              (8003, 9003, 20, 'Kelda', 'wo:7001:int', 'guild_order', 7001, 0, 2, 'interrupted', 'owner_group_priority', 1000, 2000, 1005, 1100, 0, 0);
+            """
+        )
+
+        # Claim CAS succeeds once for Kelda (20), then Brannoc (30) cannot overwrite it.
+        run_sql(
+            "UPDATE companion_work_orders SET crafter_guid = 20, crafter_name = 'Kelda', attempt_id = 1, "
+            "produced_qty = 1, status = 'claimed', revision = 2, updated_at = 1010 "
+            "WHERE id = 7001 AND status = 'open' AND crafter_guid = 0 AND revision = 1;"
+        )
+        run_sql(
+            "UPDATE companion_work_orders SET crafter_guid = 30, crafter_name = 'Brannoc', attempt_id = 2, "
+            "status = 'claimed', revision = 3, updated_at = 1011 "
+            "WHERE id = 7001 AND status = 'open' AND crafter_guid = 0 AND revision = 1;"
+        )
+        row = run_sql(
+            "SELECT crafter_guid, attempt_id, produced_qty, received_qty, status, revision "
+            "FROM companion_work_orders WHERE id = 7001;"
+        )[0]
+        self.assertEqual(row, ["20", "1", "1", "0", "claimed", "2"])
+
+        # Proposal CAS: valid executing proposal completes; expired (8002) and interrupted (8003) are untouched!
+        for pid in (8001, 8002, 8003):
+            run_sql(
+                f"UPDATE companion_proposals SET status = 'completed', outcome_reason = 'order_delivered', "
+                f"ended_at = 1600, progress_delta = 20 "
+                f"WHERE id = {pid} AND guid = 20 AND target_id = 7001 AND snapshot_rev = 2 "
+                f"AND status IN ('accepted', 'executing') AND expires_at > 1600;"
+            )
+        props = {
+            r[0]: (r[1], r[2])
+            for r in run_sql("SELECT id, status, progress_delta FROM companion_proposals WHERE id IN (8001,8002,8003);")
+        }
+        self.assertEqual(props["8001"], ("completed", "20"))
+        self.assertEqual(props["8002"], ("executing", "0"))
+        self.assertEqual(props["8003"], ("interrupted", "0"))
+
 
 if __name__ == "__main__":
     unittest.main()

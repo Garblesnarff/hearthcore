@@ -12,12 +12,15 @@
 #include "CompanionBrain.h"
 #include "CompanionDuty.h"
 #include "CompanionLease.h"
+#include "CompanionWorkOrderLogic.h"
 #include "Config.h"
 #include "Creature.h"
 #include "DBCStores.h"
 #include "DatabaseEnv.h"
 #include "GameTime.h"
 #include "Group.h"
+#include "Guild.h"
+#include "GuildMgr.h"
 #include "Log.h"
 #include "Map.h"
 #include "ObjectAccessor.h"
@@ -27,6 +30,7 @@
 #include "PlayerbotAIConfig.h"
 #include "QuestDef.h"
 #include "SharedDefines.h"
+#include "StringFormat.h"
 #include "WorldPacket.h"
 
 #include <algorithm>
@@ -54,6 +58,7 @@ constexpr uint32 MAX_PROPOSALS_PER_SESSION = 2;     // max 1-2 activity proposal
 constexpr uint32 OWNER_SESSION_RESET_SEC = 10800;   // 3 hours offline/gap resets proposal session counter
 
 std::mutex gLifeMutex;
+std::mutex gCreateOrderMutex;
 bool gLoaded = false;
 uint32 gRefreshTimerMs = 0;
 uint32 gAutoOrderTimerMs = 0;
@@ -63,7 +68,11 @@ std::unordered_map<uint32, CompanionLife::Profile> gProfiles;                  /
 std::unordered_map<std::string, uint32> gGuidByLowerName;                      // lower name -> low guid
 std::unordered_map<uint32, std::deque<CompanionLife::EventRecord>> gEvents;    // low guid -> newest first (<=10)
 std::unordered_map<uint64, CompanionLife::Relation> gRelations;                // packed(lo, hi) -> pair relation
-std::vector<CompanionLife::WorkOrder> gOrders;                                 // recent/active work orders
+CompanionWorkOrderLogic::Tracker gOrderTracker;                                // verified work-order state machine
+bool gOrderVerificationCols = false;                                           // true when migration 003 cols exist
+bool gOrderMigrationWarned = false;
+// Cached guild_bank_right rows: key = (guildId << 16) | (tabId << 8) | rankId -> {gbright, slotPerDay}
+std::unordered_map<uint64, std::pair<uint8, int32>> gBankTabRights;
 
 std::unordered_map<uint32, uint32> gLastEmoteSec;          // bot low guid -> last emote reply time
 std::unordered_map<uint32, uint32> gLastCheerSec;          // bot low guid -> last level-up cheer time
@@ -244,6 +253,154 @@ bool TableExists(char const* tableName)
         "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = '{}'",
         tableName);
     return res && res->Fetch()[0].Get<uint64>() > 0;
+}
+
+bool HasWorkOrderVerificationCols()
+{
+    QueryResult res = CharacterDatabase.Query(
+        "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() "
+        "AND table_name = 'companion_work_orders' "
+        "AND column_name IN ('attempt_id', 'produced_qty', 'transferred_qty', 'received_qty', 'delivery_tab', 'revision')");
+    return res && res->Fetch()[0].Get<uint64>() >= 6;
+}
+
+CompanionLife::WorkOrder ToPublicOrder(CompanionWorkOrderLogic::OrderState const& s)
+{
+    CompanionLife::WorkOrder wo;
+    wo.id = s.id;
+    wo.requesterGuid = s.requesterGuid;
+    wo.requesterName = s.requesterName;
+    wo.crafterGuid = s.crafterGuid;
+    wo.crafterName = s.crafterName;
+    wo.attemptId = s.attemptId;
+    wo.itemEntry = s.itemEntry;
+    wo.itemName = s.itemName;
+    wo.quantity = s.quantity;
+    wo.producedQty = s.producedQty;
+    wo.transferredQty = s.transferredQty;
+    wo.receivedQty = s.receivedQty;
+    wo.deliveryTab = s.deliveryTab;
+    wo.story = s.story;
+    wo.status = s.status;
+    wo.revision = s.revision;
+    wo.createdAt = s.createdAt;
+    wo.updatedAt = s.updatedAt;
+    return wo;
+}
+
+uint64 BankRightKey(uint32 guildId, uint8 tabId, uint8 rankId)
+{
+    return (static_cast<uint64>(guildId) << 16) | (static_cast<uint64>(tabId) << 8) | static_cast<uint64>(rankId);
+}
+
+bool HasAccessibleWithdrawRightsLocked(Guild const* guild, uint32 memberGuid, uint8 bankTab)
+{
+    if (!guild || !memberGuid || bankTab == CompanionWorkOrderLogic::TAB_NONE)
+        return false;
+    ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(memberGuid);
+    Guild::Member const* member = guild->GetMember(og);
+    if (!member)
+        return false;
+    if (!guild->MemberHasTabRights(og, bankTab, GUILD_BANK_RIGHT_VIEW_TAB))
+        return false;
+    uint8 const rankId = member->GetRankId();
+    if (rankId == 0)
+        return true;   // Guild Master always has full tab view & withdraw rights
+    auto it = gBankTabRights.find(BankRightKey(guild->GetId(), bankTab, rankId));
+    if (it == gBankTabRights.end())
+        return false;
+    // Require VIEW_TAB right AND non-zero daily withdraw slots (-1 = unlimited, >0 = slots/day; 0 = view-only).
+    return (it->second.first & GUILD_BANK_RIGHT_VIEW_TAB) != 0 && it->second.second != 0;
+}
+
+std::string BuildWorkOrderUpdateSql(CompanionWorkOrderLogic::ActionResult const& res, uint32 nowSec)
+{
+    CompanionWorkOrderLogic::OrderState const& wo = res.order;
+    if (res.previousStatus == "open")
+    {
+        return Acore::StringFormat(
+            "UPDATE companion_work_orders SET crafter_guid = {}, crafter_name = '{}', attempt_id = {}, "
+            "produced_qty = {}, transferred_qty = {}, received_qty = {}, delivery_tab = {}, status = '{}', "
+            "revision = {}, updated_at = {} "
+            "WHERE id = {} AND status = 'open' AND crafter_guid = 0 AND revision = {}",
+            wo.crafterGuid, SqlEsc(wo.crafterName), wo.attemptId, wo.producedQty, wo.transferredQty,
+            wo.receivedQty, static_cast<uint32>(wo.deliveryTab), SqlEsc(wo.status), wo.revision, nowSec,
+            wo.id, res.expectedRevision);
+    }
+    return Acore::StringFormat(
+        "UPDATE companion_work_orders SET produced_qty = {}, transferred_qty = {}, received_qty = {}, "
+        "delivery_tab = {}, status = '{}', revision = {}, updated_at = {} "
+        "WHERE id = {} AND status = 'claimed' AND crafter_guid = {} AND attempt_id = {} AND revision = {}",
+        wo.producedQty, wo.transferredQty, wo.receivedQty, static_cast<uint32>(wo.deliveryTab),
+        SqlEsc(wo.status), wo.revision, nowSec, wo.id, wo.crafterGuid, wo.attemptId, res.expectedRevision);
+}
+
+void PersistWorkOrderTransitionSync(CompanionWorkOrderLogic::ActionResult const& res, uint32 nowSec)
+{
+    if (!res.stateChanged || res.orderId == 0)
+        return;
+    // Always use synchronous DirectExecute for every work-order mutation (claim, produce, partial/full delivery)
+    // so writes are strictly ordered on the DB and can never race out-of-order against a later delivery CAS.
+    CharacterDatabase.DirectExecute(BuildWorkOrderUpdateSql(res, nowSec));
+}
+
+// Re-reads the authoritative DB row after a guarded CAS update; on mismatch (e.g. concurrent expiry) restores
+// DB truth into gOrderTracker and returns false. On DB read error returns false without keeping optimistic state.
+bool ConfirmWorkOrderRowFromDb(CompanionWorkOrderLogic::ActionResult const& res, uint32 expectedCrafterGuid)
+{
+    QueryResult chk = CharacterDatabase.Query(
+        "SELECT `status`, `crafter_guid`, `attempt_id`, `produced_qty`, `transferred_qty`, `received_qty`, "
+        "`delivery_tab`, `revision`, `updated_at` FROM `companion_work_orders` WHERE `id` = {}",
+        res.orderId);
+    if (!chk)
+    {
+        LOG_WARN("playerbots",
+                 "[GuildLife] Work order #{} confirm query returned no row (expected status={} rev={}); "
+                 "skipping completion side effects.",
+                 res.orderId, res.order.status, res.newRevision);
+        return false;
+    }
+
+    Field* f = chk->Fetch();
+    CompanionWorkOrderLogic::OrderState dbRow = res.order;
+    dbRow.status = f[0].Get<std::string>();
+    dbRow.crafterGuid = f[1].Get<uint32>();
+    dbRow.attemptId = f[2].Get<uint64>();
+    dbRow.producedQty = f[3].Get<uint32>();
+    dbRow.transferredQty = f[4].Get<uint32>();
+    dbRow.receivedQty = f[5].Get<uint32>();
+    dbRow.deliveryTab = f[6].Get<uint8>();
+    dbRow.revision = f[7].Get<uint32>();
+    dbRow.updatedAt = f[8].Get<uint32>();
+
+    bool const matched = (dbRow.status == res.order.status && dbRow.crafterGuid == expectedCrafterGuid &&
+                          dbRow.attemptId == res.attemptId && dbRow.revision == res.newRevision);
+    if (!matched)
+    {
+        {
+            std::lock_guard<std::mutex> lock(gLifeMutex);
+            gOrderTracker.RollbackOrReplaceOrder(dbRow);
+        }
+        LOG_WARN("playerbots",
+                 "[GuildLife] Work order #{} CAS mismatch (db status={} rev={} vs expected status={} rev={}); "
+                 "resynced memory from DB.",
+                 res.orderId, dbRow.status, dbRow.revision, res.order.status, res.newRevision);
+    }
+    return matched;
+}
+
+bool WarnIfMissingVerificationSchema(bool hasVerificationCols)
+{
+    if (hasVerificationCols)
+        return true;
+    if (!gOrderMigrationWarned)
+    {
+        gOrderMigrationWarned = true;
+        LOG_ERROR("playerbots",
+                  "[GuildLife] companion_work_orders missing Issue #27 verification columns (run migration 003); "
+                  "failing closed on work-order claims/deliveries.");
+    }
+    return false;
 }
 
 std::string LatestEventSummary(uint32 guid)
@@ -443,48 +600,138 @@ void CompanionLife::ReloadAll()
         }
     }
 
-    std::vector<WorkOrder> orders;
+    std::unordered_map<uint64, std::pair<uint8, int32>> bankRights;
+    if (QueryResult br = CharacterDatabase.Query("SELECT guildid, TabId, rid, gbright, SlotPerDay FROM guild_bank_right"))
+    {
+        do
+        {
+            Field* f = br->Fetch();
+            uint32 const gid = f[0].Get<uint32>();
+            uint8 const tabId = f[1].Get<uint8>();
+            uint8 const rankId = f[2].Get<uint8>();
+            uint8 const gbright = f[3].Get<uint8>();
+            int32 const slotsPerDay = f[4].Get<int32>();
+            bankRights[BankRightKey(gid, tabId, rankId)] = {gbright, slotsPerDay};
+        } while (br->NextRow());
+    }
+
+    std::vector<CompanionWorkOrderLogic::OrderState> orders;
+    bool hasVerificationCols = false;
+    uint64 maxAttemptId = 0;
     if (TableExists("companion_work_orders"))
     {
         uint32 const now = NowSec();
+        hasVerificationCols = HasWorkOrderVerificationCols();
         if (now > 172800)
-            CharacterDatabase.Execute(
-                "UPDATE companion_work_orders SET status = 'expired', updated_at = {} "
-                "WHERE status IN ('open', 'claimed') AND created_at < {}",
-                now, now - 172800);
-
-        if (QueryResult res = CharacterDatabase.Query(
-                "SELECT `id`, `requester_guid`, `requester_name`, `crafter_guid`, `crafter_name`, "
-                "`item_entry`, `item_name`, `quantity`, `story`, `status`, `created_at`, `updated_at` "
-                "FROM `companion_work_orders` ORDER BY `id` DESC LIMIT 40"))
         {
+            // Synchronous expiry UPDATE before SELECT so loaded state never predates expiry (Issue #27).
+            if (hasVerificationCols)
+                CharacterDatabase.DirectExecute(Acore::StringFormat(
+                    "UPDATE companion_work_orders SET status = 'expired', revision = revision + 1, updated_at = {} "
+                    "WHERE status IN ('open', 'claimed') AND created_at < {}",
+                    now, now - 172800));
+            else
+                CharacterDatabase.DirectExecute(Acore::StringFormat(
+                    "UPDATE companion_work_orders SET status = 'expired', updated_at = {} "
+                    "WHERE status IN ('open', 'claimed') AND created_at < {}",
+                    now, now - 172800));
+        }
+
+        if (hasVerificationCols)
+        {
+            if (QueryResult mres =
+                    CharacterDatabase.Query("SELECT COALESCE(MAX(`attempt_id`), 0) FROM `companion_work_orders`"))
+                maxAttemptId = mres->Fetch()[0].Get<uint64>();
+        }
+
+        // Load ALL active (open/claimed) orders without truncation, plus the latest 25 historical orders
+        // (delivered/expired) for reservations & status display (Issue #27).
+        auto loadQuery = [&](char const* whereClause, char const* limitClause)
+        {
+            QueryResult res =
+                hasVerificationCols
+                    ? CharacterDatabase.Query(
+                          "SELECT `id`, `requester_guid`, `requester_name`, `crafter_guid`, `crafter_name`, "
+                          "`attempt_id`, `item_entry`, `item_name`, `quantity`, `produced_qty`, "
+                          "`transferred_qty`, `received_qty`, `delivery_tab`, `story`, `status`, `revision`, "
+                          "`created_at`, `updated_at` "
+                          "FROM `companion_work_orders` WHERE {} ORDER BY `id` DESC {}",
+                          whereClause, limitClause)
+                    : CharacterDatabase.Query(
+                          "SELECT `id`, `requester_guid`, `requester_name`, `crafter_guid`, `crafter_name`, "
+                          "`item_entry`, `item_name`, `quantity`, `story`, `status`, `created_at`, `updated_at` "
+                          "FROM `companion_work_orders` WHERE {} ORDER BY `id` DESC {}",
+                          whereClause, limitClause);
+            if (!res)
+                return;
             do
             {
                 Field* f = res->Fetch();
-                WorkOrder wo;
-                wo.id = f[0].Get<uint64>();
-                wo.requesterGuid = f[1].Get<uint32>();
-                wo.requesterName = f[2].Get<std::string>();
-                wo.crafterGuid = f[3].Get<uint32>();
-                wo.crafterName = f[4].Get<std::string>();
-                wo.itemEntry = f[5].Get<uint32>();
-                wo.itemName = f[6].Get<std::string>();
-                wo.quantity = f[7].Get<uint32>();
-                wo.story = f[8].Get<std::string>();
-                wo.status = f[9].Get<std::string>();
-                wo.createdAt = f[10].Get<uint32>();
-                wo.updatedAt = f[11].Get<uint32>();
+                CompanionWorkOrderLogic::OrderState wo;
+                if (hasVerificationCols)
+                {
+                    wo.id = f[0].Get<uint64>();
+                    wo.requesterGuid = f[1].Get<uint32>();
+                    wo.requesterName = f[2].Get<std::string>();
+                    wo.crafterGuid = f[3].Get<uint32>();
+                    wo.crafterName = f[4].Get<std::string>();
+                    wo.attemptId = f[5].Get<uint64>();
+                    wo.itemEntry = f[6].Get<uint32>();
+                    wo.itemName = f[7].Get<std::string>();
+                    wo.quantity = f[8].Get<uint32>();
+                    wo.producedQty = f[9].Get<uint32>();
+                    wo.transferredQty = f[10].Get<uint32>();
+                    wo.receivedQty = f[11].Get<uint32>();
+                    wo.deliveryTab = f[12].Get<uint8>();
+                    wo.story = f[13].Get<std::string>();
+                    wo.status = f[14].Get<std::string>();
+                    wo.revision = std::max<uint32>(1u, f[15].Get<uint32>());
+                    wo.createdAt = f[16].Get<uint32>();
+                    wo.updatedAt = f[17].Get<uint32>();
+                }
+                else
+                {
+                    wo.id = f[0].Get<uint64>();
+                    wo.requesterGuid = f[1].Get<uint32>();
+                    wo.requesterName = f[2].Get<std::string>();
+                    wo.crafterGuid = f[3].Get<uint32>();
+                    wo.crafterName = f[4].Get<std::string>();
+                    wo.itemEntry = f[5].Get<uint32>();
+                    wo.itemName = f[6].Get<std::string>();
+                    wo.quantity = f[7].Get<uint32>();
+                    wo.story = f[8].Get<std::string>();
+                    wo.status = f[9].Get<std::string>();
+                    wo.createdAt = f[10].Get<uint32>();
+                    wo.updatedAt = f[11].Get<uint32>();
+                }
                 orders.push_back(std::move(wo));
             } while (res->NextRow());
-        }
+        };
+        loadQuery("`status` IN ('open', 'claimed')", "");
+        loadQuery("`status` NOT IN ('open', 'claimed')", "LIMIT 25");
     }
 
+    uint32 const now = NowSec();
     std::lock_guard<std::mutex> lock(gLifeMutex);
+    // Preserve any in-memory higher-revision order progress whose async UPDATE may still be in flight.
+    std::unordered_map<uint64, CompanionWorkOrderLogic::OrderState> prevById;
+    for (CompanionWorkOrderLogic::OrderState const& prev : gOrderTracker.Orders())
+        if (prev.id > 0)
+            prevById[prev.id] = prev;
+    for (CompanionWorkOrderLogic::OrderState& loaded : orders)
+    {
+        auto it = prevById.find(loaded.id);
+        if (it != prevById.end() && it->second.revision > loaded.revision &&
+            it->second.updatedAt + 60 >= now && loaded.status != "expired")
+            loaded = it->second;
+    }
     gProfiles.swap(profiles);
     gGuidByLowerName.swap(byName);
     gEvents.swap(events);
     gRelations.swap(rels);
-    gOrders.swap(orders);
+    gBankTabRights.swap(bankRights);
+    gOrderVerificationCols = hasVerificationCols;
+    gOrderTracker.LoadOrders(std::move(orders), maxAttemptId);
 }
 
 void CompanionLife::UpdateWorld(uint32 elapsed)
@@ -772,20 +1019,76 @@ void CompanionLife::OnSkillMilestone(Player* player, uint32 skillId, uint32 newV
                         "Reached " + SkillNameOf(skillId) + " " + std::to_string(newValue), 0, player->GetZoneId());
 }
 
-void CompanionLife::OnCraftMade(Player* bot, uint32 itemEntry, std::string const& itemName, uint32 skillId)
+bool CompanionLife::ClaimWorkOrder(uint64 orderId, Player* crafter, uint64& outAttemptId)
+{
+    outAttemptId = 0;
+    if (!sPlayerbotAIConfig.companionGuildLifeEnabled || !sPlayerbotAIConfig.companionGuildLifeWorkOrders ||
+        !crafter || !sCompanionBotMgr.IsCompanion(crafter) || !orderId)
+        return false;
+
+    uint32 const low = crafter->GetGUID().GetCounter();
+    uint32 const now = NowSec();
+    Guild* guild = crafter->GetGuildId() ? sGuildMgr->GetGuildById(crafter->GetGuildId()) : nullptr;
+
+    uint32 itemEntry = 0;
+    uint32 requesterGuid = 0;
+    {
+        std::lock_guard<std::mutex> lock(gLifeMutex);
+        for (CompanionWorkOrderLogic::OrderState const& wo : gOrderTracker.Orders())
+        {
+            if (wo.id == orderId)
+            {
+                itemEntry = wo.itemEntry;
+                requesterGuid = wo.requesterGuid;
+                break;
+            }
+        }
+    }
+    ItemTemplate const* proto = itemEntry ? sObjectMgr->GetItemTemplate(itemEntry) : nullptr;
+    bool const isTransferable = IsGuildBankTransferable(proto);
+    bool const recipientOk =
+        guild && requesterGuid && guild->GetMember(ObjectGuid::Create<HighGuid::Player>(requesterGuid)) != nullptr;
+
+    CompanionWorkOrderLogic::ActionResult res;
+    bool hasVerificationCols = false;
+    {
+        std::lock_guard<std::mutex> lock(gLifeMutex);
+        hasVerificationCols = gOrderVerificationCols;
+        if (!WarnIfMissingVerificationSchema(hasVerificationCols))
+            return false;
+        res = gOrderTracker.ClaimOrder(orderId, low, crafter->GetName(), isTransferable, recipientOk, now);
+    }
+    if (!res.ok)
+    {
+        LOG_INFO("playerbots", "[GuildLife] Work order #{} claim refused for {}: reason={}", orderId,
+                 crafter->GetName(), res.reason);
+        return false;
+    }
+    outAttemptId = res.attemptId;
+    if (res.stateChanged)
+    {
+        PersistWorkOrderTransitionSync(res, now);
+        if (!ConfirmWorkOrderRowFromDb(res, low))
+            return false;
+        LOG_INFO("playerbots", "[GuildLife] Work order #{} claimed by {} attempt={} rev={}", res.orderId,
+                 crafter->GetName(), res.attemptId, res.newRevision);
+    }
+    return true;
+}
+
+void CompanionLife::OnCraftMade(Player* bot, uint32 itemEntry, std::string const& itemName, uint32 skillId,
+                                uint32 producedCount, uint64 callbackEventId)
 {
     if (!sPlayerbotAIConfig.companionGuildLifeEnabled || !bot || !sCompanionBotMgr.IsCompanion(bot))
         return;
+    if (producedCount == 0)
+        return;
     uint32 const low = bot->GetGUID().GetCounter();
     uint32 const now = NowSec();
+    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemEntry);
     std::string name = itemName;
     if (name.empty())
-    {
-        if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemEntry))
-            name = proto->Name1;
-        else
-            name = "item #" + std::to_string(itemEntry);
-    }
+        name = proto ? proto->Name1 : ("item #" + std::to_string(itemEntry));
 
     // Rate-limit routine craft events per (bot, item) to 1 per 10 min.
     bool recordCraft = false;
@@ -803,79 +1106,126 @@ void CompanionLife::OnCraftMade(Player* bot, uint32 itemEntry, std::string const
         RecordEventInternal(low, "craft_done", "Crafted " + name + " (" + SkillNameOf(skillId) + ")", 0,
                             bot->GetZoneId());
 
-    // Check if this craft satisfies an open/claimed guild work order!
-    // Prefer an active AI-proposed & C++-validated work order ID first (Issue #3).
+    // Track verified production against an eligible claimed/open guild work order (Issue #27).
+    // Crafting into own bags is production ONLY — NEVER marks delivered, NEVER completes the proposal, and
+    // NEVER bumps help/relationship memory until verified accessible guild-bank receipt occurs.
     if (!sPlayerbotAIConfig.companionGuildLifeWorkOrders)
         return;
+
+    bool const itemIsTransferable = IsGuildBankTransferable(proto);
+    Guild* guild = bot->GetGuildId() ? sGuildMgr->GetGuildById(bot->GetGuildId()) : nullptr;
+    auto recipientInSameGuild = [guild](uint32 reqGuid) -> bool {
+        return guild && reqGuid && guild->GetMember(ObjectGuid::Create<HighGuid::Player>(reqGuid)) != nullptr;
+    };
+
     uint64 propId = 0;
     uint64 preferredOrderId = 0;
     uint32 propItemEntry = 0;
     bool const hasPropOrder = CompanionBrain::ActiveOrderProposal(low, propId, preferredOrderId, propItemEntry) &&
                               propItemEntry == itemEntry;
-    WorkOrder matched;
-    bool found = false;
+
+    CompanionWorkOrderLogic::ActionResult res;
     {
         std::lock_guard<std::mutex> lock(gLifeMutex);
-        if (hasPropOrder && preferredOrderId > 0)
-        {
-            for (WorkOrder& wo : gOrders)
-            {
-                if (wo.id == preferredOrderId && (wo.status == "open" || wo.status == "claimed") &&
-                    wo.itemEntry == itemEntry && wo.requesterGuid != low)
-                {
-                    wo.crafterGuid = low;
-                    wo.crafterName = bot->GetName();
-                    wo.status = "delivered";
-                    wo.updatedAt = now;
-                    matched = wo;
-                    found = true;
-                    break;
-                }
-            }
-        }
-        if (!found)
-        {
-            for (WorkOrder& wo : gOrders)
-            {
-                if ((wo.status == "open" || wo.status == "claimed") && wo.itemEntry == itemEntry &&
-                    wo.requesterGuid != low)
-                {
-                    wo.crafterGuid = low;
-                    wo.crafterName = bot->GetName();
-                    wo.status = "delivered";
-                    wo.updatedAt = now;
-                    matched = wo;
-                    found = true;
-                    break;
-                }
-            }
-        }
+        if (!WarnIfMissingVerificationSchema(gOrderVerificationCols))
+            return;
+        res = gOrderTracker.RecordProduction(low, bot->GetName(), itemEntry, producedCount,
+                                             hasPropOrder ? preferredOrderId : 0, itemIsTransferable,
+                                             recipientInSameGuild, callbackEventId, now);
     }
-    if (found)
+    if (res.stateChanged)
     {
-        if (matched.id > 0)
-            CharacterDatabase.Execute(
-                "UPDATE companion_work_orders SET crafter_guid = {}, crafter_name = '{}', status = 'delivered', "
-                "updated_at = {} WHERE id = {}",
-                low, SqlEsc(bot->GetName()), now, matched.id);
-        else
-            CharacterDatabase.Execute(
-                "UPDATE companion_work_orders SET crafter_guid = {}, crafter_name = '{}', status = 'delivered', "
-                "updated_at = {} WHERE requester_guid = {} AND item_entry = {} AND status IN ('open', 'claimed') "
-                "ORDER BY id DESC LIMIT 1",
-                low, SqlEsc(bot->GetName()), now, matched.requesterGuid, matched.itemEntry);
-        if (hasPropOrder && propId > 0 && (matched.id == preferredOrderId || preferredOrderId == 0))
-            CompanionBrain::MarkProposalCompleted(low, propId, matched.quantity);
-        RecordEventInternal(low, "work_order",
-                            "Made " + name + " for " + matched.requesterName + " (guild work order)",
-                            matched.requesterGuid, bot->GetZoneId());
-        RecordEventInternal(matched.requesterGuid, "work_order",
-                            bot->GetName() + " crafted " + name + " for my work order", low, bot->GetZoneId());
-        BumpRelationInternal(low, matched.requesterGuid, 0, 0, 1, 0, 5,
-                             bot->GetName() + " crafted " + name + " for " + matched.requesterName);
-        LOG_INFO("playerbots", "[GuildLife] Work order #{} delivered: {} crafted {} for {}", matched.id,
-                 bot->GetName(), name, matched.requesterName);
+        PersistWorkOrderTransitionSync(res, now);
+        if (ConfirmWorkOrderRowFromDb(res, low))
+            LOG_INFO("playerbots",
+                     "[GuildLife] Work order #{} production recorded: {} crafted {} +{} ({}/{}) attempt={} rev={} status={}",
+                     res.orderId, bot->GetName(), name, res.creditedQty, res.order.producedQty, res.order.quantity,
+                     res.attemptId, res.newRevision, res.reason);
     }
+}
+
+void CompanionLife::OnBankDepositVerified(Player* bot, uint32 itemEntry, uint32 transferredCount, uint32 receivedCount,
+                                          uint8 bankTab, uint64 callbackEventId)
+{
+    if (!sPlayerbotAIConfig.companionGuildLifeEnabled || !sPlayerbotAIConfig.companionGuildLifeWorkOrders || !bot ||
+        !sCompanionBotMgr.IsCompanion(bot) || !itemEntry || transferredCount == 0)
+        return;
+
+    uint32 const low = bot->GetGUID().GetCounter();
+    uint32 const now = NowSec();
+    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemEntry);
+    bool const itemIsTransferable = IsGuildBankTransferable(proto);
+    std::string const name = proto ? proto->Name1 : ("item #" + std::to_string(itemEntry));
+
+    Guild* guild = bot->GetGuildId() ? sGuildMgr->GetGuildById(bot->GetGuildId()) : nullptr;
+    auto recipientInSameGuild = [guild](uint32 reqGuid) -> bool {
+        return guild && reqGuid && guild->GetMember(ObjectGuid::Create<HighGuid::Player>(reqGuid)) != nullptr;
+    };
+    auto recipientCanAccessTab = [guild](uint32 reqGuid, uint8 tab) -> bool {
+        return HasAccessibleWithdrawRightsLocked(guild, reqGuid, tab);
+    };
+
+    CompanionWorkOrderLogic::ActionResult res;
+    {
+        std::lock_guard<std::mutex> lock(gLifeMutex);
+        if (!WarnIfMissingVerificationSchema(gOrderVerificationCols))
+            return;
+        res = gOrderTracker.RecordBankDelivery(low, itemEntry, transferredCount, receivedCount, bankTab,
+                                               itemIsTransferable, recipientInSameGuild, recipientCanAccessTab,
+                                               callbackEventId, now);
+    }
+    if (!res.ok)
+    {
+        if (res.reason != "no_claimed_order" && res.reason != "nothing_produced_to_deliver")
+            LOG_WARN("playerbots",
+                     "[GuildLife] Work order bank delivery not credited for {} item={} xfer={} recv={} tab={}: reason={}",
+                     bot->GetName(), itemEntry, transferredCount, receivedCount, static_cast<uint32>(bankTab),
+                     res.reason);
+        return;
+    }
+    if (!res.stateChanged)
+        return;
+
+    // Persist synchronously and confirm the guarded CAS row in DB on BOTH partial and full delivery (Issue #27).
+    PersistWorkOrderTransitionSync(res, now);
+    if (!ConfirmWorkOrderRowFromDb(res, low))
+        return;
+    if (!res.completedNow)
+    {
+        LOG_INFO("playerbots",
+                 "[GuildLife] Work order #{} partial bank delivery: {} deposited {} xfer=+{} recv=+{} (received {}/{}) tab={} rev={}",
+                 res.orderId, bot->GetName(), name, res.creditedQty, res.creditedReceivedQty, res.order.receivedQty,
+                 res.order.quantity, static_cast<uint32>(bankTab), res.newRevision);
+        return;
+    }
+
+    // DB-verified full delivery into requester-accessible guild bank tab: complete proposal conditionally and record
+    // authentic relationship/memory events strictly once (Issue #27).
+    uint64 propId = 0;
+    uint64 propOrderId = 0;
+    uint32 propItemEntry = 0;
+    uint32 propSnapshotRev = 0;
+    if (CompanionBrain::ActiveOrderProposal(low, propId, propOrderId, propItemEntry, &propSnapshotRev) &&
+        propId > 0 && propOrderId == res.orderId)
+    {
+        CompanionBrain::MarkProposalCompleted(low, propId, res.order.receivedQty, res.orderId, propSnapshotRev);
+    }
+
+    RecordEventInternal(low, "work_order",
+                        "Delivered " + name + " x" + std::to_string(res.order.receivedQty) + " for " +
+                            res.order.requesterName + " (guild work order)",
+                        res.order.requesterGuid, bot->GetZoneId());
+    RecordEventInternal(res.order.requesterGuid, "work_order",
+                        bot->GetName() + " delivered " + name + " x" + std::to_string(res.order.receivedQty) +
+                            " to guild bank for my work order",
+                        low, bot->GetZoneId());
+    BumpRelationInternal(low, res.order.requesterGuid, 0, 0, 1, 0, 5,
+                         bot->GetName() + " delivered " + name + " x" + std::to_string(res.order.receivedQty) +
+                             " for " + res.order.requesterName);
+    LOG_INFO("playerbots",
+             "[GuildLife] Work order #{} verified delivered: {} deposited {} x{} for {} in tab {} (attempt={} rev={})",
+             res.orderId, bot->GetName(), name, res.order.receivedQty, res.order.requesterName,
+             static_cast<uint32>(bankTab), res.attemptId, res.newRevision);
 }
 
 void CompanionLife::OnCreatureKill(Player* killer, Creature* killed)
@@ -1079,27 +1429,42 @@ bool CompanionLife::CreateWorkOrder(uint32 requesterGuid, std::string const& req
     if (!requesterGuid || !itemEntry || !quantity)
         return false;
     ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemEntry);
-    std::string const itemName = proto ? proto->Name1 : ("Item #" + std::to_string(itemEntry));
+    if (!IsGuildBankTransferable(proto))
+        return false;   // soulbound/quest/conjured items cannot be transferred via guild work orders (Issue #27)
+    std::string const itemName = proto->Name1;
     std::string finalStory = story;
     if (finalStory.empty())
         finalStory = requesterName + " needs " + itemName + " x" + std::to_string(quantity) + " for leveling up.";
 
+    // Serialize duplicate-check + INSERT + ID lookup so concurrent callers cannot insert duplicate rows or share an ID.
+    std::lock_guard<std::mutex> createLock(gCreateOrderMutex);
     uint32 const now = NowSec();
     {
         std::lock_guard<std::mutex> lock(gLifeMutex);
-        for (WorkOrder const& wo : gOrders)
+        for (CompanionWorkOrderLogic::OrderState const& wo : gOrderTracker.Orders())
             if ((wo.status == "open" || wo.status == "claimed") && wo.requesterGuid == requesterGuid &&
                 wo.itemEntry == itemEntry)
                 return false;   // already open
     }
 
-    CharacterDatabase.Execute(
+    // Synchronous insert on world/GM thread so the order immediately carries a stable DB id > 0 (Issue #27).
+    CharacterDatabase.DirectExecute(Acore::StringFormat(
         "INSERT INTO companion_work_orders (`requester_guid`, `requester_name`, `crafter_guid`, `crafter_name`, "
         "`item_entry`, `item_name`, `quantity`, `story`, `status`, `created_at`, `updated_at`) "
         "VALUES ({}, '{}', 0, '', {}, '{}', {}, '{}', 'open', {}, {})",
-        requesterGuid, SqlEsc(requesterName), itemEntry, SqlEsc(itemName), quantity, SqlEsc(finalStory), now, now);
+        requesterGuid, SqlEsc(requesterName), itemEntry, SqlEsc(itemName), quantity, SqlEsc(finalStory), now, now));
 
-    WorkOrder wo;
+    uint64 insertedId = 0;
+    if (QueryResult idRes = CharacterDatabase.Query(
+            "SELECT `id` FROM `companion_work_orders` WHERE `requester_guid` = {} AND `item_entry` = {} "
+            "AND `status` = 'open' ORDER BY `id` DESC LIMIT 1",
+            requesterGuid, itemEntry))
+        insertedId = idRes->Fetch()[0].Get<uint64>();
+    if (insertedId == 0)
+        return false;
+
+    CompanionWorkOrderLogic::OrderState wo;
+    wo.id = insertedId;
     wo.requesterGuid = requesterGuid;
     wo.requesterName = requesterName;
     wo.itemEntry = itemEntry;
@@ -1107,15 +1472,15 @@ bool CompanionLife::CreateWorkOrder(uint32 requesterGuid, std::string const& req
     wo.quantity = quantity;
     wo.story = finalStory;
     wo.status = "open";
+    wo.revision = 1;
     wo.createdAt = now;
     wo.updatedAt = now;
     {
         std::lock_guard<std::mutex> lock(gLifeMutex);
-        gOrders.insert(gOrders.begin(), std::move(wo));
-        if (gOrders.size() > 40)
-            gOrders.resize(40);
+        auto& orders = gOrderTracker.OrdersMutable();
+        orders.insert(orders.begin(), std::move(wo));
     }
-    LOG_INFO("playerbots", "[GuildLife] New work order: {}", finalStory);
+    LOG_INFO("playerbots", "[GuildLife] New work order #{}: {}", insertedId, finalStory);
     return true;
 }
 
@@ -1124,11 +1489,7 @@ bool CompanionLife::HasOpenWorkOrderFor(uint32 itemEntry, uint32 crafterGuid)
     if (!sPlayerbotAIConfig.companionGuildLifeEnabled || !sPlayerbotAIConfig.companionGuildLifeWorkOrders || !itemEntry)
         return false;
     std::lock_guard<std::mutex> lock(gLifeMutex);
-    for (WorkOrder const& wo : gOrders)
-        if ((wo.status == "open" || wo.status == "claimed") && wo.itemEntry == itemEntry &&
-            wo.requesterGuid != crafterGuid)
-            return true;
-    return false;
+    return gOrderTracker.HasOpenOrderFor(itemEntry, crafterGuid);
 }
 
 bool CompanionLife::HasOpenWorkOrderById(uint64 orderId, uint32 crafterGuid, uint32& outItemEntry)
@@ -1137,16 +1498,52 @@ bool CompanionLife::HasOpenWorkOrderById(uint64 orderId, uint32 crafterGuid, uin
     if (!sPlayerbotAIConfig.companionGuildLifeEnabled || !sPlayerbotAIConfig.companionGuildLifeWorkOrders || !orderId)
         return false;
     std::lock_guard<std::mutex> lock(gLifeMutex);
-    for (WorkOrder const& wo : gOrders)
-    {
-        if (wo.id == orderId && (wo.status == "open" || wo.status == "claimed") &&
-            wo.requesterGuid != crafterGuid && (wo.crafterGuid == 0 || wo.crafterGuid == crafterGuid))
-        {
-            outItemEntry = wo.itemEntry;
-            return true;
-        }
-    }
-    return false;
+    return gOrderTracker.HasOpenOrderById(orderId, crafterGuid, outItemEntry);
+}
+
+bool CompanionLife::HasPendingDeliveryFor(uint32 crafterGuid, uint32 itemEntry)
+{
+    return PendingDeliveryQty(crafterGuid, itemEntry) > 0;
+}
+
+uint32 CompanionLife::PendingDeliveryQty(uint32 crafterGuid, uint32 itemEntry)
+{
+    if (!sPlayerbotAIConfig.companionGuildLifeEnabled || !sPlayerbotAIConfig.companionGuildLifeWorkOrders ||
+        !crafterGuid || !itemEntry)
+        return 0;
+    std::lock_guard<std::mutex> lock(gLifeMutex);
+    return gOrderTracker.PendingDeliveryQty(crafterGuid, itemEntry);
+}
+
+uint32 CompanionLife::ReservedBankQty(uint32 itemEntry, uint32 excludeRequesterGuid)
+{
+    if (!sPlayerbotAIConfig.companionGuildLifeEnabled || !sPlayerbotAIConfig.companionGuildLifeWorkOrders || !itemEntry)
+        return 0;
+    uint32 const now = NowSec();
+    std::lock_guard<std::mutex> lock(gLifeMutex);
+    return gOrderTracker.ReservedBankQty(itemEntry, now, excludeRequesterGuid);
+}
+
+bool CompanionLife::IsGuildBankTransferable(ItemTemplate const* proto)
+{
+    if (!proto)
+        return false;
+    if (proto->Bonding == BIND_WHEN_PICKED_UP || proto->Bonding == BIND_QUEST_ITEM)
+        return false;
+    if ((proto->Flags & ITEM_FLAG_CONJURED) != 0 || proto->Class == ITEM_CLASS_QUEST)
+        return false;
+    return true;
+}
+
+bool CompanionLife::RequesterCanAccessBankTab(Guild const* guild, uint32 crafterGuid, uint32 itemEntry, uint8 bankTab)
+{
+    if (!guild || !crafterGuid || !itemEntry || bankTab == CompanionWorkOrderLogic::TAB_NONE)
+        return false;
+    std::lock_guard<std::mutex> lock(gLifeMutex);
+    uint32 requesterGuid = 0;
+    if (!gOrderTracker.HasPendingDeliveryFor(crafterGuid, itemEntry, &requesterGuid) || !requesterGuid)
+        return false;
+    return HasAccessibleWithdrawRightsLocked(guild, requesterGuid, bankTab);
 }
 
 float CompanionLife::NeighborhoodHubBonus(Player* bot, uint32 hubZoneId)
@@ -1217,7 +1614,7 @@ uint32 CompanionLife::TriggerWorkOrderPulse()
     std::unordered_set<uint32> openItems;
     {
         std::lock_guard<std::mutex> lock(gLifeMutex);
-        for (WorkOrder const& wo : gOrders)
+        for (CompanionWorkOrderLogic::OrderState const& wo : gOrderTracker.Orders())
         {
             if (wo.status == "open" || wo.status == "claimed")
             {
@@ -1373,7 +1770,7 @@ std::vector<std::string> CompanionLife::StatusLines(std::string const& botNameFi
         for (auto const& [g, q] : gEvents)
             eventCount += q.size();
         relCount = gRelations.size();
-        for (WorkOrder const& wo : gOrders)
+        for (CompanionWorkOrderLogic::OrderState const& wo : gOrderTracker.Orders())
             if (wo.status == "open" || wo.status == "claimed")
                 ++openOrders;
     }
@@ -1476,7 +1873,9 @@ std::vector<std::string> CompanionLife::WorkOrderLines()
     std::vector<WorkOrder> copy;
     {
         std::lock_guard<std::mutex> lock(gLifeMutex);
-        copy = gOrders;
+        copy.reserve(gOrderTracker.Orders().size());
+        for (CompanionWorkOrderLogic::OrderState const& wo : gOrderTracker.Orders())
+            copy.push_back(ToPublicOrder(wo));
     }
     if (copy.empty())
     {
@@ -1489,7 +1888,8 @@ std::vector<std::string> CompanionLife::WorkOrderLines()
     {
         if (shown++ >= 15)
             break;
-        out.push_back("  #" + std::to_string(wo.id) + " [" + wo.status + "] " + wo.story +
+        out.push_back("  #" + std::to_string(wo.id) + " [" + wo.status + " " + std::to_string(wo.producedQty) + "/" +
+                      std::to_string(wo.receivedQty) + "/" + std::to_string(wo.quantity) + "] " + wo.story +
                       (wo.crafterName.empty() ? "" : " (by " + wo.crafterName + ")"));
     }
     return out;
