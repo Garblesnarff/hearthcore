@@ -17,6 +17,7 @@ import logging
 import os
 import sqlite3
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,27 @@ DEFAULT_CONFIRM_TTL_SEC = 2 * 60
 DEFAULT_MAX_GROUPS = 1
 MIN_AVAIL_RAM_MIB = 512.0
 MAX_TICK_P99_MS = 45.0
+NATIVE_STATE_ORDER: dict[str, int] = {
+    "queued": 1,
+    "proposal_sent": 2,
+    "in_instance": 3,
+    "active": 3,
+}
+
+
+@dataclass(frozen=True)
+class NativeReconcileSnapshot:
+    """Authoritative live native queue/group/instance snapshot for crash reconciliation (Issue #13).
+
+    Fail-closed: when `authoritative=False` or a set is `None`, reconcile will NOT abort active runs
+    or release confirmed handoffs on missing/unknown data.
+    """
+    authoritative: bool = False
+    active_group_ids: frozenset[int] | None = None
+    active_queue_ids: frozenset[str] | None = None
+    active_run_ids: frozenset[str] | None = None
+    # correlation_key -> {"native_state": ..., "native_queue_id": ..., "group_id": ..., "native_run_id": ...}
+    correlation_map: dict[str, dict[str, Any]] | None = None
 
 
 def coop_enabled() -> bool:
@@ -219,8 +241,15 @@ class OpportunityCoordinator:
                     state TEXT NOT NULL,
                     created_at INTEGER NOT NULL,
                     recruit_until INTEGER NOT NULL,
+                    confirm_until INTEGER NOT NULL DEFAULT 0,
+                    correlation_key TEXT NOT NULL DEFAULT '',
                     estimated_minutes INTEGER NOT NULL DEFAULT 45,
                     group_id INTEGER NOT NULL DEFAULT 0,
+                    native_queue_id TEXT NOT NULL DEFAULT '',
+                    native_run_id TEXT NOT NULL DEFAULT '',
+                    native_state TEXT NOT NULL DEFAULT '',
+                    started_at INTEGER NOT NULL DEFAULT 0,
+                    ended_at INTEGER NOT NULL DEFAULT 0,
                     outcome_reason TEXT NOT NULL DEFAULT '',
                     is_shadow INTEGER NOT NULL DEFAULT 1
                 )
@@ -231,20 +260,63 @@ class OpportunityCoordinator:
                     opportunity_id INTEGER NOT NULL,
                     opportunity_revision INTEGER NOT NULL,
                     persona_id TEXT NOT NULL,
+                    realm_id INTEGER NOT NULL DEFAULT 1,
                     character_guid INTEGER NOT NULL,
+                    incarnation INTEGER NOT NULL DEFAULT 1,
                     character_slug TEXT NOT NULL,
                     role TEXT NOT NULL,
                     state TEXT NOT NULL,
                     reason_code TEXT NOT NULL DEFAULT '',
                     available_until INTEGER NOT NULL,
                     reserved_until INTEGER NOT NULL DEFAULT 0,
+                    confirmed_at INTEGER NOT NULL DEFAULT 0,
+                    ack_token TEXT NOT NULL DEFAULT '',
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     UNIQUE(opportunity_id, persona_id)
                 )
             """)
+            # Additive schema migration for pre-existing brain.db files (Issue #13)
+            opp_cols = {r[1] for r in db.execute("PRAGMA table_info(opportunities)").fetchall()}
+            for col, typ in (
+                ("confirm_until", "INTEGER NOT NULL DEFAULT 0"),
+                ("correlation_key", "TEXT NOT NULL DEFAULT ''"),
+                ("native_queue_id", "TEXT NOT NULL DEFAULT ''"),
+                ("native_run_id", "TEXT NOT NULL DEFAULT ''"),
+                ("native_state", "TEXT NOT NULL DEFAULT ''"),
+                ("started_at", "INTEGER NOT NULL DEFAULT 0"),
+                ("ended_at", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if col not in opp_cols:
+                    db.execute(f"ALTER TABLE opportunities ADD COLUMN {col} {typ}")
+            # Backfill confirm_until on pre-#13 assembling rows so they can never stay stranded!
+            db.execute(
+                """
+                UPDATE opportunities
+                SET confirm_until = COALESCE(
+                    (SELECT MAX(reserved_until) FROM opportunity_interests oi
+                     WHERE oi.opportunity_id = opportunities.id AND oi.reserved_until > 0),
+                    created_at
+                )
+                WHERE state = 'assembling' AND confirm_until = 0
+                """
+            )
+            oi_cols = {r[1] for r in db.execute("PRAGMA table_info(opportunity_interests)").fetchall()}
+            for col, typ in (
+                ("realm_id", "INTEGER NOT NULL DEFAULT 1"),
+                ("incarnation", "INTEGER NOT NULL DEFAULT 1"),
+                ("confirmed_at", "INTEGER NOT NULL DEFAULT 0"),
+                ("ack_token", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if col not in oi_cols:
+                    db.execute(f"ALTER TABLE opportunity_interests ADD COLUMN {col} {typ}")
             db.execute("CREATE INDEX IF NOT EXISTS idx_oi_persona_state ON opportunity_interests(persona_id, state)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_oi_state_reserved ON opportunity_interests(state, reserved_until)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_opp_state ON opportunities(state, is_shadow)")
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_opp_native_run_id "
+                "ON opportunities(native_run_id) WHERE native_run_id != ''"
+            )
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=10.0, isolation_level=None)
@@ -310,6 +382,8 @@ class OpportunityCoordinator:
         role: str,
         reason_code: str,
         available_until: int,
+        realm_id: int = 1,
+        incarnation: int = 1,
         now_ts: int | None = None,
     ) -> bool:
         """Record voluntary character interest if opportunity is recruiting at expected_revision."""
@@ -327,67 +401,170 @@ class OpportunityCoordinator:
             conn.execute(
                 """
                 INSERT INTO opportunity_interests (
-                    opportunity_id, opportunity_revision, persona_id, character_guid, character_slug,
-                    role, state, reason_code, available_until, reserved_until, created_at, updated_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,0,?,?)
+                    opportunity_id, opportunity_revision, persona_id, realm_id, character_guid, incarnation,
+                    character_slug, role, state, reason_code, available_until, reserved_until, confirmed_at,
+                    ack_token, created_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,0,0,'',?,?)
                 ON CONFLICT(opportunity_id, persona_id) DO UPDATE SET
+                    opportunity_revision = excluded.opportunity_revision,
+                    realm_id = excluded.realm_id,
                     character_guid = excluded.character_guid,
+                    incarnation = excluded.incarnation,
+                    character_slug = excluded.character_slug,
                     role = excluded.role,
-                    state = CASE WHEN state IN ('withdrawn','expired','declined') THEN 'interested' ELSE state END,
+                    state = CASE WHEN state IN ('withdrawn','expired','declined','released') THEN 'interested' ELSE state END,
                     reason_code = excluded.reason_code,
                     available_until = excluded.available_until,
                     updated_at = excluded.updated_at
                 """,
                 (
-                    int(opportunity_id), int(expected_revision), persona_id, int(character_guid),
-                    character_slug.lower(), role.lower(), "interested", reason_code[:64],
+                    int(opportunity_id), int(expected_revision), persona_id, int(realm_id), int(character_guid),
+                    int(incarnation), character_slug.lower(), role.lower(), "interested", reason_code[:64],
                     int(available_until), ts, ts,
                 ),
             )
             conn.execute("COMMIT")
             return True
         except Exception:
-            conn.execute("ROLLBACK")
+            if conn.in_transaction:
+                conn.rollback()
             raise
         finally:
             conn.close()
 
-    def withdraw_interest(self, opportunity_id: int, persona_id: str, reason: str = "withdrawn", now_ts: int | None = None) -> None:
+    def withdraw_interest(self, opportunity_id: int, persona_id: str, reason: str = "withdrawn", now_ts: int | None = None) -> dict[str, Any]:
         ts = int(now_ts if now_ts is not None else time.time())
         conn = self._conn()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            opp = conn.execute("SELECT state, is_shadow FROM opportunities WHERE id=?", (int(opportunity_id),)).fetchone()
+            if not opp:
+                conn.execute("ROLLBACK")
+                return {"ok": False, "reason": "not_found"}
+            opp_state = str(opp["state"])
+            # Refuse blind local withdrawal once handed off to native ('confirmed'/'active'/'cancelling') on live runs!
+            if int(opp["is_shadow"]) == 0 and opp_state in ("confirmed", "active", "cancelling"):
+                conn.execute("ROLLBACK")
+                return {"ok": False, "reason": f"requires_native_leave:{opp_state}"}
+
+            row = conn.execute(
+                "SELECT state FROM opportunity_interests WHERE opportunity_id=? AND persona_id=?",
+                (int(opportunity_id), persona_id),
+            ).fetchone()
+            was_committed = bool(row and str(row["state"]) in ("reserved", "accepted"))
             conn.execute(
                 "UPDATE opportunity_interests SET state='withdrawn', reason_code=?, reserved_until=0, updated_at=? "
-                "WHERE opportunity_id=? AND persona_id=? AND state IN ('interested','reserved')",
+                "WHERE opportunity_id=? AND persona_id=? AND state IN ('interested','reserved','accepted')",
                 (reason[:64], ts, int(opportunity_id), persona_id),
             )
+            if was_committed and opp_state == "assembling":
+                conn.execute(
+                    "UPDATE opportunity_interests SET state='released', reserved_until=0, reason_code=?, updated_at=? "
+                    "WHERE opportunity_id=? AND state IN ('reserved','accepted')",
+                    (f"member_withdrew:{reason}"[:64], ts, int(opportunity_id)),
+                )
+                conn.execute(
+                    "UPDATE opportunities SET state='cancelled', outcome_reason=?, confirm_until=0, ended_at=?, revision=revision+1 "
+                    "WHERE id=? AND state='assembling'",
+                    (f"member_withdrew:{persona_id}"[:120], ts, int(opportunity_id)),
+                )
             conn.execute("COMMIT")
+            return {"ok": True}
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
         finally:
             conn.close()
 
+    def _expire_stale_in_tx(self, conn: sqlite3.Connection, now_ts: int) -> dict[str, int]:
+        """Expire stale recruiting/assembling opportunities & reservations inside an open IMMEDIATE tx."""
+        # 1. Identify any assembling opportunity whose confirm_until is missing (0) or elapsed,
+        #    OR has an expired reserved member (zero stranded assembling!)
+        stranded_rows = conn.execute(
+            """
+            SELECT DISTINCT o.id
+            FROM opportunities o
+            LEFT JOIN opportunity_interests oi ON oi.opportunity_id = o.id
+            WHERE o.state = 'assembling'
+              AND (
+                  o.confirm_until <= ?
+                  OR (oi.state = 'reserved' AND (oi.reserved_until = 0 OR oi.reserved_until <= ?))
+              )
+            """,
+            (now_ts, now_ts),
+        ).fetchall()
+        stranded_ids = [int(r["id"]) for r in stranded_rows]
+
+        c_stranded = 0
+        for oid in stranded_ids:
+            conn.execute(
+                "UPDATE opportunity_interests SET state = CASE WHEN state='reserved' AND (reserved_until = 0 OR reserved_until <= ?) "
+                "THEN 'expired' ELSE 'released' END, "
+                "reserved_until = 0, reason_code = 'confirm_ttl_expired', updated_at = ? "
+                "WHERE opportunity_id = ? AND state IN ('reserved', 'accepted')",
+                (now_ts, now_ts, oid),
+            )
+            c_stranded += conn.execute(
+                "UPDATE opportunities SET state='expired', outcome_reason='confirm_ttl_expired', "
+                "confirm_until=0, ended_at=?, revision=revision+1 WHERE id=? AND state='assembling'",
+                (now_ts, oid),
+            ).rowcount
+
+        # 2. Expire any remaining standalone expired reservations
+        c1 = conn.execute(
+            "UPDATE opportunity_interests SET state='expired', reserved_until=0, updated_at=? "
+            "WHERE state='reserved' AND (reserved_until = 0 OR reserved_until <= ?)",
+            (now_ts, now_ts),
+        ).rowcount
+        c2 = conn.execute(
+            "UPDATE opportunity_interests SET state='expired', updated_at=? "
+            "WHERE state='interested' AND available_until <= ?",
+            (now_ts, now_ts),
+        ).rowcount
+        c3 = conn.execute(
+            "UPDATE opportunities SET state='expired', outcome_reason='recruit_ttl_expired', ended_at=?, revision=revision+1 "
+            "WHERE state='recruiting' AND recruit_until <= ?",
+            (now_ts, now_ts),
+        ).rowcount
+        return {
+            "expired_reservations": c1,
+            "expired_interests": c2,
+            "expired_opportunities": c3 + c_stranded,
+            "expired_assembling": c_stranded,
+        }
+
     def expire_stale(self, now_ts: int) -> dict[str, int]:
-        """Expire past-TTL recruiting opportunities & stale reservations cleanly."""
+        """Expire past-TTL recruiting & stranded assembling opportunities cleanly (zero stranding, Issue #13)."""
         conn = self._conn()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            c1 = conn.execute(
-                "UPDATE opportunity_interests SET state='expired', reserved_until=0, updated_at=? "
-                "WHERE state='reserved' AND reserved_until > 0 AND reserved_until <= ?",
-                (now_ts, now_ts),
-            ).rowcount
-            c2 = conn.execute(
-                "UPDATE opportunity_interests SET state='expired', updated_at=? "
-                "WHERE state='interested' AND available_until <= ?",
-                (now_ts, now_ts),
-            ).rowcount
-            c3 = conn.execute(
-                "UPDATE opportunities SET state='expired', outcome_reason='recruit_ttl_expired', revision=revision+1 "
-                "WHERE state='recruiting' AND recruit_until <= ?",
-                (now_ts,),
-            ).rowcount
+            res = self._expire_stale_in_tx(conn, int(now_ts))
             conn.execute("COMMIT")
-            return {"expired_reservations": c1, "expired_interests": c2, "expired_opportunities": c3}
+            return res
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_opportunity(self, opportunity_id: int) -> dict[str, Any] | None:
+        conn = self._conn()
+        try:
+            row = conn.execute("SELECT * FROM opportunities WHERE id = ?", (int(opportunity_id),)).fetchone()
+            if not row:
+                return None
+            members = [
+                dict(m)
+                for m in conn.execute(
+                    "SELECT * FROM opportunity_interests WHERE opportunity_id = ? ORDER BY id ASC",
+                    (int(opportunity_id),),
+                ).fetchall()
+            ]
+            out = dict(row)
+            out["members"] = members
+            return out
         finally:
             conn.close()
 
@@ -401,45 +578,48 @@ class OpportunityCoordinator:
     ) -> dict[str, Any]:
         """Atomically reserve 1 tank, 1 healer, 3 damage among voluntary interests.
 
-        Enforces unique active reservation per `persona_id` across ALL opportunities so two
-        competing opportunities can never double-book the same tank/healer/DPS.
+        Enforces unique active reservation/commitment per `persona_id` across ALL opportunities so two
+        competing opportunities can never double-book the same tank/healer/DPS. Accepted & active
+        commitments remain strictly exclusive regardless of confirmation TTL (Issue #13).
         """
         ts = int(now_ts if now_ts is not None else time.time())
         conn = self._conn()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            # Clear expired reservations first inside the transaction
-            conn.execute(
-                "UPDATE opportunity_interests SET state='expired', reserved_until=0, updated_at=? "
-                "WHERE state='reserved' AND reserved_until > 0 AND reserved_until <= ?",
-                (ts, ts),
-            )
+            # Persist expiry sweep cleanly even if the subsequent reservation check returns early!
+            self._expire_stale_in_tx(conn, ts)
             opp = conn.execute("SELECT * FROM opportunities WHERE id = ?", (opportunity_id,)).fetchone()
             if not opp:
-                conn.execute("ROLLBACK")
+                conn.execute("COMMIT")
                 return {"ok": False, "reason": "not_found"}
+            if str(opp["state"]) == "expired":
+                conn.execute("COMMIT")
+                return {"ok": False, "reason": "expired"}
             if str(opp["state"]) != "recruiting" or int(opp["revision"]) != int(expected_revision):
-                conn.execute("ROLLBACK")
+                conn.execute("COMMIT")
                 return {"ok": False, "reason": "revision_or_state_mismatch"}
             if int(opp["recruit_until"]) <= ts:
                 conn.execute(
-                    "UPDATE opportunities SET state='expired', outcome_reason='recruit_ttl_expired', revision=revision+1 WHERE id=?",
-                    (opportunity_id,),
+                    "UPDATE opportunities SET state='expired', outcome_reason='recruit_ttl_expired', ended_at=?, revision=revision+1 WHERE id=?",
+                    (ts, opportunity_id),
                 )
                 conn.execute("COMMIT")
                 return {"ok": False, "reason": "expired"}
 
             roles_needed: dict[str, int] = json.loads(str(opp["roles_json"]))
             opp_is_shadow = int(opp["is_shadow"])
-            # Issue #15: Strict shadow/live isolation — shadow reservations NEVER block live slots and vice versa!
+            # Issue #13 & #15: Accepted/active commitments stay strictly exclusive regardless of reserved_until;
+            # shadow reservations NEVER block live slots and vice versa!
             busy_rows = conn.execute(
                 """
                 SELECT DISTINCT oi.persona_id
                 FROM opportunity_interests oi
                 JOIN opportunities o ON o.id = oi.opportunity_id
                 WHERE o.is_shadow = ?
-                  AND oi.state IN ('reserved', 'accepted', 'active')
-                  AND (oi.reserved_until = 0 OR oi.reserved_until > ?)
+                  AND (
+                      oi.state IN ('accepted', 'active')
+                      OR (oi.state = 'reserved' AND oi.reserved_until > ?)
+                  )
                 """,
                 (opp_is_shadow, ts),
             ).fetchall()
@@ -472,7 +652,9 @@ class OpportunityCoordinator:
                     picked.append({
                         "interest_id": int(r["id"]),
                         "persona_id": pid,
+                        "realm_id": int(r["realm_id"]),
                         "character_guid": int(r["character_guid"]),
+                        "incarnation": int(r["incarnation"]),
                         "character_slug": str(r["character_slug"]),
                         "role": role_name,
                     })
@@ -481,15 +663,15 @@ class OpportunityCoordinator:
                     shortfalls[role_name] = need - got
 
             if shortfalls:
-                conn.execute("ROLLBACK")
+                conn.execute("COMMIT")
                 return {"ok": False, "reason": "insufficient_roles", "shortfalls": shortfalls}
 
-            # Atomically advance opportunity to 'assembling' (revision + 1) and reserve all 5 slots
-            res_until = ts + int(confirm_ttl_sec)
+            # Atomically advance opportunity to 'assembling' (revision + 1) with explicit confirm_until TTL
+            res_until = ts + max(1, int(confirm_ttl_sec))
             new_rev = int(opp["revision"]) + 1
             conn.execute(
-                "UPDATE opportunities SET state='assembling', revision=? WHERE id=? AND revision=?",
-                (new_rev, opportunity_id, int(opp["revision"])),
+                "UPDATE opportunities SET state='assembling', confirm_until=?, revision=? WHERE id=? AND revision=?",
+                (res_until, new_rev, opportunity_id, int(opp["revision"])),
             )
             for p in picked:
                 conn.execute(
@@ -502,20 +684,588 @@ class OpportunityCoordinator:
                 "opportunity_id": opportunity_id,
                 "revision": new_rev,
                 "reserved_until": res_until,
+                "confirm_until": res_until,
                 "party": picked,
             }
         except Exception:
-            conn.execute("ROLLBACK")
+            if conn.in_transaction:
+                conn.rollback()
             raise
         finally:
             conn.close()
 
-    def release_party(self, opportunity_id: int, reason: str, *, cancel_opp: bool = True, now_ts: int | None = None) -> None:
-        """Saga compensation: release all reservations on partial invite failure, recall, or toggle-off."""
+    def confirm_member(
+        self,
+        opportunity_id: int,
+        *,
+        expected_revision: int,
+        persona_id: str,
+        character_guid: int,
+        realm_id: int = 1,
+        incarnation: int = 1,
+        accepted: bool = True,
+        ack_token: str = "",
+        now_ts: int | None = None,
+    ) -> dict[str, Any]:
+        """Atomically confirm or decline a reserved party member (idempotent, revalidating char key & rev, Issue #13)."""
+        ts = int(now_ts if now_ts is not None else time.time())
+        clean_tok = str(ack_token or "").strip()[:64]
+        conn = self._conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._expire_stale_in_tx(conn, ts)
+            opp = conn.execute("SELECT * FROM opportunities WHERE id = ?", (int(opportunity_id),)).fetchone()
+            if not opp:
+                conn.execute("COMMIT")
+                return {"ok": False, "reason": "not_found"}
+
+            opp_state = str(opp["state"])
+            opp_rev = int(opp["revision"])
+            member = conn.execute(
+                "SELECT * FROM opportunity_interests WHERE opportunity_id=? AND persona_id=?",
+                (int(opportunity_id), persona_id),
+            ).fetchone()
+            if not member:
+                conn.execute("COMMIT")
+                return {"ok": False, "reason": "member_not_found"}
+
+            # Revalidate exact character key (realm_id, character_guid, incarnation)
+            if (
+                int(member["character_guid"]) != int(character_guid)
+                or int(member["realm_id"]) != int(realm_id)
+                or int(member["incarnation"]) != int(incarnation)
+            ):
+                conn.execute("COMMIT")
+                return {"ok": False, "reason": "character_key_mismatch"}
+
+            m_state = str(member["state"])
+            stored_tok = str(member["ack_token"] or "")
+
+            # Idempotent duplicate accept (in assembling, confirmed, or active)
+            if accepted and m_state in ("accepted", "active") and opp_state in ("assembling", "confirmed", "active"):
+                if stored_tok and clean_tok and stored_tok != clean_tok:
+                    conn.execute("COMMIT")
+                    return {"ok": False, "reason": "ack_token_mismatch"}
+                if int(expected_revision) <= opp_rev:
+                    conn.execute("COMMIT")
+                    return {
+                        "ok": True,
+                        "idempotent": True,
+                        "state": opp_state,
+                        "revision": opp_rev,
+                        "all_confirmed": opp_state in ("confirmed", "active"),
+                    }
+
+            # Idempotent duplicate decline on already-cancelled opportunity
+            if (not accepted) and m_state == "declined" and opp_state == "cancelled":
+                if stored_tok and clean_tok and stored_tok != clean_tok:
+                    conn.execute("COMMIT")
+                    return {"ok": False, "reason": "ack_token_mismatch"}
+                conn.execute("COMMIT")
+                return {"ok": True, "idempotent": True, "accepted": False, "state": "cancelled", "revision": opp_rev, "all_confirmed": False}
+
+            if opp_state == "expired":
+                conn.execute("COMMIT")
+                return {"ok": False, "reason": "confirm_ttl_expired"}
+
+            if opp_state != "assembling" or opp_rev != int(expected_revision):
+                conn.execute("COMMIT")
+                return {"ok": False, "reason": f"revision_or_state_mismatch:{opp_state}:rev{opp_rev}"}
+
+            if m_state not in ("reserved", "accepted"):
+                conn.execute("COMMIT")
+                return {"ok": False, "reason": f"member_not_reserved:{m_state}"}
+
+            if not accepted:
+                # Partial accept failure (even if this member previously accepted while still assembling!)
+                conn.execute(
+                    "UPDATE opportunity_interests SET state='declined', reserved_until=0, reason_code='member_declined', ack_token=?, updated_at=? WHERE id=?",
+                    (clean_tok, ts, int(member["id"])),
+                )
+                conn.execute(
+                    "UPDATE opportunity_interests SET state='released', reserved_until=0, reason_code='party_member_declined', updated_at=? "
+                    "WHERE opportunity_id=? AND id != ? AND state IN ('reserved','accepted')",
+                    (ts, int(opportunity_id), int(member["id"])),
+                )
+                new_rev = opp_rev + 1
+                conn.execute(
+                    "UPDATE opportunities SET state='cancelled', outcome_reason=?, confirm_until=0, ended_at=?, revision=? WHERE id=?",
+                    (f"member_declined:{persona_id}"[:120], ts, new_rev, int(opportunity_id)),
+                )
+                conn.execute("COMMIT")
+                return {"ok": True, "accepted": False, "state": "cancelled", "revision": new_rev, "all_confirmed": False}
+
+            # Mark member accepted (clear reserved_until -> durable commitment, NOT bounded by confirmation TTL!)
+            conn.execute(
+                "UPDATE opportunity_interests SET state='accepted', reserved_until=0, confirmed_at=?, ack_token=?, updated_at=? WHERE id=?",
+                (ts, clean_tok, ts, int(member["id"])),
+            )
+            counts = conn.execute(
+                "SELECT SUM(CASE WHEN state='accepted' THEN 1 ELSE 0 END) AS acc, "
+                "SUM(CASE WHEN state='reserved' THEN 1 ELSE 0 END) AS res "
+                "FROM opportunity_interests WHERE opportunity_id=?",
+                (int(opportunity_id),),
+            ).fetchone()
+            acc_n = int(counts["acc"] or 0)
+            res_n = int(counts["res"] or 0)
+            roles_needed: dict[str, int] = json.loads(str(opp["roles_json"]))
+            total_needed = sum(int(v) for v in roles_needed.values())
+
+            if res_n == 0 and acc_n == total_needed:
+                new_rev = opp_rev + 1
+                corr_key = f"opp:{int(opportunity_id)}:rev{new_rev}"
+                # Deterministic correlation key + handoff grace window so lost native handoff responses reconcile cleanly!
+                conn.execute(
+                    "UPDATE opportunities SET state='confirmed', confirm_until=?, correlation_key=?, revision=? WHERE id=?",
+                    (ts + DEFAULT_CONFIRM_TTL_SEC, corr_key, new_rev, int(opportunity_id)),
+                )
+                conn.execute("COMMIT")
+                return {
+                    "ok": True,
+                    "accepted": True,
+                    "state": "confirmed",
+                    "revision": new_rev,
+                    "correlation_key": corr_key,
+                    "all_confirmed": True,
+                    "confirmed_count": acc_n,
+                    "needed_count": total_needed,
+                }
+
+            conn.execute("COMMIT")
+            return {
+                "ok": True,
+                "accepted": True,
+                "state": "assembling",
+                "revision": opp_rev,
+                "all_confirmed": False,
+                "confirmed_count": acc_n,
+                "needed_count": total_needed,
+            }
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def record_native_handoff(
+        self,
+        opportunity_id: int,
+        *,
+        expected_revision: int,
+        native_state: str,
+        native_queue_id: str = "",
+        group_id: int = 0,
+        native_run_id: str = "",
+        now_ts: int | None = None,
+    ) -> dict[str, Any]:
+        """Idempotently record authoritative native LFG queue/group/run handoff from 'confirmed' -> 'active'."""
+        ts = int(now_ts if now_ts is not None else time.time())
+        n_state = str(native_state or "").strip().lower()
+        q_id = str(native_queue_id or "").strip()[:64]
+        r_id = str(native_run_id or "").strip()[:64]
+        g_id = max(0, int(group_id or 0))
+        conn = self._conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            opp = conn.execute("SELECT * FROM opportunities WHERE id = ?", (int(opportunity_id),)).fetchone()
+            if not opp:
+                conn.execute("ROLLBACK")
+                return {"ok": False, "reason": "not_found"}
+
+            if int(opp["is_shadow"]) == 1:
+                conn.execute("ROLLBACK")
+                return {"ok": False, "reason": "shadow_opportunity"}
+
+            opp_state = str(opp["state"])
+            opp_rev = int(opp["revision"])
+
+            # Late handoff after cancellation/expiry -> instruct caller to tear down any orphaned native queue!
+            if opp_state in ("cancelled", "expired", "aborted"):
+                conn.execute("ROLLBACK")
+                return {
+                    "ok": False,
+                    "reason": f"late_handoff_on_{opp_state}",
+                    "compensate": "leave_queue",
+                }
+
+            # Idempotent forward-only replay when already 'active' (never overwrite non-empty IDs or go backwards!)
+            if opp_state == "active" and n_state in NATIVE_STATE_ORDER:
+                st_q = str(opp["native_queue_id"] or "")
+                st_r = str(opp["native_run_id"] or "")
+                st_g = int(opp["group_id"] or 0)
+                st_ns = str(opp["native_state"] or "")
+                # Reject conflicting non-empty native IDs!
+                if (q_id and st_q and q_id != st_q) or (r_id and st_r and r_id != st_r) or (g_id > 0 and st_g > 0 and g_id != st_g):
+                    conn.execute("ROLLBACK")
+                    return {"ok": False, "reason": "native_identity_conflict"}
+                has_match = (q_id and q_id == st_q) or (r_id and r_id == st_r) or (g_id > 0 and g_id == st_g)
+                if not has_match:
+                    conn.execute("ROLLBACK")
+                    return {"ok": False, "reason": "native_identity_mismatch"}
+                if NATIVE_STATE_ORDER.get(n_state, 0) < NATIVE_STATE_ORDER.get(st_ns, 0):
+                    conn.execute("ROLLBACK")
+                    return {"ok": False, "reason": f"backward_native_state:{st_ns}->{n_state}"}
+                # Fill only currently-empty native IDs and advance native_state forward
+                conn.execute(
+                    "UPDATE opportunities SET native_state=?, "
+                    "native_queue_id=CASE WHEN native_queue_id='' THEN ? ELSE native_queue_id END, "
+                    "group_id=CASE WHEN group_id=0 THEN ? ELSE group_id END, "
+                    "native_run_id=CASE WHEN native_run_id='' THEN ? ELSE native_run_id END "
+                    "WHERE id=?",
+                    (n_state, q_id, g_id, r_id, int(opportunity_id)),
+                )
+                conn.execute("COMMIT")
+                return {"ok": True, "idempotent": True, "state": "active", "revision": opp_rev}
+
+            if opp_state != "confirmed" or opp_rev != int(expected_revision):
+                conn.execute("ROLLBACK")
+                return {"ok": False, "reason": f"revision_or_state_mismatch:{opp_state}:rev{opp_rev}"}
+
+            if n_state in ("rejected", "failed", "cancelled"):
+                conn.execute(
+                    "UPDATE opportunity_interests SET state='released', reserved_until=0, reason_code=?, updated_at=? "
+                    "WHERE opportunity_id=? AND state IN ('reserved','accepted','active')",
+                    (f"native_{n_state}"[:64], ts, int(opportunity_id)),
+                )
+                new_rev = opp_rev + 1
+                conn.execute(
+                    "UPDATE opportunities SET state='cancelled', native_state=?, outcome_reason=?, "
+                    "confirm_until=0, ended_at=?, revision=? WHERE id=?",
+                    (n_state, f"native_{n_state}", ts, new_rev, int(opportunity_id)),
+                )
+                conn.execute("COMMIT")
+                return {"ok": True, "state": "cancelled", "revision": new_rev}
+
+            if n_state not in NATIVE_STATE_ORDER:
+                conn.execute("ROLLBACK")
+                return {"ok": False, "reason": f"invalid_native_state:{n_state}"}
+            if not q_id and not r_id and g_id <= 0:
+                conn.execute("ROLLBACK")
+                return {"ok": False, "reason": "missing_native_identifier"}
+
+            new_rev = opp_rev + 1
+            conn.execute(
+                "UPDATE opportunities SET state='active', native_state=?, native_queue_id=?, group_id=?, "
+                "native_run_id=?, confirm_until=0, started_at=?, revision=? WHERE id=?",
+                (n_state, q_id, g_id, r_id, ts, new_rev, int(opportunity_id)),
+            )
+            conn.execute(
+                "UPDATE opportunity_interests SET state='active', reserved_until=0, opportunity_revision=?, updated_at=? "
+                "WHERE opportunity_id=? AND state='accepted'",
+                (new_rev, ts, int(opportunity_id)),
+            )
+            conn.execute("COMMIT")
+            return {
+                "ok": True,
+                "idempotent": False,
+                "state": "active",
+                "revision": new_rev,
+                "native_queue_id": q_id,
+                "group_id": g_id,
+                "native_run_id": r_id,
+            }
+        except sqlite3.IntegrityError:
+            if conn.in_transaction:
+                conn.rollback()
+            return {"ok": False, "reason": "duplicate_native_run_id"}
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def record_native_outcome(
+        self,
+        opportunity_id: int,
+        *,
+        native_run_id: str = "",
+        native_queue_id: str = "",
+        group_id: int = 0,
+        outcome: str,
+        outcome_reason: str = "",
+        expected_revision: int | None = None,
+        now_ts: int | None = None,
+    ) -> dict[str, Any]:
+        """Record terminal dungeon outcome ONLY from authoritative native run completion/abort (Issue #13)."""
+        ts = int(now_ts if now_ts is not None else time.time())
+        r_id = str(native_run_id or "").strip()[:64]
+        q_id = str(native_queue_id or "").strip()[:64]
+        g_id = max(0, int(group_id or 0))
+        out_s = str(outcome or "").strip().lower()
+        if out_s not in ("completed", "aborted", "failed", "disbanded"):
+            return {"ok": False, "reason": f"invalid_outcome:{out_s}"}
+
+        conn = self._conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            opp = conn.execute("SELECT * FROM opportunities WHERE id = ?", (int(opportunity_id),)).fetchone()
+            if not opp:
+                conn.execute("ROLLBACK")
+                return {"ok": False, "reason": "not_found"}
+
+            if int(opp["is_shadow"]) == 1:
+                conn.execute("ROLLBACK")
+                return {"ok": False, "reason": "shadow_opportunity"}
+
+            opp_state = str(opp["state"])
+            opp_rev = int(opp["revision"])
+            stored_run = str(opp["native_run_id"] or "")
+            stored_q = str(opp["native_queue_id"] or "")
+            stored_g = int(opp["group_id"] or 0)
+            target_state = "completed" if out_s == "completed" else "aborted"
+
+            # Idempotent duplicate terminal callback with matching run ID
+            if opp_state == target_state and (
+                (r_id and stored_run == r_id)
+                or (target_state == "aborted" and not stored_run and ((q_id and q_id == stored_q) or (g_id > 0 and g_id == stored_g)))
+            ):
+                conn.execute("COMMIT")
+                return {"ok": True, "idempotent": True, "state": opp_state, "revision": opp_rev}
+
+            # Late genuine completion after reconcile aborted a run as missing -> update opportunity ledger ONLY!
+            if (
+                out_s == "completed"
+                and opp_state == "aborted"
+                and str(opp["outcome_reason"]) == "reconciled_missing_native_run"
+                and stored_run
+                and r_id == stored_run
+            ):
+                new_rev = opp_rev + 1
+                reason_txt = (outcome_reason or "late_native_completed")[:120]
+                conn.execute(
+                    "UPDATE opportunities SET state='completed', native_state='completed', outcome_reason=?, "
+                    "ended_at=?, revision=? WHERE id=?",
+                    (reason_txt, ts, new_rev, int(opportunity_id)),
+                )
+                conn.execute("COMMIT")
+                return {"ok": True, "idempotent": False, "late_reconciled": True, "state": "completed", "revision": new_rev}
+
+            if opp_state not in ("active", "cancelling"):
+                conn.execute("ROLLBACK")
+                return {"ok": False, "reason": f"not_active:{opp_state}"}
+            if expected_revision is not None and opp_rev != int(expected_revision):
+                conn.execute("ROLLBACK")
+                return {"ok": False, "reason": f"revision_mismatch:{opp_rev}"}
+
+            # Strict native identity binding (P0.2):
+            # - 'completed' REQUIRES a non-empty stored_run that matches r_id exactly!
+            # - abort/failed/disbanded without stored_run MUST match stored_q or stored_g!
+            if out_s == "completed":
+                if not stored_run or not r_id or stored_run != r_id:
+                    conn.execute("ROLLBACK")
+                    return {"ok": False, "reason": "native_run_id_required_and_must_match"}
+            else:
+                if stored_run:
+                    if not r_id or stored_run != r_id:
+                        conn.execute("ROLLBACK")
+                        return {"ok": False, "reason": f"native_run_id_mismatch:{stored_run}!={r_id}"}
+                else:
+                    matched_alt = (q_id and stored_q and q_id == stored_q) or (g_id > 0 and stored_g > 0 and g_id == stored_g)
+                    if not matched_alt:
+                        conn.execute("ROLLBACK")
+                        return {"ok": False, "reason": "native_queue_or_group_id_must_match"}
+
+            new_rev = opp_rev + 1
+            member_final = "completed" if out_s == "completed" else "released"
+            reason_txt = (outcome_reason or f"native_{out_s}")[:120]
+            conn.execute(
+                "UPDATE opportunities SET state=?, native_state=?, outcome_reason=?, "
+                "ended_at=?, revision=? WHERE id=?",
+                (target_state, out_s, reason_txt, ts, new_rev, int(opportunity_id)),
+            )
+            conn.execute(
+                "UPDATE opportunity_interests SET state=?, reserved_until=0, reason_code=?, updated_at=? "
+                "WHERE opportunity_id=? AND state IN ('active','accepted','reserved')",
+                (member_final, reason_txt[:64], ts, int(opportunity_id)),
+            )
+            conn.execute("COMMIT")
+            return {"ok": True, "idempotent": False, "state": target_state, "revision": new_rev, "native_run_id": stored_run or r_id}
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def reconcile_native_state(
+        self,
+        snapshot: NativeReconcileSnapshot | None = None,
+        *,
+        now_ts: int | None = None,
+    ) -> dict[str, Any]:
+        """Fail-closed crash & restart reconciliation against an authoritative NativeReconcileSnapshot (Issue #13)."""
+        ts = int(now_ts if now_ts is not None else time.time())
+        snap = snapshot if snapshot is not None else NativeReconcileSnapshot(authoritative=False)
+
+        conn = self._conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            exp_stats = self._expire_stale_in_tx(conn, ts)
+
+            # Shadow confirmed rows past confirm_until get a distinct shadow label (never pollute live crash metrics)
+            shadow_expired = 0
+            for sr in conn.execute(
+                "SELECT id FROM opportunities WHERE is_shadow=1 AND state='confirmed' AND confirm_until > 0 AND confirm_until <= ?",
+                (ts,),
+            ).fetchall():
+                oid = int(sr["id"])
+                conn.execute(
+                    "UPDATE opportunity_interests SET state='released', reserved_until=0, "
+                    "reason_code='shadow_confirm_expired', updated_at=? WHERE opportunity_id=? AND state IN ('reserved','accepted')",
+                    (ts, oid),
+                )
+                shadow_expired += conn.execute(
+                    "UPDATE opportunities SET state='expired', outcome_reason='shadow_confirm_expired', "
+                    "confirm_until=0, ended_at=?, revision=revision+1 WHERE id=?",
+                    (ts, oid),
+                ).rowcount
+
+            # Fail CLOSED: if native snapshot is NOT authoritative, NEVER abort live active runs or cancel live confirmed!
+            if not snap.authoritative:
+                conn.execute("COMMIT")
+                return {
+                    **exp_stats,
+                    "authoritative": False,
+                    "shadow_confirmed_expired": shadow_expired,
+                    "adopted_confirmed": 0,
+                    "lost_confirmed_released": 0,
+                    "aborted_missing_native": 0,
+                }
+
+            groups = snap.active_group_ids
+            queues = snap.active_queue_ids
+            runs = snap.active_run_ids
+            corr_map = snap.correlation_map or {}
+
+            # 1. Reconcile live 'confirmed' opportunities via deterministic correlation_key:
+            #    Adopt into 'active' if native created it (lost response!); cancel ONLY if absent & past confirm_until!
+            adopted = 0
+            lost_confirmed = 0
+            for r in conn.execute(
+                "SELECT id, revision, correlation_key, confirm_until FROM opportunities WHERE is_shadow=0 AND state='confirmed'"
+            ).fetchall():
+                oid = int(r["id"])
+                ckey = str(r["correlation_key"] or "")
+                found = corr_map.get(ckey) if ckey else None
+                if isinstance(found, dict):
+                    n_st = str(found.get("native_state") or "queued").lower()
+                    q_id = str(found.get("native_queue_id") or "")[:64]
+                    r_id = str(found.get("native_run_id") or "")[:64]
+                    g_id = max(0, int(found.get("group_id") or 0))
+                    new_rev = int(r["revision"]) + 1
+                    conn.execute(
+                        "UPDATE opportunities SET state='active', native_state=?, native_queue_id=?, "
+                        "group_id=?, native_run_id=?, confirm_until=0, started_at=?, revision=? WHERE id=?",
+                        (n_st, q_id, g_id, r_id, ts, new_rev, oid),
+                    )
+                    conn.execute(
+                        "UPDATE opportunity_interests SET state='active', reserved_until=0, "
+                        "opportunity_revision=?, updated_at=? WHERE opportunity_id=? AND state='accepted'",
+                        (new_rev, ts, oid),
+                    )
+                    adopted += 1
+                elif snap.correlation_map is not None and int(r["confirm_until"]) > 0 and int(r["confirm_until"]) <= ts:
+                    conn.execute(
+                        "UPDATE opportunity_interests SET state='released', reserved_until=0, "
+                        "reason_code='crash_lost_native_handoff', updated_at=? "
+                        "WHERE opportunity_id=? AND state IN ('reserved','accepted')",
+                        (ts, oid),
+                    )
+                    lost_confirmed += conn.execute(
+                        "UPDATE opportunities SET state='cancelled', outcome_reason='crash_lost_native_handoff', "
+                        "confirm_until=0, ended_at=?, revision=revision+1 WHERE id=?",
+                        (ts, oid),
+                    ).rowcount
+
+            # 2. Reconcile live 'active'/'cancelling' opportunities ONLY when every relevant native ID set is known (non-None!)
+            aborted_missing = 0
+            for r in conn.execute(
+                "SELECT id, state, group_id, native_queue_id, native_run_id FROM opportunities "
+                "WHERE state IN ('active','cancelling') AND is_shadow=0"
+            ).fetchall():
+                oid = int(r["id"])
+                gid = int(r["group_id"] or 0)
+                qid = str(r["native_queue_id"] or "").strip()
+                rid = str(r["native_run_id"] or "").strip()
+
+                # Fail closed per-identifier: if an identifier is set on the opportunity but its corresponding
+                # authoritative set wasn't supplied (None), treat as unknown and DO NOT abort!
+                unknown_check = (
+                    (gid > 0 and groups is None)
+                    or (bool(qid) and queues is None)
+                    or (bool(rid) and runs is None)
+                )
+                if unknown_check:
+                    continue
+
+                still_alive = (
+                    (gid > 0 and groups is not None and gid in groups)
+                    or (bool(qid) and queues is not None and qid in queues)
+                    or (bool(rid) and runs is not None and rid in runs)
+                )
+                if not still_alive:
+                    conn.execute(
+                        "UPDATE opportunity_interests SET state='released', reserved_until=0, "
+                        "reason_code='reconciled_missing_native_run', updated_at=? "
+                        "WHERE opportunity_id=? AND state IN ('active','accepted','reserved')",
+                        (ts, oid),
+                    )
+                    final_st = "cancelled" if str(r["state"]) == "cancelling" else "aborted"
+                    aborted_missing += conn.execute(
+                        "UPDATE opportunities SET state=?, native_state='missing', "
+                        "outcome_reason='reconciled_missing_native_run', ended_at=?, revision=revision+1 WHERE id=?",
+                        (final_st, ts, oid),
+                    ).rowcount
+
+            conn.execute("COMMIT")
+            return {
+                **exp_stats,
+                "authoritative": True,
+                "shadow_confirmed_expired": shadow_expired,
+                "adopted_confirmed": adopted,
+                "lost_confirmed_released": lost_confirmed,
+                "aborted_missing_native": aborted_missing,
+            }
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def release_party(
+        self,
+        opportunity_id: int,
+        reason: str,
+        *,
+        cancel_opp: bool = True,
+        native_confirmed: bool = False,
+        now_ts: int | None = None,
+    ) -> dict[str, Any]:
+        """Saga compensation: release reservations; for live active/confirmed runs without native_confirmed,
+        enter 'cancelling' so members remain exclusive until native teardown completes (Issue #13)."""
         ts = int(now_ts if now_ts is not None else time.time())
         conn = self._conn()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            opp = conn.execute("SELECT state, is_shadow, revision FROM opportunities WHERE id=?", (int(opportunity_id),)).fetchone()
+            if not opp:
+                conn.execute("ROLLBACK")
+                return {"ok": False, "reason": "not_found"}
+            opp_state = str(opp["state"])
+            is_live_native = int(opp["is_shadow"]) == 0 and opp_state in ("confirmed", "active")
+
+            if is_live_native and not native_confirmed:
+                new_rev = int(opp["revision"]) + 1
+                conn.execute(
+                    "UPDATE opportunities SET state='cancelling', outcome_reason=?, revision=? WHERE id=?",
+                    (reason[:120], new_rev, int(opportunity_id)),
+                )
+                conn.execute("COMMIT")
+                return {"ok": True, "state": "cancelling", "revision": new_rev, "awaiting_native_teardown": True}
+
             conn.execute(
                 "UPDATE opportunity_interests SET state='released', reserved_until=0, reason_code=?, updated_at=? "
                 "WHERE opportunity_id=? AND state IN ('reserved','accepted','active')",
@@ -523,11 +1273,16 @@ class OpportunityCoordinator:
             )
             if cancel_opp:
                 conn.execute(
-                    "UPDATE opportunities SET state='cancelled', outcome_reason=?, revision=revision+1 "
-                    "WHERE id=? AND state IN ('recruiting','assembling','active')",
-                    (reason[:120], int(opportunity_id)),
+                    "UPDATE opportunities SET state='cancelled', outcome_reason=?, confirm_until=0, ended_at=?, revision=revision+1 "
+                    "WHERE id=? AND state IN ('recruiting','assembling','confirmed','active','cancelling')",
+                    (reason[:120], ts, int(opportunity_id)),
                 )
             conn.execute("COMMIT")
+            return {"ok": True, "state": "cancelled", "awaiting_native_teardown": False}
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
         finally:
             conn.close()
 

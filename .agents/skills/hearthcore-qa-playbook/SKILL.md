@@ -56,6 +56,9 @@ This is a living skill updated continuously after every Claude Opus 5.5 High QA 
 - **Check rate limits BEFORE mutating state:** Rate-limiting a combined save+trigger endpoint (like directive + replan) after saving leaves mutated state behind a `429` response.
 - **Per-character pause must actually stop Claude & respect global kill switches:** Persist paused characters in `brain.db` so `run_cycle()` skips them (no API spend), `reconcile_state()` ignores them, and presets/resume refuse to run while `brain.disabled` exists.
 - **Consume one-shot directives once, and ONLY on real AI plans:** Filter `consumed_at = 0` when reading one-shot notes and stamp `consumed_at` only when `source == 'anthropic'` (never on fallback/holdout).
+- **Fail-closed crash reconciliation & correlation keys:** Never treat `None` or unverified empty sets as "nothing is running" during crash reconciliation — require an explicit `authoritative=True` snapshot and persist a deterministic `correlation_key` BEFORE external handoffs so lost responses can be adopted rather than cancelled into orphans.
+- **Guard SQLite rollbacks & persist TTL sweeps:** Always use `if conn.in_transaction: conn.rollback()` (avoiding "no transaction is active" masking the real error), and commit TTL expiry sweeps on early returns rather than rolling them back.
+- **Forward-only idempotent replays & strict native run binding:** Reject conflicting non-empty IDs or backward native state transitions on callback replays, reject shadow rows on live native endpoints, and require exact `native_run_id` match before recording `completed`.
 
 ### HTTP Security, Auth & Loopback Trust
 - **Scope opt-in loopback trust narrowly:** `AZEROTH_WATCH_TRUST_LOOPBACK_WRITES=1` applies ONLY to `/api/character/*` routes, rejects requests with `X-Forwarded-For` / `Forwarded` headers (no reverse-proxy/tunnel leak), and requires an explicit same-origin `Origin` header.
