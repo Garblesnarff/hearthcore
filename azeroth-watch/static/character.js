@@ -58,6 +58,8 @@
   }
 
   async function apiPost(action, payload, okMsg) {
+    if (state.busy) return null;
+    state.busy = true;
     try {
       const res = await fetch(`/api/character/${encodeURIComponent(state.slug)}/${action}`, {
         method: "POST",
@@ -75,6 +77,8 @@
     } catch (_) {
       showToast("Network error", true);
       return null;
+    } finally {
+      state.busy = false;
     }
   }
 
@@ -431,7 +435,7 @@
         .map((s) => `<option value="${esc(s.id)}">${esc(s.label)} (${s.start_hour}:00–${s.end_hour}:00)</option>`)
         .join("");
     }
-    if (d.character.schedule && !sgSel._dirty) {
+    if (d.character.schedule && !sgSel._dirty && !$("sched-always-online")._dirty) {
       sgSel.value = d.character.schedule.shift_group || "prime-time";
       $("sched-always-online").checked = Boolean(d.character.schedule.always_online);
     }
@@ -638,18 +642,20 @@
   $("directive-input").addEventListener("input", () => { state.dirtyDirective = true; });
   $("btn-save-directive").addEventListener("click", async () => {
     const note = $("directive-input").value.trim();
-    state.dirtyDirective = false;
-    await apiPost("directive", { note, replan: false }, note ? "Saved note for Claude's next plan" : "Cleared directive note");
+    const res = await apiPost("directive", { note, replan: false }, note ? "Saved note for Claude's next plan" : "Cleared directive note");
+    if (res) state.dirtyDirective = false;
   });
   $("btn-replan-now").addEventListener("click", async () => {
     const note = $("directive-input").value.trim();
-    state.dirtyDirective = false;
-    await apiPost("directive", { note, replan: true }, "Saved note & triggered Claude replan now!");
+    const res = await apiPost("directive", { note, replan: true }, "Saved note & triggered Claude replan now!");
+    if (res) state.dirtyDirective = false;
   });
   $("btn-clear-directive").addEventListener("click", async () => {
-    $("directive-input").value = "";
-    state.dirtyDirective = false;
-    await apiPost("directive", { note: "", replan: false }, "Cleared directive note");
+    const res = await apiPost("directive", { note: "", replan: false }, "Cleared directive note");
+    if (res) {
+      $("directive-input").value = "";
+      state.dirtyDirective = false;
+    }
   });
 
   $("btn-create-wo").addEventListener("click", async () => {
@@ -666,11 +672,15 @@
   });
 
   $("sched-group-select").addEventListener("change", () => { $("sched-group-select")._dirty = true; });
+  $("sched-always-online").addEventListener("change", () => { $("sched-always-online")._dirty = true; });
   $("btn-save-sched").addEventListener("click", async () => {
     const sg = $("sched-group-select").value;
     const ao = $("sched-always-online").checked;
-    $("sched-group-select")._dirty = false;
-    await apiPost("schedule", { shift_group: sg, always_online: ao }, `Updated shift schedule to ${sg}`);
+    const res = await apiPost("schedule", { shift_group: sg, always_online: ao }, `Updated shift schedule to ${sg}`);
+    if (res) {
+      $("sched-group-select")._dirty = false;
+      $("sched-always-online")._dirty = false;
+    }
   });
 
   $("life-tabs").querySelectorAll("[data-ltab]").forEach((btn) => {

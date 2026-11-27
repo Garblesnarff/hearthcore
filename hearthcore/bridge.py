@@ -1264,16 +1264,18 @@ def apply_plan_to_db(
 
     stmts: list[str] = ["START TRANSACTION;"]
     for k, v in sorted(cpp_weights.items()):
+        # Preserve unexpired manual operator focus presets (source='operator' AND expires_at > ts)
+        op_guard = f"NOT (`source` = 'operator' AND `enabled` = 1 AND `expires_at` > {ts})"
         stmts.append(
             "INSERT INTO companion_weight_overrides "
             "(`guid`, `key`, `value`, `plan_id`, `revision`, `source`, `enabled`, `created_at`, `expires_at`) "
             f"VALUES ({int(guid)}, '{_sql_esc(k)}', {v:.3f}, {int(plan_id)}, {revision}, '{db_src}', 1, {ts}, {expires_at}) "
             "ON DUPLICATE KEY UPDATE "
-            "`value` = IF(VALUES(`revision`) >= `revision`, VALUES(`value`), `value`), "
-            "`plan_id` = IF(VALUES(`revision`) >= `revision`, VALUES(`plan_id`), `plan_id`), "
-            "`source` = IF(VALUES(`revision`) >= `revision`, VALUES(`source`), `source`), "
-            "`created_at` = IF(VALUES(`revision`) >= `revision`, VALUES(`created_at`), `created_at`), "
-            "`expires_at` = IF(VALUES(`revision`) >= `revision`, VALUES(`expires_at`), `expires_at`), "
+            f"`value` = IF(VALUES(`revision`) >= `revision` AND {op_guard}, VALUES(`value`), `value`), "
+            f"`plan_id` = IF(VALUES(`revision`) >= `revision` AND {op_guard}, VALUES(`plan_id`), `plan_id`), "
+            f"`source` = IF(VALUES(`revision`) >= `revision` AND {op_guard}, VALUES(`source`), `source`), "
+            f"`created_at` = IF(VALUES(`revision`) >= `revision` AND {op_guard}, VALUES(`created_at`), `created_at`), "
+            f"`expires_at` = IF(VALUES(`revision`) >= `revision` AND {op_guard}, VALUES(`expires_at`), `expires_at`), "
             "`revision` = GREATEST(`revision`, VALUES(`revision`));"
         )
 
@@ -1366,6 +1368,13 @@ class BrainStore:
                     consumed_at INTEGER NOT NULL DEFAULT 0
                 )
             """)
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS paused_characters (
+                    character_id TEXT PRIMARY KEY,
+                    paused_at INTEGER NOT NULL,
+                    reason TEXT NOT NULL DEFAULT 'operator'
+                )
+            """)
             existing_cols = {r[1] for r in db.execute("PRAGMA table_info(plans)").fetchall()}
             for col, typ in [
                 ("start_level", "INTEGER NOT NULL DEFAULT 0"),
@@ -1451,16 +1460,19 @@ class BrainStore:
                 "consumed_at": 0,
             }
 
-    def get_operator_directive(self, slug: str, *, now_ts: int | None = None) -> dict[str, Any] | None:
-        """Return active unexpired operator directive for slug, or None."""
+    def get_operator_directive(
+        self, slug: str, *, now_ts: int | None = None, include_consumed: bool = False
+    ) -> dict[str, Any] | None:
+        """Return active unexpired operator directive for slug (unconsumed only by default)."""
         ts = int(now_ts if now_ts is not None else time.time())
         clean_slug = str(slug or "").strip().lower()
+        cond = "AND consumed_at = 0" if not include_consumed else ""
         with self._conn() as db:
             row = db.execute(
-                """
+                f"""
                 SELECT character_id, note, updated_at, expires_at, consumed_at
                 FROM operator_directives
-                WHERE character_id = ? AND expires_at > ?
+                WHERE character_id = ? AND expires_at > ? {cond}
                 """,
                 (clean_slug, ts),
             ).fetchone()
@@ -1469,7 +1481,7 @@ class BrainStore:
             return {
                 "character_id": str(row["character_id"]),
                 "note": str(row["note"]),
-                "active": True,
+                "active": int(row["consumed_at"] or 0) == 0,
                 "updated_at": int(row["updated_at"]),
                 "expires_at": int(row["expires_at"]),
                 "consumed_at": int(row["consumed_at"] or 0),
@@ -1480,9 +1492,34 @@ class BrainStore:
         clean_slug = str(slug or "").strip().lower()
         with self._conn() as db:
             db.execute(
-                "UPDATE operator_directives SET consumed_at = ? WHERE character_id = ? AND expires_at > ?",
+                "UPDATE operator_directives SET consumed_at = ? WHERE character_id = ? AND expires_at > ? AND consumed_at = 0",
                 (ts, clean_slug, ts),
             )
+
+    def set_character_paused(self, slug: str, paused: bool, *, now_ts: int | None = None, reason: str = "operator") -> bool:
+        """Persist per-character AI pause flag so run_cycle skips paused companions without burning API credits."""
+        ts = int(now_ts if now_ts is not None else time.time())
+        clean_slug = str(slug or "").strip().lower()
+        with self._conn() as db:
+            if paused:
+                db.execute(
+                    "INSERT INTO paused_characters (character_id, paused_at, reason) VALUES (?, ?, ?) "
+                    "ON CONFLICT(character_id) DO UPDATE SET paused_at = excluded.paused_at, reason = excluded.reason",
+                    (clean_slug, ts, str(reason)[:64]),
+                )
+            else:
+                db.execute("DELETE FROM paused_characters WHERE character_id = ?", (clean_slug,))
+        return bool(paused)
+
+    def is_character_paused(self, slug: str) -> bool:
+        clean_slug = str(slug or "").strip().lower()
+        with self._conn() as db:
+            row = db.execute("SELECT 1 FROM paused_characters WHERE character_id = ?", (clean_slug,)).fetchone()
+            return row is not None
+
+    def paused_character_slugs(self) -> set[str]:
+        with self._conn() as db:
+            return {str(r["character_id"]) for r in db.execute("SELECT character_id FROM paused_characters").fetchall()}
 
     def sync_sequence_floor(self, remote_max_rev: int) -> dict[str, Any]:
         """Detect if brain.db is behind MySQL revisions and advance monotonic sequence floor (Issue #53)."""
@@ -2077,12 +2114,15 @@ def reconcile_state(
     jstat = mem.journal_status()
     journal_lag = max(0, mysql_max_ev - int(jstat["cursor"]))
 
+    paused_slugs = store.paused_character_slugs()
     orphan_plans: list[dict[str, Any]] = []
     override_drift: list[dict[str, Any]] = []
     for r in active_rows:
         pid = int(r["id"])
         guid = int(r["game_guid"])
         slug = str(r["character_id"])
+        if slug in paused_slugs:
+            continue
         if pid not in mysql_props:
             orphan_plans.append({"plan_id": pid, "character_id": slug, "reason": "missing_mysql_proposal"})
         ov = mysql_ov.get(guid)
@@ -2261,6 +2301,7 @@ def run_cycle(
         # Shadow runs read a snapshot copy of reservations and NEVER mutate live reservations (Issue #7)
         reservations = dict(mem.active_order_reservations(now_ts))
         known_slugs = set(profiles())
+        paused_slugs = store.paused_character_slugs() if apply else set()
 
         targets = []
         for slug, comp in sorted(world_ctx["companions"].items()):
@@ -2269,6 +2310,9 @@ def run_cycle(
             if not comp["online"] and not character:
                 continue
             if slug not in known_slugs:
+                continue
+            if apply and slug in paused_slugs:
+                logger.info("Skipping AI planning for %s (paused by operator)", slug)
                 continue
             if not force and store.active_plan(slug, now_ts) is not None:
                 continue
@@ -2427,7 +2471,7 @@ def run_cycle(
                         # MySQL acknowledged! Finalize previous open plan and mark this one applied.
                         store.finalize_character_open_plans(slug, comp, now_ts, exclude_plan_id=plan_id)
                         store.mark_plan_applied(plan_id)
-                        if active_directive:
+                        if active_directive and source == "anthropic":
                             store.mark_operator_directive_consumed(slug, now_ts=now_ts)
                         pending_plan_id = None
                         consecutive_apply_failures = 0
