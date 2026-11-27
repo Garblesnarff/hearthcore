@@ -891,15 +891,20 @@ bool CompanionBotMgr::IsScheduledOnline(std::string const& name, Player const* b
     std::time_t const now = std::time(nullptr);
     std::tm localTm{};
     localtime_r(&now, &localTm);
+    // daysMask names the day a shift starts. An overnight shift's after-midnight hours belong to the shift that
+    // started on the previous weekday, so they consult the previous day's bit.
     uint8 const dayBit = static_cast<uint8>(1u << localTm.tm_wday);
-    if ((entry.daysMask & dayBit) == 0)
-        return false;
+    uint8 const prevDayBit = static_cast<uint8>(1u << ((localTm.tm_wday + 6) % 7));
     uint8 const hr = static_cast<uint8>(localTm.tm_hour);
     if (entry.startHour == entry.endHour)
-        return true;
+        return (entry.daysMask & dayBit) != 0;
     if (entry.startHour < entry.endHour)
-        return hr >= entry.startHour && hr < entry.endHour;
-    return hr >= entry.startHour || hr < entry.endHour;
+        return (entry.daysMask & dayBit) != 0 && hr >= entry.startHour && hr < entry.endHour;
+    if (hr >= entry.startHour)
+        return (entry.daysMask & dayBit) != 0;
+    if (hr < entry.endHour)
+        return (entry.daysMask & prevDayBit) != 0;
+    return false;
 }
 
 std::string CompanionBotMgr::ScheduleSummary() const
