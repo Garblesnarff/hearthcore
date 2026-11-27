@@ -156,16 +156,23 @@
     const aiPill = $("ai-pill");
     if (aiPill) {
       const ab = d.ai_brain || {};
-      const t = ab.today || {};
-      const bal = ab.balance || {};
-      const mShort = fmtModelShort(ab.model);
-      const ok = t.ai_ok || 0;
-      const err = t.ai_err || 0;
-      const cap = ab.daily_cap || 500;
-      const rem = typeof bal.remaining_usd === "number" ? `~$${bal.remaining_usd.toFixed(2)}` : `${ok}/${cap}`;
-      aiPill.classList.toggle("has-err", err > 0);
-      $("ai-val").textContent = `${mShort} · ${rem}`;
-      aiPill.title = `Claude AI Brain (${ab.model || "none"} ${ab.effort || ""}) · Est. ${rem} left of $${(bal.credit_total_usd || 98).toFixed(2)} · Today: ${ok}/${cap} plans, ${err} errors · Click or press 4`;
+      if (ab.redacted) {
+        const activeCnt = Number(ab.active_plans_count || 0);
+        aiPill.classList.toggle("has-err", Boolean(ab.stale_alarm));
+        $("ai-val").textContent = `${activeCnt} active · 🔒`;
+        aiPill.title = `Claude AI Brain (${activeCnt} active companion plans) · Click or press 4 and unlock Admin to view model & budget`;
+      } else {
+        const t = ab.today || {};
+        const bal = ab.balance || {};
+        const mShort = fmtModelShort(ab.model);
+        const ok = t.ai_ok || 0;
+        const err = t.ai_err || 0;
+        const cap = ab.daily_cap || 500;
+        const rem = typeof bal.remaining_usd === "number" ? `~$${bal.remaining_usd.toFixed(2)}` : `${ok}/${cap}`;
+        aiPill.classList.toggle("has-err", err > 0);
+        $("ai-val").textContent = `${mShort} · ${rem}`;
+        aiPill.title = `Claude AI Brain (${ab.model || "none"} ${ab.effort || ""}) · Est. ${rem} left of $${(bal.credit_total_usd || 98).toFixed(2)} · Today: ${ok}/${cap} plans, ${err} errors · Click or press 4`;
+      }
     }
 
     const evPill = $("event-pill");
@@ -1069,6 +1076,7 @@
         await postBrainApi("/api/brain/logout", {}, "Admin controls locked");
         adminUnlocked = false;
         updateAdminBtn();
+        connectStream();
         return;
       }
       const tok = window.prompt("Enter AZEROTH_WATCH_ADMIN_TOKEN (from hearthcore/.env):");
@@ -1083,6 +1091,15 @@
         adminUnlocked = true;
         updateAdminBtn();
         showBrainToast("Admin controls unlocked for this browser");
+        // Immediately fetch full admin snapshot & reconnect SSE with the new session cookie!
+        try {
+          const stRes = await fetch("/api/state", { cache: "no-store" });
+          if (stRes.ok) {
+            state.data = await stRes.json();
+            render(state.data);
+          }
+        } catch (_) {}
+        connectStream();
       } else {
         showBrainToast(data.error || "Invalid admin token", true);
       }
@@ -1274,6 +1291,9 @@
     const resCount = Object.keys(mem.active_reservations || {}).length;
 
     $("brain-active-badge").textContent = `${activeCnt} active · ${resCount} reserved orders${opAlerts.length ? ` · ⚠ ${opAlerts.length} stall alert${opAlerts.length > 1 ? "s" : ""}` : ""}`;
+    const emptyPlansMsg = ab.redacted
+      ? `<tr><td colspan="5" class="empty-note">🔒 Admin session locked or expired — click <b>🔒 Unlock Admin</b> above to view companion plans &amp; Claude decisions.</td></tr>`
+      : `<tr><td colspan="5" class="empty-note">No AI Brain session plans recorded yet.</td></tr>`;
     const plansHtml =
       activeList.length > 0
         ? activeList
@@ -1326,11 +1346,14 @@
                 </tr>`;
             })
             .join("")
-        : `<tr><td colspan="5" class="empty-note">No AI Brain session plans recorded yet.</td></tr>`;
+        : emptyPlansMsg;
     setHtmlIfChanged($("brain-plans-tbody"), plansHtml);
 
     const hist = ab.history || [];
-    $("brain-hist-badge").textContent = `${hist.length} recent`;
+    $("brain-hist-badge").textContent = ab.redacted ? "locked" : `${hist.length} recent`;
+    const emptyHistMsg = ab.redacted
+      ? `<div class="empty-note">🔒 Admin session locked or expired — click <b>🔒 Unlock Admin</b> above.</div>`
+      : `<div class="empty-note">No decisions logged yet.</div>`;
     const histHtml =
       hist.length > 0
         ? hist
@@ -1355,16 +1378,43 @@
                 </div>`;
             })
             .join("")
-        : `<div class="empty-note">No decisions logged yet.</div>`;
+        : emptyHistMsg;
     setHtmlIfChanged($("brain-history-list"), histHtml);
   }
 
   function render(d) {
+    if (d && typeof d.view_mode === "string") {
+      const nextAuth = d.view_mode === "admin";
+      if (nextAuth !== adminUnlocked) {
+        adminUnlocked = nextAuth;
+        updateAdminBtn();
+      }
+    }
     renderHeader(d);
     if (state.view === "overview") renderOverview(d);
     else if (state.view === "vault") renderVaultView(d);
     else if (state.view === "roster") renderRosterView(d);
     else if (state.view === "brain") renderBrainView(d);
+  }
+
+  let sseSource = null;
+  function connectStream() {
+    if (sseSource) {
+      try { sseSource.close(); } catch (_) {}
+      sseSource = null;
+    }
+    const es = new EventSource("/api/stream");
+    sseSource = es;
+    es.addEventListener("state", (ev) => {
+      try {
+        state.data = JSON.parse(ev.data);
+        $("sse-dot").classList.remove("stale");
+        render(state.data);
+      } catch (_) {}
+    });
+    es.onerror = () => {
+      $("sse-dot").classList.add("stale");
+    };
   }
 
   async function init() {
@@ -1376,17 +1426,7 @@
       }
     } catch (_) {}
 
-    const es = new EventSource("/api/stream");
-    es.addEventListener("state", (ev) => {
-      try {
-        state.data = JSON.parse(ev.data);
-        $("sse-dot").classList.remove("stale");
-        render(state.data);
-      } catch (_) {}
-    });
-    es.onerror = () => {
-      $("sse-dot").classList.add("stale");
-    };
+    connectStream();
   }
 
   init();
