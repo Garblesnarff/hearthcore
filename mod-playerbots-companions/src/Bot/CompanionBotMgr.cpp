@@ -10,6 +10,7 @@
 #include "CompanionCraft.h"
 #include "CompanionClassStrategy.h"
 #include "CompanionGatherStrategy.h"
+#include "CompanionLeadStrategy.h"
 #include "CompanionDuty.h"
 #include "CompanionLease.h"
 #include "CompanionLife.h"
@@ -1411,9 +1412,9 @@ void CompanionBotMgr::ApplyLeadStrategies(PlayerbotAI* botAI)
     bool dungeon = bot->GetMap() && (bot->GetMap()->IsDungeon() || bot->GetMap()->IsRaid());
     bool groupAllowed = IsGroupedWithOwner(bot) || (bot->GetMap() && bot->GetMap()->IsDungeon() && IsInAuthorizedCoopGroup(bot));
     bool on = dungeon && groupAllowed && LeadModeOn(bot->GetGUID().GetCounter());
-    bool tank = PlayerbotAI::IsTank(bot);
-    bool wantLead = on && tank;
-    bool wantAssist = on && !tank;
+    bool lead = on && CompanionLead::IsGroupLead(bot);
+    bool wantLead = on && lead;
+    bool wantAssist = on && !lead;
 
     auto sync = [botAI](char const* name, bool want, BotState state) {
         bool has = botAI->HasStrategy(name, state);
