@@ -27,6 +27,7 @@
 #include "ObjectMgr.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotAIConfig.h"
+#include "Spell.h"
 
 #include <algorithm>
 #include <array>
@@ -43,6 +44,10 @@ constexpr uint32 ORGANIZE_COOLDOWN_SEC = 1800;         // auto-organize at most 
 constexpr uint32 MAX_PURGE_PER_VISIT = 8;              // leave daily withdraw slots for crafting withdrawals
 std::mutex gPickupMutex;
 std::unordered_map<uint32, uint32> gLastPickupSec;     // bot low guid -> last pickup attempt, game seconds
+std::unordered_map<uint32, uint32> gNothingSinceSec;   // bot low guid -> last scan that found nothing
+std::unordered_map<uint32, uint32> gLastLearnSec;      // bot low guid -> last recipe use
+constexpr uint32 RESCAN_SECONDS = 120;                 // duty evaluations must not rescan the bank every time
+constexpr uint32 LEARN_RETRY_SECONDS = 60;
 
 uint32 LearnSpellOf(ItemTemplate const* proto)
 {
@@ -58,6 +63,41 @@ bool HasEmptyBagSlot(Player* bot)
         if (!bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
             return true;
     return false;
+}
+
+// A free backpack or general-bag slot.
+bool FindFreeSlot(Player* bot, uint8& outBag, uint8& outSlot)
+{
+    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        if (!bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+        {
+            outBag = INVENTORY_SLOT_BAG_0;
+            outSlot = slot;
+            return true;
+        }
+    for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+    {
+        Bag* bag = static_cast<Bag*>(bot->GetItemByPos(INVENTORY_SLOT_BAG_0, bagSlot));
+        if (!bag || bag->GetTemplate()->SubClass != ITEM_SUBCLASS_CONTAINER)
+            continue;
+        for (uint32 i = 0; i < bag->GetBagSize(); ++i)
+            if (!bag->GetItemByPos(static_cast<uint8>(i)))
+            {
+                outBag = bagSlot;
+                outSlot = static_cast<uint8>(i);
+                return true;
+            }
+    }
+    return false;
+}
+
+bool IsLearnableRecipe(Player* bot, ItemTemplate const* proto)
+{
+    if (!proto || proto->Class != ITEM_CLASS_RECIPE)
+        return false;
+    uint32 const taught = LearnSpellOf(proto);
+    // CanUseItem enforces profession, skill rank, required spell and level.
+    return taught && !bot->HasSpell(taught) && bot->BotCanUseItem(proto) == EQUIP_ERR_OK;
 }
 
 bool PickupEnabled()
@@ -729,7 +769,9 @@ bool GuildBankAction::HasPickup()
 {
     uint32 const guildId = bot->GetGuildId();
     Guild* guild = guildId ? sGuildMgr->GetGuildById(guildId) : nullptr;
-    if (!guild || !PickupEnabled() || !bot->GetFreeInventorySpace())
+    uint8 freeBag = NULL_BAG;
+    uint8 freeSlot = NULL_SLOT;
+    if (!guild || !PickupEnabled() || !FindFreeSlot(bot, freeBag, freeSlot))
         return false;
 
     uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
@@ -737,6 +779,9 @@ bool GuildBankAction::HasPickup()
         std::lock_guard<std::mutex> lock(gPickupMutex);
         auto it = gLastPickupSec.find(bot->GetGUID().GetCounter());
         if (it != gLastPickupSec.end() && now - it->second < CompanionBankPickup::RETRY_SECONDS)
+            return false;
+        auto none = gNothingSinceSec.find(bot->GetGUID().GetCounter());
+        if (none != gNothingSinceSec.end() && now - none->second < RESCAN_SECONDS)
             return false;
     }
 
@@ -748,7 +793,50 @@ bool GuildBankAction::HasPickup()
         if (guild->MemberHasTabRights(bot->GetGUID(), bankSlot.tab, GUILD_BANK_RIGHT_VIEW_TAB) &&
             PickupKind(bankSlot) != static_cast<uint8>(CompanionBankPickup::Kind::None))
             return true;
+    std::lock_guard<std::mutex> lock(gPickupMutex);
+    gNothingSinceSec[bot->GetGUID().GetCounter()] = now;
     return false;
+}
+
+void GuildBankAction::LearnCarriedRecipe()
+{
+    if (!PickupEnabled() || !bot->IsAlive() || bot->IsInCombat() || bot->IsInFlight() || bot->GetVehicle() ||
+        bot->IsNonMeleeSpellCast(false))
+        return;
+
+    std::vector<Item*> carried;
+    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        if (Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            carried.push_back(item);
+    for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+        if (Bag* bag = static_cast<Bag*>(bot->GetItemByPos(INVENTORY_SLOT_BAG_0, bagSlot)))
+            for (uint32 i = 0; i < bag->GetBagSize(); ++i)
+                if (Item* item = bag->GetItemByPos(static_cast<uint8>(i)))
+                    carried.push_back(item);
+
+    for (Item* item : carried)
+    {
+        ItemTemplate const* proto = item->GetTemplate();
+        if (!IsLearnableRecipe(bot, proto) || bot->CanUseItem(item) != EQUIP_ERR_OK)
+            continue;
+
+        uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+        {
+            std::lock_guard<std::mutex> lock(gPickupMutex);
+            uint32& last = gLastLearnSec[bot->GetGUID().GetCounter()];
+            if (last && now - last < LEARN_RETRY_SECONDS)
+                return;
+            last = now;
+        }
+        if (bot->isMoving())
+            bot->StopMoving();
+        // The stock item-use path (as the mount project uses): it checks, teaches and consumes the recipe.
+        SpellCastTargets targets;
+        targets.SetUnitTarget(bot);
+        LOG_INFO("playerbots", "[Companion] {} using recipe {}", bot->GetName(), proto->ItemId);
+        bot->CastItemUseSpell(item, targets, 1, 0);
+        return;
+    }
 }
 
 void GuildBankAction::RunPickup(std::vector<CompanionDuty::BankSlot> const& slots, std::set<uint8> const& viewTabs,
@@ -780,36 +868,30 @@ void GuildBankAction::RunPickup(std::vector<CompanionDuty::BankSlot> const& slot
             (kind == CompanionBankPickup::Kind::Gear && gear >= CompanionBankPickup::MAX_GEAR_PER_VISIT))
             continue;
 
-        uint8 freeSlot = NULL_SLOT;
-        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
-            if (!bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
-            {
-                freeSlot = slot;
-                break;
-            }
-        if (freeSlot == NULL_SLOT)
-            return;   // backpack full
+        uint8 toBag = NULL_BAG;
+        uint8 toSlot = NULL_SLOT;
+        if (!FindFreeSlot(bot, toBag, toSlot))
+            return;   // bags full
 
-        // This exact bank slot, one item. A refused move (rank daily limit) leaves the backpack slot empty.
-        guild->SwapItemsWithInventory(bot, true, bankSlot.tab, bankSlot.slot, INVENTORY_SLOT_BAG_0, freeSlot,
+        // This exact bank slot, one item. A refused move (rank daily limit) leaves the free slot empty.
+        guild->SwapItemsWithInventory(bot, true, bankSlot.tab, bankSlot.slot, toBag, toSlot,
                                       bankSlot.count > 1 ? 1 : 0);
-        Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, freeSlot);
-        if (!item || item->GetEntry() != bankSlot.entry)
+        Item* item = bot->GetItemByPos(toBag, toSlot);
+        if (!item)
             continue;
+        if (item->GetEntry() != bankSlot.entry)
+        {
+            // The bank slot changed after the snapshot: put it straight back so no vendor rule ever sees it.
+            guild->SwapItemsWithInventory(bot, false, bankSlot.tab, bankSlot.slot, toBag, toSlot, 0);
+            LOG_WARN("playerbots", "[Companion] {} bank pickup: slot changed, returned item to tab {}",
+                     bot->GetName(), static_cast<uint32>(bankSlot.tab));
+            continue;
+        }
         CompanionDuty::RecordLedger(bot->GetGUID().GetCounter(), "withdraw", bankSlot.entry, 1, bankSlot.tab,
                                     "bank pickup");
 
         if (kind == CompanionBankPickup::Kind::Recipe)
-        {
-            ++recipes;
-            uint32 const taught = LearnSpellOf(item->GetTemplate());
-            bot->learnSpell(taught, false);
-            // Same result as using the recipe: the spell is learned and the item is consumed.
-            if (bot->HasSpell(taught))
-                bot->DestroyItem(INVENTORY_SLOT_BAG_0, freeSlot, true);
-            LOG_INFO("playerbots", "[Companion] {} bank pickup: recipe {} learned={}", bot->GetName(),
-                     bankSlot.entry, bot->HasSpell(taught) ? 1 : 0);
-        }
+            ++recipes;   // learned from the bags by LearnCarriedRecipe
         else
         {
             kind == CompanionBankPickup::Kind::Bag ? ++bags : ++gear;

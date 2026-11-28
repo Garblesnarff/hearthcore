@@ -972,6 +972,7 @@ void CompanionDuty::Evaluate(PlayerbotAI* botAI)
     }
 
     // Something in the bank this companion would use (recipe, bag, gear upgrade) is a reason to visit on its own.
+    GuildBankAction(botAI).LearnCarriedRecipe();
     if (bankOk && bankNeed < PICKUP_BANK_NEED && GuildBankAction(botAI).HasPickup())
         bankNeed = PICKUP_BANK_NEED;
 

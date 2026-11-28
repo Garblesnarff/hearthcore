@@ -533,6 +533,13 @@ CompanionBrain::ItemClass CompanionBrain::ClassifyItem(PlayerbotAI* botAI, Item*
     }
     if (IsProfessionTool(proto))
         return ItemClass::KEEP;
+    // A recipe this companion can learn now stays until it is used (it is otherwise banked or sold).
+    if (proto->Class == ITEM_CLASS_RECIPE && botAI->IsCompanion() &&
+        botAI->GetBot()->BotCanUseItem(proto) == EQUIP_ERR_OK)
+        for (auto const& spell : proto->Spells)
+            if (spell.SpellTrigger == ITEM_SPELLTRIGGER_LEARN_SPELL_ID && spell.SpellId > 0 &&
+                !botAI->GetBot()->HasSpell(static_cast<uint32>(spell.SpellId)))
+                return ItemClass::KEEP;
     // Verified guild work-order delivery (Issue #27): a transferable item crafted for this companion's active
     // claimed work order must be classified BANK so RunCompanionBankDuty deposits it for verified receipt.
     if (Player* const orderBot = botAI->GetBot();

@@ -39,6 +39,8 @@ public:
     // True when the bank snapshot holds a recipe, bag or gear upgrade this companion would take, and it has not tried
     // in the last CompanionBankPickup::RETRY_SECONDS. Switch: AiPlayerbot.Companion.Bank.Pickup (default 1).
     bool HasPickup();
+    // Uses one learnable recipe the companion carries (looted or taken from the bank), when it is idle.
+    void LearnCarriedRecipe();
 
 private:
     uint8 PickupKind(CompanionDuty::BankSlot const& bankSlot);   // CompanionBankPickup::Kind as uint8
