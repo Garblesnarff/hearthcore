@@ -535,9 +535,19 @@ public:
     {
         uint32 nowSec = static_cast<uint32>(GameTime::GetGameTime().count());
         uint32 ownerLevel = sCompanionBotMgr.GetOwnerLevel();
-        uint32 lead = sPlayerbotAIConfig.companionLevelLead;
-        handler->PSendSysMessage("Companions: owner level {}, cap {} (lead {}), {} configured",
-                                 ownerLevel, ownerLevel + lead, lead, sCompanionBotMgr.CompanionNames().size());
+        uint32 lead = sCompanionBotMgr.LevelLead();
+        uint32 expCap = sCompanionBotMgr.ExpansionMaxLevel();
+        if (ownerLevel > 0)
+        {
+            uint32 effPrimaryCap = ownerLevel + lead;
+            if (expCap > 0 && effPrimaryCap > expCap)
+                effPrimaryCap = expCap;
+            handler->PSendSysMessage("Companions: primary owner level {}, cap {} (lead {}), {} configured",
+                                     ownerLevel, effPrimaryCap, lead, sCompanionBotMgr.CompanionNames().size());
+        }
+        else
+            handler->PSendSysMessage("Companions: primary owner level unknown/unconfigured (lead {}), {} configured",
+                                     lead, sCompanionBotMgr.CompanionNames().size());
 
         for (std::string const& name : sCompanionBotMgr.CompanionNames())
         {
@@ -581,10 +591,19 @@ public:
                             ++freeSlots;
             }
 
-            handler->PSendSysMessage("{}: level {}, cap {} ({}), zone {}, group {}, quests {}, free bag slots {}",
-                                     name, p->GetLevel(), ownerLevel + lead,
-                                     sCompanionBotMgr.OwnerLevelUnknown() ? "closed: owner level unknown"
-                                     : (sCompanionBotMgr.IsXpCapped(p) ? "reached" : "open"),
+            CompanionOwnerXpCap::BotXpCapResolution const capRes = sCompanionBotMgr.ResolveXpCapFor(p);
+            std::string capStatus;
+            if (capRes.failClosed)
+                capStatus = std::string("closed: ") + CompanionOwnerXpCap::ResolutionStateName(capRes.state);
+            else if (capRes.xpCapped)
+                capStatus = capRes.expansionCapped ? "reached (expansion cap)" : "reached";
+            else
+                capStatus = "open";
+
+            handler->PSendSysMessage("{}: level {}, owner {}, cap {} ({}), zone {}, group {}, quests {}, free bag slots {}",
+                                     name, p->GetLevel(),
+                                     capRes.ownerName.empty() ? "none" : capRes.ownerName,
+                                     capRes.capLevel, capStatus,
                                      zone,
                                      p->GetGroup() ? "yes" : "no", quests, freeSlots);
             handler->PSendSysMessage("  lead mode: {}, grouped with owner: {}",

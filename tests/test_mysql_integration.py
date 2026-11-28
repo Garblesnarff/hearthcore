@@ -244,7 +244,8 @@ class MySQLIntegrationTests(unittest.TestCase):
             guid INT PRIMARY KEY, account INT NOT NULL, name VARCHAR(32) NOT NULL,
             race TINYINT UNSIGNED NOT NULL DEFAULT 1, class TINYINT UNSIGNED NOT NULL DEFAULT 1,
             level TINYINT UNSIGNED NOT NULL, zone INT NOT NULL, map INT NOT NULL,
-            money INT NOT NULL, online TINYINT NOT NULL, xp INT NOT NULL
+            money INT NOT NULL, online TINYINT NOT NULL, xp INT NOT NULL,
+            deleteDate INT UNSIGNED DEFAULT NULL
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
         CREATE TABLE IF NOT EXISTS `{db_name}`.character_skills (
             guid INT NOT NULL, skill SMALLINT NOT NULL, value SMALLINT NOT NULL, max SMALLINT NOT NULL
@@ -464,7 +465,8 @@ class MySQLIntegrationTests(unittest.TestCase):
             race TINYINT NOT NULL DEFAULT 1, class TINYINT NOT NULL DEFAULT 1, gender TINYINT NOT NULL DEFAULT 0,
             level TINYINT UNSIGNED NOT NULL, xp INT NOT NULL DEFAULT 0, money INT NOT NULL DEFAULT 0,
             zone INT NOT NULL DEFAULT 0, map INT NOT NULL DEFAULT 0, online TINYINT NOT NULL DEFAULT 0,
-            totaltime INT NOT NULL DEFAULT 0, health INT NOT NULL DEFAULT 100, power1 INT NOT NULL DEFAULT 0
+            totaltime INT NOT NULL DEFAULT 0, health INT NOT NULL DEFAULT 100, power1 INT NOT NULL DEFAULT 0,
+            deleteDate INT UNSIGNED DEFAULT NULL
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
         DROP TABLE IF EXISTS `{db_name}`.character_inventory;
         CREATE TABLE `{db_name}`.character_inventory (guid INT, bag INT, slot TINYINT, item INT);
@@ -500,7 +502,7 @@ class MySQLIntegrationTests(unittest.TestCase):
         INSERT IGNORE INTO acore_world.quest_template (ID, QuestLevel, LogTitle) VALUES (501, 30, 'Steel of Ironforge');
         INSERT IGNORE INTO acore_world.player_xp_for_level (level, Experience) VALUES (33, 48600);
 
-        INSERT INTO `{db_name}`.characters VALUES
+        INSERT INTO `{db_name}`.characters (guid, account, name, race, class, gender, level, xp, money, zone, map, online, totaltime, health, power1) VALUES
             (101, 2, 'Brannoc', 4, 1, 1, 33, 3397, 761128, 1519, 0, 1, 72000, 1588, 0);
         INSERT INTO `{db_name}`.companion_schedule (name, shift_group, start_hour, end_hour, days_mask, always_online, note)
             VALUES ('Brannoc', 'core-wonky', 0, 24, 127, 1, 'Core tank');
