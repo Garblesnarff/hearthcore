@@ -52,6 +52,7 @@ struct Candidate
     bool teachesSpell = false;    // recipe has a learn spell
     bool knowsSpell = false;
     bool emptyBagSlot = false;
+    bool biggerBag = false;       // larger than the smallest equipped general bag
     bool isUpgrade = false;       // item usage says equip / replace
     bool equipAllowed = false;    // companion equip rules (heirlooms, armor type)
 };
@@ -63,7 +64,7 @@ inline Kind Decide(Candidate const& c)
     if (c.itemClass == CLASS_RECIPE)
         return c.teachesSpell && !c.knowsSpell ? Kind::Recipe : Kind::None;
     if (c.itemClass == CLASS_CONTAINER)
-        return c.subClass == SUBCLASS_GENERAL_BAG && c.emptyBagSlot ? Kind::Bag : Kind::None;
+        return c.subClass == SUBCLASS_GENERAL_BAG && (c.emptyBagSlot || c.biggerBag) ? Kind::Bag : Kind::None;
     if (c.itemClass == CLASS_WEAPON || c.itemClass == CLASS_ARMOR)
         return c.isUpgrade && c.equipAllowed ? Kind::Gear : Kind::None;
     return Kind::None;

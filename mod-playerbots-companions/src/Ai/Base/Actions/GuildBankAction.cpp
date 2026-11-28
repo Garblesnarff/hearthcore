@@ -65,8 +65,25 @@ bool HasEmptyBagSlot(Player* bot)
     return false;
 }
 
-// A free backpack or general-bag slot.
-bool FindFreeSlot(Player* bot, uint8& outBag, uint8& outSlot)
+// The equipped general bag with the fewest slots, if it has fewer than size; NULL_SLOT otherwise.
+uint8 SmallerBagSlot(Player* bot, uint32 size)
+{
+    uint8 result = NULL_SLOT;
+    uint32 smallest = size;
+    for (uint8 slot = INVENTORY_SLOT_BAG_START; slot < INVENTORY_SLOT_BAG_END; ++slot)
+    {
+        Bag* bag = static_cast<Bag*>(bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
+        if (bag && bag->GetTemplate()->SubClass == ITEM_SUBCLASS_CONTAINER && bag->GetBagSize() < smallest)
+        {
+            smallest = bag->GetBagSize();
+            result = slot;
+        }
+    }
+    return result;
+}
+
+// A free backpack or general-bag slot, never one inside excludeBag.
+bool FindFreeSlot(Player* bot, uint8& outBag, uint8& outSlot, uint8 excludeBag = NULL_SLOT)
 {
     for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
         if (!bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
@@ -78,7 +95,7 @@ bool FindFreeSlot(Player* bot, uint8& outBag, uint8& outSlot)
     for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
     {
         Bag* bag = static_cast<Bag*>(bot->GetItemByPos(INVENTORY_SLOT_BAG_0, bagSlot));
-        if (!bag || bag->GetTemplate()->SubClass != ITEM_SUBCLASS_CONTAINER)
+        if (bagSlot == excludeBag || !bag || bag->GetTemplate()->SubClass != ITEM_SUBCLASS_CONTAINER)
             continue;
         for (uint32 i = 0; i < bag->GetBagSize(); ++i)
             if (!bag->GetItemByPos(static_cast<uint8>(i)))
@@ -102,7 +119,9 @@ bool IsLearnableRecipe(Player* bot, ItemTemplate const* proto)
 
 bool PickupEnabled()
 {
-    return sConfigMgr->GetOption<bool>("AiPlayerbot.Companion.Bank.Pickup", true, false);
+    // Read once: this is on the duty evaluation path.
+    static bool const enabled = sConfigMgr->GetOption<bool>("AiPlayerbot.Companion.Bank.Pickup", true, false);
+    return enabled;
 }
 }  // namespace
 
@@ -753,7 +772,10 @@ uint8 GuildBankAction::PickupKind(CompanionDuty::BankSlot const& bankSlot)
         c.knowsSpell = taught && bot->HasSpell(taught);
     }
     else if (proto->Class == ITEM_CLASS_CONTAINER)
+    {
         c.emptyBagSlot = HasEmptyBagSlot(bot);
+        c.biggerBag = SmallerBagSlot(bot, proto->ContainerSlots) != NULL_SLOT;
+    }
     else
     {
         std::string const qualifier =
@@ -868,10 +890,22 @@ void GuildBankAction::RunPickup(std::vector<CompanionDuty::BankSlot> const& slot
             (kind == CompanionBankPickup::Kind::Gear && gear >= CompanionBankPickup::MAX_GEAR_PER_VISIT))
             continue;
 
+        // With no empty bag slot, a bag replaces the smallest one; it must not be withdrawn into that bag.
+        uint8 replaceSlot = NULL_SLOT;
+        if (kind == CompanionBankPickup::Kind::Bag && !HasEmptyBagSlot(bot))
+        {
+            ItemTemplate const* bagProto = sObjectMgr->GetItemTemplate(bankSlot.entry);
+            replaceSlot = bagProto ? SmallerBagSlot(bot, bagProto->ContainerSlots) : NULL_SLOT;
+        }
+
         uint8 toBag = NULL_BAG;
         uint8 toSlot = NULL_SLOT;
-        if (!FindFreeSlot(bot, toBag, toSlot))
-            return;   // bags full
+        if (!FindFreeSlot(bot, toBag, toSlot, replaceSlot))
+        {
+            if (replaceSlot != NULL_SLOT)
+                continue;   // no room outside the bag to be replaced
+            return;         // bags full
+        }
 
         // This exact bank slot, one item. A refused move (rank daily limit) leaves the free slot empty.
         guild->SwapItemsWithInventory(bot, true, bankSlot.tab, bankSlot.slot, toBag, toSlot,
@@ -895,7 +929,11 @@ void GuildBankAction::RunPickup(std::vector<CompanionDuty::BankSlot> const& slot
         else
         {
             kind == CompanionBankPickup::Kind::Bag ? ++bags : ++gear;
-            EquipAction(botAI).EquipItems({bankSlot.entry});
+            if (replaceSlot != NULL_SLOT)
+                // The core moves the old bag's contents into the new, empty one and leaves the old bag here.
+                bot->SwapItem((toBag << 8) | toSlot, (INVENTORY_SLOT_BAG_0 << 8) | replaceSlot);
+            else
+                EquipAction(botAI).EquipItems({bankSlot.entry});
             LOG_INFO("playerbots", "[Companion] {} bank pickup: {} {}", bot->GetName(),
                      kind == CompanionBankPickup::Kind::Bag ? "bag" : "gear", bankSlot.entry);
         }

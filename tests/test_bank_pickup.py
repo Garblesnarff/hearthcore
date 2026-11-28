@@ -28,6 +28,7 @@ int main()
     CHECK(Decide(b) == Kind::Bag);
     b.subClass = 1; CHECK(Decide(b) == Kind::None);           // soul bag etc.
     b.subClass = 0; b.emptyBagSlot = false; CHECK(Decide(b) == Kind::None);
+    b.biggerBag = true; CHECK(Decide(b) == Kind::Bag);        // replaces a smaller bag
 
     Candidate g; g.itemClass = CLASS_ARMOR; g.canUse = true; g.isUpgrade = true; g.equipAllowed = true;
     CHECK(Decide(g) == Kind::Gear);
