@@ -6,5 +6,8 @@
 # on /api/state and /api/stream as well (while keeping minimal /api/kiosk available).
 [Service]
 # Environment=AZEROTH_WATCH_REQUIRE_AUTH_FOR_READS=1
+# Uncomment to show the full dashboard (AI Brain tab included) to every device that can reach it,
+# with no token. Controls that change anything still require the token.
+# Environment=AZEROTH_WATCH_OPEN_READS=1
 ExecStart=
 ExecStart=/usr/bin/taskset -c 0-1 /usr/bin/nice -n 15 /usr/bin/python3 %h/azeroth-watch/server.py --host 0.0.0.0 --port 8787 --interval 4.0
