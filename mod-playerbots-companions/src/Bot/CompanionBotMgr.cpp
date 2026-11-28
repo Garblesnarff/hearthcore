@@ -9,6 +9,7 @@
 #include "CompanionBrain.h"
 #include "CompanionCoopAuthLogic.h"
 #include "CompanionCoopDrainLogic.h"
+#include "CompanionCoopLifecycleLogic.h"
 #include "CompanionLfgBridgeLogic.h"
 #include "CompanionCraft.h"
 #include "CompanionClassStrategy.h"
@@ -1473,8 +1474,11 @@ void CompanionBotMgr::ApplyLeadStrategies(PlayerbotAI* botAI)
         return;
 
     bool dungeon = bot->GetMap() && (bot->GetMap()->IsDungeon() || bot->GetMap()->IsRaid());
-    bool groupAllowed = IsGroupedWithOwner(bot) || (bot->GetMap() && bot->GetMap()->IsNonRaidDungeon() && IsInAuthorizedCoopGroup(bot));
-    bool on = dungeon && groupAllowed && LeadModeOn(bot->GetGUID().GetCounter());
+    bool const ownerGroup = IsGroupedWithOwner(bot);
+    bool const coopDungeon = !ownerGroup && bot->GetMap() && bot->GetMap()->IsNonRaidDungeon() && IsInAuthorizedCoopGroup(bot);
+    // Issue #21: Authorized cooperative bot-only 5-player dungeon runs activate lead/assist automatically without
+    // requiring a human owner to toggle LeadModeOn (owner-grouped runs still obey LeadModeOn unchanged!).
+    bool on = dungeon && ((ownerGroup && LeadModeOn(bot->GetGUID().GetCounter())) || coopDungeon);
     bool lead = on && CompanionLead::IsGroupLead(bot);
     bool wantLead = on && lead;
     bool wantAssist = on && !lead;
@@ -1755,22 +1759,98 @@ void CompanionBotMgr::TickBot(PlayerbotAI* botAI)
         if (CompanionBrain::AuthorizeCoopGroup(bot, snap, /*allowQueueBind=*/true, &assemblyInProgress, &coopReason))
         {
             CompanionLease::RequestInterrupt(bot, CompanionLease::Interrupt::Group);
-            Player* leader = ObjectAccessor::FindConnectedPlayer(group->GetLeaderGUID());
-            bool const isLeader = (leader == bot);
-            if (botAI->GetCompanionMode() != PlayerbotAI::COMPANION_COOPERATIVE)
+            uint32 const botLow = bot->GetGUID().GetCounter();
+            uint64 oppId = 0;
+            uint32 targetMap = 0;
+            uint32 boundGroupId = 0;
+            bool const isBoundMember =
+                CompanionBrain::IsAuthorizedCoopMember(botLow, oppId, targetMap, boundGroupId);
+
+            // Issue #21: Evaluate full cooperative dungeon lifecycle (readiness, dynamic leader/master failover,
+            // boss completion + loot grace, bounded wipe/stall abort, and native LFG exit/return).
+            // P0-2 & P2-1: Only invoke lifecycle when bound with non-zero oppId & targetMap AND matching boundGroupId!
+            uint32 const curGroupId = group->GetGUID().GetCounter();
+            CompanionCoopLifecycle::MemberControlDecision ldec;
+            if (isBoundMember && oppId != 0 && targetMap != 0 &&
+                (boundGroupId == 0 || boundGroupId == curGroupId))
             {
-                if (isLeader)
-                    botAI->ChangeStrategy("-follow,-stay,-new rpg,-quest,-gather,-grind,-companion duty,-companion quest",
-                                          BOT_STATE_NON_COMBAT);
+                uint32 tankLeadGuid = 0;
+                if (bot->GetMap() && bot->GetMap()->IsNonRaidDungeon())
+                {
+                    if (Player* tankLead = CompanionLead::GroupLead(group, bot))
+                    {
+                        if (tankLead->GetMap() == bot->GetMap() && tankLead->IsAlive())
+                            tankLeadGuid = tankLead->GetGUID().GetCounter();
+                    }
+                }
+                ldec = CompanionBrain::EvaluateCoopLifecycleMember(bot, group, oppId, targetMap, tankLeadGuid);
+            }
+
+            if (ldec.action == CompanionCoopLifecycle::MemberAction::ExitCompleted ||
+                ldec.action == CompanionCoopLifecycle::MemberAction::ExitAborted)
+            {
+                LOG_INFO("playerbots",
+                         "[CompanionCoop] {} exiting cooperative group {} (opp #{}, outcome={}, reason={})",
+                         bot->GetName(), group->GetGUID().GetCounter(), ldec.opportunityId, ldec.outcomeState,
+                         ldec.outcomeReason);
+                // Native CMSG_GROUP_DISBAND -> LFGGroupScript::OnRemoveMember -> TeleportToEntryPoint()!
+                botAI->LeaveOrDisbandGroup();
+                return;
+            }
+
+            // P0-2: If not yet bound or lifecycle returned Ignore, fall back cleanly to native group leader without
+            // assigning +follow to everyone or churning strategies!
+            bool const useLifecycle = (ldec.action == CompanionCoopLifecycle::MemberAction::ContinueRun &&
+                                       ldec.effectiveLeaderGuid != 0);
+            uint32 const effLeaderGuid =
+                useLifecycle ? ldec.effectiveLeaderGuid : group->GetLeaderGUID().GetCounter();
+            bool const isEffLeader = (effLeaderGuid != 0 && effLeaderGuid == botLow);
+            bool const wantFollow = !isEffLeader && (effLeaderGuid != 0);
+
+            // Dynamic leader/follower strategy & master sync on EVERY tick (handles leader change/loss cleanly,
+            // eliminates conflicting solo movement, and keeps +loot active for real boss/quest drops!).
+            bool const enteringCoop = (botAI->GetCompanionMode() != PlayerbotAI::COMPANION_COOPERATIVE);
+            bool const hasFollow = botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT);
+            bool const hasSoloDrift = botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) ||
+                                      botAI->HasStrategy("quest", BOT_STATE_NON_COMBAT) ||
+                                      botAI->HasStrategy("gather", BOT_STATE_NON_COMBAT) ||
+                                      botAI->HasStrategy("grind", BOT_STATE_NON_COMBAT) ||
+                                      botAI->HasStrategy("companion duty", BOT_STATE_NON_COMBAT) ||
+                                      botAI->HasStrategy("companion quest", BOT_STATE_NON_COMBAT) ||
+                                      botAI->HasStrategy("stay", BOT_STATE_NON_COMBAT) ||
+                                      !botAI->HasStrategy("loot", BOT_STATE_NON_COMBAT);
+
+            if (enteringCoop || (useLifecycle && ldec.leaderChanged) || hasSoloDrift || (hasFollow != wantFollow))
+            {
+                if (isEffLeader)
+                    botAI->ChangeStrategy(
+                        "-follow,-stay,-new rpg,-quest,-gather,-grind,-companion duty,-companion quest,+loot",
+                        BOT_STATE_NON_COMBAT);
                 else
-                    botAI->ChangeStrategy("+follow,-stay,-new rpg,-quest,-gather,-grind,-companion duty,-companion quest",
-                                          BOT_STATE_NON_COMBAT);
+                    botAI->ChangeStrategy(
+                        "+follow,-stay,-new rpg,-quest,-gather,-grind,-companion duty,-companion quest,+loot",
+                        BOT_STATE_NON_COMBAT);
+            }
+            if (enteringCoop)
+            {
                 botAI->SetCompanionMode(PlayerbotAI::COMPANION_COOPERATIVE);
-                CompanionDuty::CompleteDuty(bot->GetGUID().GetCounter(), "cleared: cooperative dungeon group",
+                CompanionDuty::CompleteDuty(botLow, "cleared: cooperative dungeon group",
                                             CompanionDuty::DutyEnd::Interrupted, "interrupt:coop_group");
             }
-            if (!isLeader && leader && botAI->GetMaster() != leader)
-                botAI->SetMaster(leader);
+            if (isEffLeader)
+            {
+                if (botAI->GetMaster() != nullptr)
+                    botAI->SetMaster(nullptr);
+            }
+            else if (effLeaderGuid != 0)
+            {
+                ObjectGuid const leadObjGuid = ObjectGuid::Create<HighGuid::Player>(effLeaderGuid);
+                Player* effLeader = ObjectAccessor::GetPlayer(*bot, leadObjGuid);
+                if (!effLeader)
+                    effLeader = ObjectAccessor::FindConnectedPlayer(leadObjGuid);
+                if (effLeader && effLeader != bot && botAI->GetMaster() != effLeader)
+                    botAI->SetMaster(effLeader);
+            }
             return;
         }
         if (assemblyInProgress)

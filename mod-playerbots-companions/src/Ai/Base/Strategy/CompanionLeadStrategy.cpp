@@ -21,6 +21,7 @@
 #include "AttackersValue.h"
 #include "CellImpl.h"
 #include "CompanionBotMgr.h"
+#include "CompanionBrain.h"
 #include "CompanionDuty.h"
 #include "CompanionGatherStrategy.h"
 #include "Creature.h"
@@ -119,18 +120,18 @@ Unit* SkullUnit(PlayerbotAI* botAI, bool engaged)
     return IsPullable(bot, unit) ? unit : nullptr;
 }
 
-// Lead mode applies in a dungeon/raid grouped with the owner, OR in a 5-player dungeon when in an
-// authorized Phase II cooperative group (AiPlayerbot.Companion.Coop.Enabled=1).
+// Lead mode applies in a dungeon/raid grouped with the owner (when LeadModeOn), OR automatically in a 5-player
+// non-raid dungeon when in an authorized Phase II cooperative group (Issue #21: no human required to whisper "lead on").
 bool LeadActive(Player* bot)
 {
     if (!bot->GetMap() || !(bot->GetMap()->IsDungeon() || bot->GetMap()->IsRaid()))
         return false;
     CompanionBotMgr& mgr = sCompanionBotMgr;
-    if (!mgr.IsCompanion(bot) || !mgr.LeadModeOn(bot->GetGUID().GetCounter()))
+    if (!mgr.IsCompanion(bot))
         return false;
     if (mgr.IsGroupedWithOwner(bot))
-        return true;
-    return bot->GetMap()->IsDungeon() && !bot->GetMap()->IsRaid() && mgr.IsInAuthorizedCoopGroup(bot);
+        return mgr.LeadModeOn(bot->GetGUID().GetCounter());
+    return bot->GetMap()->IsNonRaidDungeon() && mgr.IsInAuthorizedCoopGroup(bot);
 }
 
 // Per-companion state written from map threads: gStateMutex covers per-bot/kill-order tables below.
@@ -161,20 +162,25 @@ Player* FindCompanionTank(Group* group, Player const* reference = nullptr)
     return (lead && lead->IsAlive()) ? lead : nullptr;
 }
 
-// Lead v2 (3c): healer is the group member with the heal role; if none, the owner.
+// Lead v2 (3c): healer is the same-map group member with the heal role; if none (and not coop), the owner.
+// Uses map-local ObjectAccessor::GetPlayer so cross-map-thread Player* dereferences never occur (P0-5!).
 Player* FindGroupHealer(Player* tank, Group* group)
 {
-    if (group)
+    if (group && tank)
     {
-        for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
+        for (Group::MemberSlot const& slot : group->GetMemberSlots())
         {
-            Player* member = itr->GetSource();
-            if (!member || member == tank || !member->IsInWorld())
+            if (slot.guid == tank->GetGUID())
+                continue;
+            Player* member = ObjectAccessor::GetPlayer(*tank, slot.guid);
+            if (!member || !member->IsInWorld())
                 continue;
             if (PlayerbotAI::IsHeal(member))
                 return member;
         }
     }
+    if (tank && !sCompanionBotMgr.IsGroupedWithOwner(tank) && sCompanionBotMgr.IsInAuthorizedCoopGroup(tank))
+        return nullptr;
     return sCompanionBotMgr.FindOwnerOnlineFor(tank);
 }
 
@@ -205,6 +211,8 @@ bool ReadyToPull(PlayerbotAI* botAI, bool withRange)
         return false;
 
     bool const coopGroup = !mgr.IsGroupedWithOwner(bot) && mgr.IsInAuthorizedCoopGroup(bot);
+    if (coopGroup && !CompanionBrain::IsCoopGroupReadyForPull(group))
+        return false;
     Player* owner = coopGroup ? FindGroupHealer(bot, group) : mgr.FindOwnerOnlineFor(bot);
     if (!owner)
         return false;
@@ -213,11 +221,27 @@ bool ReadyToPull(PlayerbotAI* botAI, bool withRange)
     uint32 now = static_cast<uint32>(GameTime::GetUptime().count());
     uint32 low = bot->GetGUID().GetCounter();
     bool ready = true;
-    for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
+    uint32 presentInDungeon = 0;
+    // P0-5 & P1-A: Resolve each member strictly via map-local ObjectAccessor::GetPlayer(*bot, slot.guid) so
+    // cross-map-thread Player* dereferences never occur! For coopGroup, fail closed on any missing/offline slot;
+    // for owner-led groups, preserve exact historical behavior (skip offline slots via null-check, wait for
+    // online members on another map!).
+    for (Group::MemberSlot const& slot : group->GetMemberSlots())
     {
-        Player* member = itr->GetSource();
-        if (!member)
+        Player* member = ObjectAccessor::GetPlayer(*bot, slot.guid);
+        if (!member || !member->IsInWorld())
+        {
+            if (coopGroup)
+            {
+                ready = false;
+            }
+            else if (ObjectAccessor::FindConnectedPlayer(slot.guid) != nullptr)
+            {
+                ready = false;  // online member on another map (pointer null-check only, no dereference)
+            }
             continue;
+        }
+        ++presentInDungeon;
         if (member->IsInCombat())
         {
             mgr.NoteGroupCombat(low, now);
@@ -229,18 +253,20 @@ bool ReadyToPull(PlayerbotAI* botAI, bool withRange)
             }
             ready = false;
         }
-        if (!member->IsAlive() || member->GetMapId() != bot->GetMapId() ||
-            member->GetHealthPct() < sPlayerbotAIConfig.companionLeadMinMemberHealthPct)
+        if (!member->IsAlive() || member->GetHealthPct() < sPlayerbotAIConfig.companionLeadMinMemberHealthPct)
             ready = false;
         if (PlayerbotAI::IsHeal(member) && IsDrinking(member))
             ready = false;
         // Phase 2: a companion gathering a node or skinning is not waited for (the group does not stop for it).
         // Lead v2: when HealerTether is on, the healer's distance/LOS is governed by the soft healer tether instead.
-        if (withRange && member != healer && member->GetMapId() == bot->GetMapId() &&
+        if (withRange && member != healer &&
             bot->GetDistance(member) > sPlayerbotAIConfig.companionLeadGroupRange &&
             !CompanionGather::IsGathering(member->GetGUID().GetCounter()))
             ready = false;
     }
+    // Issue #21: In cooperative bot-only runs, wait until ALL group member slots have loaded into the dungeon map!
+    if (coopGroup && presentInDungeon < group->GetMembersCount())
+        ready = false;
     if (!ready)
         return false;
 
@@ -666,17 +692,18 @@ ChainCache CachedChainCheck(PlayerbotAI* botAI)
     result.valid = true;
     Group* group = bot->GetGroup();
     CompanionBotMgr& mgr = sCompanionBotMgr;
-    Player* owner = mgr.FindOwnerOnlineFor(bot);
+    bool const coopGroup = !mgr.IsGroupedWithOwner(bot) && mgr.IsInAuthorizedCoopGroup(bot);
+    Player* anchor = coopGroup ? FindGroupHealer(bot, group) : mgr.FindOwnerOnlineFor(bot);
     if (!group)
         result.reason = "not in a group";
-    else if (!owner)
-        result.reason = "owner offline";
+    else if (!anchor)
+        result.reason = coopGroup ? "healer unavailable" : "owner offline";
     else
     {
-        uint32 maxMana = owner->GetMaxPower(POWER_MANA);
-        result.manaPct = maxMana ? owner->GetPower(POWER_MANA) * 100 / maxMana : 100;
+        uint32 maxMana = anchor->GetMaxPower(POWER_MANA);
+        result.manaPct = maxMana ? anchor->GetPower(POWER_MANA) * 100 / maxMana : 100;
         if (maxMana && result.manaPct < sPlayerbotAIConfig.companionChainMinHealerManaPct)
-            result.reason = "owner mana " + std::to_string(result.manaPct) + "%";
+            result.reason = (coopGroup ? "healer mana " : "owner mana ") + std::to_string(result.manaPct) + "%";
 
         std::vector<Unit*> engaged;
         for (GroupReference* itr = group->GetFirstMember(); itr != nullptr && result.reason.empty(); itr = itr->next())
@@ -717,8 +744,10 @@ Unit* ChainReturnUnit(PlayerbotAI* botAI)
     Unit* unit = botAI->GetUnit(guid);
     if (!unit || !unit->IsAlive() || !unit->IsEngagedBy(bot))
         return nullptr;
-    Player* owner = sCompanionBotMgr.FindOwnerOnlineFor(bot);
-    if (!owner || bot->GetMapId() != owner->GetMapId() || bot->GetDistance(owner) <= 10.0f)
+    CompanionBotMgr& mgr = sCompanionBotMgr;
+    bool const coopGroup = !mgr.IsGroupedWithOwner(bot) && mgr.IsInAuthorizedCoopGroup(bot);
+    Player* anchor = coopGroup ? FindGroupHealer(bot, bot->GetGroup()) : mgr.FindOwnerOnlineFor(bot);
+    if (!anchor || bot->GetMapId() != anchor->GetMapId() || bot->GetDistance(anchor) <= 10.0f)
         return nullptr;
     return unit;
 }
@@ -1747,7 +1776,18 @@ public:
     bool IsActive() override
     {
         CompanionLead::ClearKillOrderIfIdle(botAI);
-        return CompanionLead::PickPullTarget(botAI) != nullptr;
+        if (CompanionLead::PickPullTarget(botAI) != nullptr)
+            return true;
+        // Issue #21: In authorized cooperative bot-only dungeon runs, advance along verified dungeon progression
+        // waypoints when no pullable mob is within FindFarPull range (zero effect on owner-led groups!).
+        Player* bot = botAI->GetBot();
+        if (bot && !sCompanionBotMgr.IsGroupedWithOwner(bot) && sCompanionBotMgr.IsInAuthorizedCoopGroup(bot) &&
+            CompanionLead::IsGroupLead(bot) && ReadyToPull(botAI, false))
+        {
+            float wpX = 0.0f, wpY = 0.0f, wpZ = 0.0f;
+            return CompanionBrain::PeekCoopProgressionWaypoint(bot, wpX, wpY, wpZ);
+        }
+        return false;
     }
 };
 
@@ -1793,7 +1833,25 @@ public:
         bool far = false;
         Unit* target = CompanionLead::PickPullTarget(botAI, &far);
         if (!target)
+        {
+            // Issue #21: Cooperative bot-only in-instance traversal along verified wing waypoints when no pullable
+            // pack is within FindFarPull range (holds for followers & healer tether; zero effect on owner-led runs!).
+            if (bot && !sCompanionBotMgr.IsGroupedWithOwner(bot) && sCompanionBotMgr.IsInAuthorizedCoopGroup(bot) &&
+                CompanionLead::IsGroupLead(bot) && ReadyToPull(botAI, false))
+            {
+                if (GroupMemberBehind(bot))
+                {
+                    LogWaitingOnce(bot);
+                    return true;
+                }
+                if (!CheckHealerTetherForNewPull(botAI, bot->GetGroup()))
+                    return true;
+                float wpX = 0.0f, wpY = 0.0f, wpZ = 0.0f;
+                if (CompanionBrain::NextCoopProgressionWaypoint(bot, wpX, wpY, wpZ))
+                    return MoveTo(bot->GetMapId(), wpX, wpY, wpZ);
+            }
             return false;
+        }
 
         float pullRange = sPlayerbotAIConfig.companionLeadPullRange;
         if (far)
@@ -1826,7 +1884,19 @@ public:
             return botAI->CastSpell("charge", target);
         return Attack(target);
     }
-    bool isUseful() override { return CompanionLead::PickPullTarget(botAI) != nullptr; }
+    bool isUseful() override
+    {
+        if (CompanionLead::PickPullTarget(botAI) != nullptr)
+            return true;
+        Player* bot = botAI->GetBot();
+        if (bot && !sCompanionBotMgr.IsGroupedWithOwner(bot) && sCompanionBotMgr.IsInAuthorizedCoopGroup(bot) &&
+            CompanionLead::IsGroupLead(bot) && ReadyToPull(botAI, false))
+        {
+            float wpX = 0.0f, wpY = 0.0f, wpZ = 0.0f;
+            return CompanionBrain::PeekCoopProgressionWaypoint(bot, wpX, wpY, wpZ);
+        }
+        return false;
+    }
 
 private:
     void LogWaitingOnce(Player* bot)
@@ -1885,8 +1955,9 @@ public:
         if (!skull)
         {
             Unit* returning = ChainReturnUnit(botAI);
-            Player* owner = sCompanionBotMgr.FindOwnerOnlineFor(bot);
-            return returning && owner && MoveTo(owner, 8.0f);
+            bool const coopGroup = !sCompanionBotMgr.IsGroupedWithOwner(bot) && sCompanionBotMgr.IsInAuthorizedCoopGroup(bot);
+            Player* anchor = coopGroup ? FindGroupHealer(bot, bot->GetGroup()) : sCompanionBotMgr.FindOwnerOnlineFor(bot);
+            return returning && anchor && MoveTo(anchor, 8.0f);
         }
 
         uint32 low = bot->GetGUID().GetCounter();

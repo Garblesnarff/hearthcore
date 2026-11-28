@@ -10,6 +10,7 @@
 #include "CompanionCoopAdmissionLogic.h"
 #include "CompanionCoopAuthLogic.h"
 #include "CompanionCoopDrainLogic.h"
+#include "CompanionCoopLifecycleLogic.h"
 #include "CompanionLfgBridgeLogic.h"
 #include "CompanionDuty.h"
 #include "CompanionCraft.h"
@@ -28,6 +29,7 @@
 #include "AiObjectContext.h"
 #include "Bag.h"
 #include "Config.h"
+#include "Creature.h"
 #include "DBCStores.h"
 #include "DatabaseEnv.h"
 #include "GameTime.h"
@@ -130,6 +132,20 @@ std::atomic<bool> gHasNativeLfgColumns{false};
 bool gNativeLfgColumnsProbed = false;
 uint32 gCoopLfgTickTimer = 0;
 constexpr uint32 COOP_LFG_TICK_MS = 2000;
+
+// Issue #21: Native bot-only dungeon lifecycle, boss/loot evidence & bounded wipe recovery.
+struct PendingCoopOutcome
+{
+    uint64 opportunityId = 0;
+    std::string state;   // "completed" or "aborted"
+    std::string reason;  // compact <= 64 char token
+    uint8 retryCount = 0;
+};
+std::mutex gLifecycleMutex;
+CompanionCoopLifecycle::LifecycleController gLifecycleController;
+std::atomic<bool> gHasActiveLifecycleRuns{false};
+std::vector<PendingCoopOutcome> gPendingCoopOutcomes;  // guarded by gCoopQueueMutex
+std::unordered_set<uint64> gPendingCompletedOpps;      // guarded by gCoopQueueMutex (pruned on DB confirm!)
 
 std::string SanitizeSqlToken(std::string const& raw, size_t maxLen = 64)
 {
@@ -1727,8 +1743,217 @@ void CompanionBrain::OnCompanionLogout(uint32 botGuid)
     gPendingLfgEvents.push_back(std::move(ev));
 }
 
+void CompanionBrain::OnCoopCreatureKilled(Player const* killer, Creature const* killed)
+{
+    // Fast lock-free early exit when coop is OFF or no cooperative dungeon run is active (Must-Verify #2!).
+    if (!gHasActiveLifecycleRuns.load() || !killer || !killed || !sCompanionBotMgr.IsCompanion(killer) ||
+        sCompanionBotMgr.IsGroupedWithOwner(killer))
+        return;
+    Group const* group = killer->GetGroup();
+    if (!group || !killer->GetMap() || !killer->GetMap()->IsNonRaidDungeon())
+        return;
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    uint32 const groupId = group->GetGUID().GetCounter();
+    uint32 const mapId = killer->GetMapId();
+    uint32 const entry = killed->GetEntry();
+    bool const isBoss = killed->IsDungeonBoss();
+    bool completedFinalBoss = false;
+    {
+        std::lock_guard<std::mutex> lock(gLifecycleMutex);
+        completedFinalBoss = gLifecycleController.RecordCreatureKill(groupId, mapId, entry, isBoss, now);
+    }
+    if (completedFinalBoss)
+        LOG_INFO("playerbots", "[CompanionCoop] Group {} defeated final boss {} (entry {}) on map {} — starting loot grace",
+                 groupId, killed->GetName(), entry, mapId);
+}
+
+void CompanionBrain::OnCoopLootReceived(Player const* looter, uint32 itemEntry, uint32 count)
+{
+    if (!gHasActiveLifecycleRuns.load() || !looter || !itemEntry || !count || !sCompanionBotMgr.IsCompanion(looter) ||
+        sCompanionBotMgr.IsGroupedWithOwner(looter))
+        return;
+    Group const* group = looter->GetGroup();
+    if (!group || !looter->GetMap() || !looter->GetMap()->IsNonRaidDungeon())
+        return;
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    std::lock_guard<std::mutex> lock(gLifecycleMutex);
+    (void)gLifecycleController.RecordLootItem(group->GetGUID().GetCounter(), looter->GetMapId(), itemEntry, count, now);
+}
+
+void CompanionBrain::OnCoopMemberDied(Player const* victim)
+{
+    if (!gHasActiveLifecycleRuns.load() || !victim || !sCompanionBotMgr.IsCompanion(victim) ||
+        sCompanionBotMgr.IsGroupedWithOwner(victim))
+        return;
+    Group const* group = victim->GetGroup();
+    if (!group)
+        return;
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    std::lock_guard<std::mutex> lock(gLifecycleMutex);
+    gLifecycleController.RecordMemberDeath(group->GetGUID().GetCounter(), victim->GetGUID().GetCounter(), now);
+}
+
+bool CompanionBrain::IsCoopGroupReadyForPull(Group const* group)
+{
+    if (!group || !gHasActiveLifecycleRuns.load())
+        return false;
+    std::lock_guard<std::mutex> lock(gLifecycleMutex);
+    return gLifecycleController.IsGroupReadyForPull(group->GetGUID().GetCounter());
+}
+
+bool CompanionBrain::PeekCoopProgressionWaypoint(Player const* bot, float& outX, float& outY, float& outZ)
+{
+    if (!gHasActiveLifecycleRuns.load() || !bot || !bot->GetMap() || !bot->GetMap()->IsNonRaidDungeon() ||
+        sCompanionBotMgr.IsGroupedWithOwner(bot))
+        return false;
+    Group const* group = bot->GetGroup();
+    if (!group)
+        return false;
+    std::lock_guard<std::mutex> lock(gLifecycleMutex);
+    return gLifecycleController.PeekProgressionWaypoint(group->GetGUID().GetCounter(), bot->GetMapId(),
+                                                        bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+                                                        outX, outY, outZ);
+}
+
+bool CompanionBrain::NextCoopProgressionWaypoint(Player const* bot, float& outX, float& outY, float& outZ)
+{
+    if (!gHasActiveLifecycleRuns.load() || !bot || !bot->GetMap() || !bot->GetMap()->IsNonRaidDungeon() ||
+        sCompanionBotMgr.IsGroupedWithOwner(bot))
+        return false;
+    Group const* group = bot->GetGroup();
+    if (!group)
+        return false;
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    std::lock_guard<std::mutex> lock(gLifecycleMutex);
+    return gLifecycleController.NextProgressionWaypoint(group->GetGUID().GetCounter(), bot->GetMapId(),
+                                                        bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+                                                        now, outX, outY, outZ);
+}
+
+CompanionCoopLifecycle::MemberControlDecision CompanionBrain::EvaluateCoopLifecycleMember(
+    Player const* bot, Group const* group, uint64 opportunityId, uint32 targetMapId, uint32 electedTankLeadGuid)
+{
+    CompanionCoopLifecycle::MemberControlDecision empty;
+    if (!bot || !group || !opportunityId || !targetMapId)
+        return empty;
+
+    CompanionCoopLifecycle::MemberControlInput in;
+    in.botGuid = bot->GetGUID().GetCounter();
+    in.opportunityId = opportunityId;
+    in.groupId = group->GetGUID().GetCounter();
+    in.targetMapId = targetMapId;
+    in.isLfgGroup = group->isLFGGroup();
+    in.groupedWithOwner = sCompanionBotMgr.IsGroupedWithOwner(bot);
+    in.botInTargetDungeon = (bot->GetMap() && bot->GetMap()->IsNonRaidDungeon() && bot->GetMapId() == targetMapId);
+    in.botInCombat = bot->IsInCombat();
+    in.botDead = bot->isDead();
+    in.nativeLeaderGuid = group->GetLeaderGUID().GetCounter();
+    in.electedTankLeadGuid = electedTankLeadGuid;
+
+    // P0-5 & P1-1: Resolve ONLY the <=5 group slots via map-local ObjectAccessor::GetPlayer(*bot, slot.guid) —
+    // O(5) cost, ZERO continent-wide GetPlayers() scans, and ZERO cross-map-thread Player* dereferences!
+    in.groupInCombat = in.botInCombat;
+    for (Group::MemberSlot const& slot : group->GetMemberSlots())
+    {
+        uint32 const low = slot.guid.GetCounter();
+        if (sCompanionBotMgr.IsAnyOwnerLow(low) || !sCompanionBotMgr.IsCompanionSlot(slot.guid, slot.name))
+        {
+            in.hasHumanMember = true;
+            break;
+        }
+        in.memberSlotGuids.push_back(low);
+        if (!in.groupInCombat)
+        {
+            if (Player* peer = ObjectAccessor::GetPlayer(*bot, slot.guid))
+            {
+                if (peer->IsInCombat())
+                    in.groupInCombat = true;
+            }
+        }
+    }
+    in.totalMemberSlots = static_cast<uint32>(in.memberSlotGuids.size());
+
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    static CompanionCoopLifecycle::LifecycleConfig const kCfg = []()
+    {
+        CompanionCoopLifecycle::LifecycleConfig c;
+        c.entryTimeoutSec = sConfigMgr->GetOption<uint32>(
+            "AiPlayerbot.Companion.Coop.EntryTimeoutSeconds", CompanionCoopLifecycle::DEFAULT_ENTRY_TIMEOUT_SEC, false);
+        c.postBossLootGraceSec = sConfigMgr->GetOption<uint32>(
+            "AiPlayerbot.Companion.Coop.PostBossLootGraceSeconds",
+            CompanionCoopLifecycle::DEFAULT_POST_BOSS_LOOT_GRACE_SEC, false);
+        c.maxWipes = sConfigMgr->GetOption<uint32>(
+            "AiPlayerbot.Companion.Coop.MaxWipes", CompanionCoopLifecycle::DEFAULT_MAX_COOP_WIPES, false);
+        c.wipeRecoveryTimeoutSec = sConfigMgr->GetOption<uint32>(
+            "AiPlayerbot.Companion.Coop.WipeRecoveryTimeoutSeconds",
+            CompanionCoopLifecycle::DEFAULT_WIPE_RECOVERY_TIMEOUT_SEC, false);
+        c.stallTimeoutSec = sConfigMgr->GetOption<uint32>(
+            "AiPlayerbot.Companion.Coop.StallTimeoutSeconds", CompanionCoopLifecycle::DEFAULT_STALL_TIMEOUT_SEC, false);
+        c.exitRetrySec = sConfigMgr->GetOption<uint32>(
+            "AiPlayerbot.Companion.Coop.ExitRetrySeconds", CompanionCoopLifecycle::DEFAULT_EXIT_RETRY_SEC, false);
+        return c;
+    }();
+
+    CompanionCoopLifecycle::MemberControlDecision dec;
+    std::string dbState;
+    std::string dbReason;
+    bool queueOutcomeWrite = false;
+    {
+        std::lock_guard<std::mutex> lock(gLifecycleMutex);
+        dec = gLifecycleController.EvaluateMember(in, now, kCfg);
+        gHasActiveLifecycleRuns.store(gLifecycleController.HasActiveRuns());
+        if (dec.action == CompanionCoopLifecycle::MemberAction::ExitCompleted ||
+            dec.action == CompanionCoopLifecycle::MemberAction::ExitAborted)
+        {
+            queueOutcomeWrite = gLifecycleController.ClaimTerminalDbWrite(opportunityId, dbState, dbReason);
+        }
+    }
+    if (queueOutcomeWrite)
+    {
+        // Admission token is released on the world thread in FlushCoopGroupMutations / OnNativeGroupDisbanded
+        // (never early from a map thread while members are still inside the dungeon!).
+        std::lock_guard<std::mutex> qlock(gCoopQueueMutex);
+        gPendingCoopOutcomes.push_back(PendingCoopOutcome{opportunityId, dbState, dbReason, 0});
+        if (dbState == "completed")
+            gPendingCompletedOpps.insert(opportunityId);
+    }
+    return dec;
+}
+
 void CompanionBrain::TickCoopLfgOnWorldThread()
 {
+    // Issue #21: Poll native LFG_STATE_FINISHED_DUNGEON for active cooperative groups SAFELY on the world thread
+    // (ZERO map-thread sLFGMgr reads!). Requires real in-instance kill evidence inside ObserveLfgDungeonFinished.
+    {
+        std::vector<uint32> activeGroupIds;
+        {
+            std::lock_guard<std::mutex> lock(gLifecycleMutex);
+            activeGroupIds = gLifecycleController.ActiveGroupIds();
+        }
+        if (!activeGroupIds.empty())
+        {
+            uint32 const nowSec = static_cast<uint32>(GameTime::GetGameTime().count());
+            for (uint32 gid : activeGroupIds)
+            {
+                Group const* grp = sGroupMgr->GetGroupByGUID(gid);
+                if (!grp || !grp->isLFGGroup())
+                    continue;
+                if (sLFGMgr->GetState(grp->GetGUID()) == lfg::LFG_STATE_FINISHED_DUNGEON)
+                {
+                    bool newlyCompleted = false;
+                    {
+                        std::lock_guard<std::mutex> lock(gLifecycleMutex);
+                        newlyCompleted = gLifecycleController.ObserveLfgDungeonFinished(gid, nowSec);
+                    }
+                    if (newlyCompleted)
+                        LOG_INFO("playerbots",
+                                 "[CompanionCoop] World thread observed native LFG_STATE_FINISHED_DUNGEON for group {}",
+                                 gid);
+                }
+            }
+        }
+    }
+
     bool const enabled = CoopEnabled();
     bool hasTracked = false;
     std::unordered_set<uint32> candidateGuids;
@@ -2085,10 +2310,37 @@ void CompanionBrain::OnNativeGroupDisbanded(Group const* group)
             drainedOppIds.insert(dr.opportunityId);
     }
 
-    // Also include opportunities just drained by OnRemoveMember (e.g. LFG auto-disband right after last member left!)
+    // P0-4: Force-claim any unclaimed CompletedLootGrace / CompletedExitPending / AbortedExitPending outcome BEFORE
+    // RemoveGroup so a disband during loot grace NEVER leaves companion_opportunities stuck in 'active'!
+    uint64 completedOppId = 0;
+    uint64 forcedOppId = 0;
+    std::string forcedState;
+    std::string forcedReason;
+    bool forcedClaimed = false;
+    {
+        std::lock_guard<std::mutex> lock(gLifecycleMutex);
+        (void)gLifecycleController.IsCompletedGroup(groupId, &completedOppId);
+        forcedClaimed = gLifecycleController.ForceClaimTerminalOnDisband(groupId, forcedOppId, forcedState, forcedReason);
+        gLifecycleController.RemoveGroup(groupId);
+        gHasActiveLifecycleRuns.store(gLifecycleController.HasActiveRuns());
+    }
+    if (completedOppId != 0)
+        drainedOppIds.insert(completedOppId);
+    if (forcedClaimed && forcedOppId != 0)
+    {
+        // P2-4: Admission token is released by FlushCoopGroupMutations after DB readback confirms; shield BOTH
+        // completed AND aborted forced outcomes in drainedOppIds so disband fallback never overwrites the specific reason!
+        drainedOppIds.insert(forcedOppId);
+        std::lock_guard<std::mutex> qlock(gCoopQueueMutex);
+        gPendingCoopOutcomes.push_back(PendingCoopOutcome{forcedOppId, forcedState, forcedReason, 0});
+        if (forcedState == "completed")
+            gPendingCompletedOpps.insert(forcedOppId);
+    }
     {
         std::lock_guard<std::mutex> lock(gCoopQueueMutex);
         for (uint64 oid : gPendingDrainedOpps)
+            drainedOppIds.insert(oid);
+        for (uint64 oid : gPendingCompletedOpps)
             drainedOppIds.insert(oid);
     }
 
@@ -2153,21 +2405,23 @@ void CompanionBrain::FlushCoopGroupMutations()
     std::vector<PendingCoopDisband> disbands;
     std::vector<PendingCoopBind> binds;
     std::vector<PendingCoopExit> exits;
+    std::vector<PendingCoopOutcome> outcomes;
     std::vector<CompanionLfgBridge::LfgLifecycleEvent> lfgEvents;
     {
         std::lock_guard<std::mutex> lock(gCoopQueueMutex);
         // When mode != Enabled (Draining or Off), cancel all pending uncommitted binds immediately while
-        // STILL retaining disbands, safe-boundary exit releases, and LFG decline/cancel events!
+        // STILL retaining disbands, safe-boundary exit releases, terminal outcomes, and LFG decline/cancel events!
         if (!CompanionCoopDrain::AllowsNewAdmissions(mode))
         {
             gPendingCoopBinds.clear();
             gFailedBindCooldown.clear();
         }
         if (gPendingCoopDisbands.empty() && gPendingCoopBinds.empty() && gPendingCoopExits.empty() &&
-            gPendingLfgEvents.empty())
+            gPendingCoopOutcomes.empty() && gPendingLfgEvents.empty())
             return;
         disbands.swap(gPendingCoopDisbands);
         exits.swap(gPendingCoopExits);
+        outcomes.swap(gPendingCoopOutcomes);
         lfgEvents.swap(gPendingLfgEvents);
         binds.reserve(gPendingCoopBinds.size());
         for (auto& [oppId, req] : gPendingCoopBinds)
@@ -2175,14 +2429,17 @@ void CompanionBrain::FlushCoopGroupMutations()
         gPendingCoopBinds.clear();
     }
 
-    // Issue #22: Defer exits, disbands, LFG events AND binds while DB is unhealthy so no writes are lost during outages
-    // and disbands can never race ahead of deferred drained exits!
+    // Issue #22: Defer exits, outcomes, disbands, LFG events AND binds while DB is unhealthy so no writes are lost
+    // during outages and disbands can never race ahead of deferred drained/completed outcomes!
     auto restoreDeferred = [&](std::vector<PendingCoopExit>& remExits)
     {
         std::lock_guard<std::mutex> lock(gCoopQueueMutex);
         if (!remExits.empty())
             gPendingCoopExits.insert(gPendingCoopExits.begin(), std::make_move_iterator(remExits.begin()),
                                      std::make_move_iterator(remExits.end()));
+        if (!outcomes.empty())
+            gPendingCoopOutcomes.insert(gPendingCoopOutcomes.begin(), std::make_move_iterator(outcomes.begin()),
+                                        std::make_move_iterator(outcomes.end()));
         if (!disbands.empty())
             gPendingCoopDisbands.insert(gPendingCoopDisbands.begin(), std::make_move_iterator(disbands.begin()),
                                         std::make_move_iterator(disbands.end()));
@@ -2205,6 +2462,96 @@ void CompanionBrain::FlushCoopGroupMutations()
 
     uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
     uint32 const graceSec = sConfigMgr->GetOption<uint32>("AiPlayerbot.Companion.Coop.ExitGraceMinutes", 10, false) * 60;
+
+    // Issue #21: Persist terminal dungeon completion / bounded abort outcomes BEFORE disbands, with DB readback
+    // confirmation (P2), <=64-char reason_code truncation (Must-Verify #8), and gPendingCompletedOpps pruning (P0-6)!
+    std::unordered_set<uint64> confirmedTerminalOpps;
+    std::vector<PendingCoopOutcome> retryOutcomes;
+    bool dbFailedDuringOutcomes = false;
+    for (size_t idx = 0; idx < outcomes.size(); ++idx)
+    {
+        PendingCoopOutcome& out = outcomes[idx];
+        if (!out.opportunityId)
+            continue;
+        if (dbFailedDuringOutcomes)
+        {
+            // P2-3: DB already failed in this pass; defer remaining outcomes without hammering a dead DB!
+            retryOutcomes.push_back(std::move(out));
+            continue;
+        }
+        bool const isComp = (out.state == "completed");
+        char const* dbState = isComp ? "completed" : "aborted";
+        char const* memberState = isComp ? "completed" : "released";
+        std::string const safeReasonCode = SanitizeSqlToken(out.reason, 64);
+        std::string const safeOutcomeReason = SanitizeSqlToken(out.reason, 110);
+        CharacterDatabase.DirectExecute(Acore::StringFormat(
+            "UPDATE companion_opportunity_interests SET state = '{}', reason_code = '{}', "
+            "reserved_until = 0, updated_at = {} "
+            "WHERE opportunity_id = {} AND state IN ('reserved', 'accepted', 'active')",
+            memberState, safeReasonCode, now, out.opportunityId));
+        CharacterDatabase.DirectExecute(Acore::StringFormat(
+            "UPDATE companion_opportunities SET state = '{}', group_guid = 0, outcome_reason = '{}' "
+            "WHERE id = {} AND is_shadow = 0 AND state IN ('assembling', 'active')",
+            dbState, safeOutcomeReason, out.opportunityId));
+        QueryResult oConfirm = CharacterDatabase.Query(Acore::StringFormat(
+            "SELECT state FROM companion_opportunities WHERE id = {}", out.opportunityId));
+        bool persisted = false;
+        if (oConfirm)
+        {
+            persisted = !CompanionCoopAuth::IsActiveRunState(oConfirm->Fetch()[0].Get<std::string>());
+        }
+        else if (CharacterDatabase.Query("SELECT 1"))
+        {
+            persisted = true;  // DB healthy, row pruned/deleted
+        }
+        else
+        {
+            dbFailedDuringOutcomes = true;
+        }
+        if (persisted)
+        {
+            confirmedTerminalOpps.insert(out.opportunityId);
+            ReleaseCoopAdmissionToken(out.opportunityId);
+            LOG_INFO("playerbots", "[CompanionCoop] Opportunity #{} finalized as '{}' ({})", out.opportunityId, dbState,
+                     safeOutcomeReason);
+        }
+        else if (dbFailedDuringOutcomes || out.retryCount < COOP_EXIT_MAX_RETRIES)
+        {
+            if (dbFailedDuringOutcomes)
+                gCoopDbHealthy.store(false);
+            else
+                ++out.retryCount;
+            retryOutcomes.push_back(std::move(out));
+        }
+        else
+        {
+            // P2-3: Unconfirmable row after max retries on a healthy DB — release token, prune completed guard & warn!
+            confirmedTerminalOpps.insert(out.opportunityId);
+            ReleaseCoopAdmissionToken(out.opportunityId);
+            LOG_WARN("playerbots",
+                     "[CompanionCoop] Dropping unconfirmable terminal outcome '{}' for opp #{} after {} retries",
+                     dbState, out.opportunityId, COOP_EXIT_MAX_RETRIES);
+        }
+    }
+    if (!confirmedTerminalOpps.empty())
+    {
+        // P0-6: Prune confirmed IDs from gPendingCompletedOpps so it never grows unboundedly!
+        std::lock_guard<std::mutex> lock(gCoopQueueMutex);
+        for (uint64 oid : confirmedTerminalOpps)
+            gPendingCompletedOpps.erase(oid);
+    }
+    if (!retryOutcomes.empty())
+    {
+        if (dbFailedDuringOutcomes)
+        {
+            outcomes = std::move(retryOutcomes);
+            restoreDeferred(exits);
+            return;
+        }
+        std::lock_guard<std::mutex> lock(gCoopQueueMutex);
+        gPendingCoopOutcomes.insert(gPendingCoopOutcomes.begin(), std::make_move_iterator(retryOutcomes.begin()),
+                                    std::make_move_iterator(retryOutcomes.end()));
+    }
 
     // Issue #22: Flush BOTH partial and full member exits BEFORE disbands and verify DB persistence!
     // Distinguish real DB outage (`SELECT 1` fails) from missing/poisoned row (bounded COOP_EXIT_MAX_RETRIES) so
@@ -2324,8 +2671,12 @@ void CompanionBrain::FlushCoopGroupMutations()
     {
         std::lock_guard<std::mutex> lock(gCoopQueueMutex);
         drainedGuard = gPendingDrainedOpps;
+        for (uint64 oid : gPendingCompletedOpps)
+            drainedGuard.insert(oid);
     }
     for (uint64 oid : confirmedDrainedOpps)
+        drainedGuard.insert(oid);
+    for (uint64 oid : confirmedTerminalOpps)
         drainedGuard.insert(oid);
 
     for (PendingCoopDisband const& d : disbands)
@@ -3042,6 +3393,12 @@ void CompanionBrain::ReloadCoopMemberships()
                 else
                     ++it;
             }
+        }
+        // P2: Sweep any orphaned lifecycle runs whose native group no longer exists!
+        {
+            std::lock_guard<std::mutex> lcLock(gLifecycleMutex);
+            (void)gLifecycleController.SweepOrphanedGroups(liveGroupIds);
+            gHasActiveLifecycleRuns.store(gLifecycleController.HasActiveRuns());
         }
         std::lock_guard<std::mutex> lock(gAdmissionMutex);
         (void)gAdmissionController.PruneCommittedTokensNotIn(keepOppIds);

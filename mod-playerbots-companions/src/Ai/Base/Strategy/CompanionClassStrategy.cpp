@@ -191,19 +191,41 @@ uint32 RevengeGlyphBuff(Player* bot)
 
 // --- Paladin heals, Gift of the Naaru, blessings ---------------------------------------------------------------
 
-// The owner (the healer) is online, alive, grouped with the bot on the same map and has mana.
+// The healer (owner when grouped with owner, or an alive same-map healer bot in Phase II coop mode) is online,
+// alive, grouped with the bot on the same map, and has sufficient mana. Uses map-local ObjectAccessor::GetPlayer
+// so cross-map-thread Player* dereferences never occur (P0-5!).
 bool HealerCovers(Player* bot)
 {
-    Player* owner = sCompanionBotMgr.FindOwnerOnlineFor(bot);
-    if (!owner || !owner->IsAlive() || owner->GetMapId() != bot->GetMapId() || !bot->GetGroup() ||
-        owner->GetGroup() != bot->GetGroup())
+    Group* group = bot->GetGroup();
+    if (!group)
         return false;
-    uint32 maxMana = owner->GetMaxPower(POWER_MANA);
+    Player* healer = nullptr;
+    if (!sCompanionBotMgr.IsGroupedWithOwner(bot) && sCompanionBotMgr.IsInAuthorizedCoopGroup(bot))
+    {
+        for (Group::MemberSlot const& slot : group->GetMemberSlots())
+        {
+            if (slot.guid == bot->GetGUID())
+                continue;
+            Player* member = ObjectAccessor::GetPlayer(*bot, slot.guid);
+            if (member && member->IsInWorld() && member->IsAlive() && PlayerbotAI::IsHeal(member))
+            {
+                healer = member;
+                break;
+            }
+        }
+    }
+    else
+    {
+        healer = sCompanionBotMgr.FindOwnerOnlineFor(bot);
+    }
+    if (!healer || !healer->IsAlive() || healer->GetMapId() != bot->GetMapId() || healer->GetGroup() != group)
+        return false;
+    uint32 maxMana = healer->GetMaxPower(POWER_MANA);
     if (!maxMana)
         return false;
     uint32 minPct = static_cast<uint32>(FloatOption("AiPlayerbot.Companion.Class.PaladinHeal.OwnerMinManaPct",
                                                     static_cast<float>(DEFAULT_OWNER_MIN_MANA_PCT)));
-    return owner->GetPower(POWER_MANA) * 100 / maxMana >= minPct;
+    return healer->GetPower(POWER_MANA) * 100 / maxMana >= minPct;
 }
 
 // The lowest-health group member under the heal threshold: 40% while the healer covers, 65% when it does not.

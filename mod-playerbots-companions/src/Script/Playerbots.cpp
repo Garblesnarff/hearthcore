@@ -21,6 +21,7 @@
 #include "PlayerbotsDatabase.h"
 #include <mysqld_error.h>
 #include "GuildTaskMgr.h"
+#include "Item.h"
 #include "PlayerScript.h"
 #include "PlayerbotAIConfig.h"
 #include "PlayerbotCommandScript.h"
@@ -145,7 +146,10 @@ public:
         PLAYERHOOK_ON_LEVEL_CHANGED,
         PLAYERHOOK_ON_UPDATE_SKILL,
         PLAYERHOOK_ON_CREATURE_KILL,
-        PLAYERHOOK_ON_PLAYER_KILLED_BY_CREATURE
+        PLAYERHOOK_ON_CREATURE_KILLED_BY_PET,
+        PLAYERHOOK_ON_PLAYER_KILLED_BY_CREATURE,
+        PLAYERHOOK_ON_LOOT_ITEM,
+        PLAYERHOOK_ON_GROUP_ROLL_REWARD_ITEM
     }) {}
 
     // Quest accept and turn-in times for companions, shown by .companion status.
@@ -182,11 +186,31 @@ public:
     void OnPlayerCreatureKill(Player* killer, Creature* killed) override
     {
         CompanionLife::OnCreatureKill(killer, killed);
+        CompanionBrain::OnCoopCreatureKilled(killer, killed);
+    }
+
+    void OnPlayerCreatureKilledByPet(Player* petOwner, Creature* killed) override
+    {
+        CompanionBrain::OnCoopCreatureKilled(petOwner, killed);
     }
 
     void OnPlayerKilledByCreature(Creature* killer, Player* victim) override
     {
         CompanionLife::OnPlayerDeath(victim, killer);
+        CompanionBrain::OnCoopMemberDied(victim);
+    }
+
+    void OnPlayerLootItem(Player* player, Item* item, uint32 count, ObjectGuid /*lootguid*/) override
+    {
+        if (player && item && count > 0)
+            CompanionBrain::OnCoopLootReceived(player, item->GetEntry(), count);
+    }
+
+    void OnPlayerGroupRollRewardItem(Player* player, Item* item, uint32 count, RollVote /*voteType*/,
+                                     Roll* /*roll*/) override
+    {
+        if (player && item && count > 0)
+            CompanionBrain::OnCoopLootReceived(player, item->GetEntry(), count);
     }
 
     void OnPlayerUpdateSkill(Player* player, uint32 skillId, uint32 value, uint32 /*max*/, uint32 /*step*/,
@@ -659,6 +683,9 @@ public:
 
     void OnPlayerbotLogout(Player* player) override
     {
+        if (player && CompanionBrain::IsCoopLfgTrackedBot(player->GetGUID().GetCounter()))
+            CompanionBrain::OnCompanionLogout(player->GetGUID().GetCounter());
+
         if (PlayerbotMgr* playerbotMgr = GET_PLAYERBOT_MGR(player))
         {
             PlayerbotAI* botAI = PlayerbotsMgr::instance().GetPlayerbotAI(player);

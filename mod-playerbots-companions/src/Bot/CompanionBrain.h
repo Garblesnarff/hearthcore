@@ -15,6 +15,7 @@
 
 #include "Define.h"
 
+class Creature;
 class Group;
 class Item;
 struct ItemTemplate;
@@ -29,6 +30,10 @@ namespace CompanionCoopDrain
 enum class CoopMode : uint8;
 enum class DrainReason : uint8;
 struct DrainDecision;
+}
+namespace CompanionCoopLifecycle
+{
+struct MemberControlDecision;
 }
 namespace CompanionLfgBridge
 {
@@ -161,8 +166,17 @@ public:
                                                uint32 lfgDungeonId);
     static void OnCompanionLfgProposalDeclined(uint32 botGuid, uint32 proposalId, std::string const& reason);
     static void OnCompanionLfgProposalFinished(uint32 botGuid, uint32 proposalId, uint8 proposalState);
-    // World thread only: drives cooperative LFG queue/leave/deferred-proposal lifecycle safely with LFGMgr,
-    // flushes queued binds/disbands/outcomes atomically to MySQL, and reloads memberships.
+    // Issue #21: Native bot-only dungeon lifecycle, leader failover, boss/loot evidence & bounded wipe recovery.
+    static void OnCoopCreatureKilled(Player const* killer, Creature const* killed);
+    static void OnCoopLootReceived(Player const* looter, uint32 itemEntry, uint32 count);
+    static void OnCoopMemberDied(Player const* victim);
+    static bool IsCoopGroupReadyForPull(Group const* group);
+    static bool PeekCoopProgressionWaypoint(Player const* bot, float& outX, float& outY, float& outZ);
+    static bool NextCoopProgressionWaypoint(Player const* bot, float& outX, float& outY, float& outZ);
+    static CompanionCoopLifecycle::MemberControlDecision EvaluateCoopLifecycleMember(
+        Player const* bot, Group const* group, uint64 opportunityId, uint32 targetMapId, uint32 electedTankLeadGuid);
+    // World thread only: drives cooperative LFG queue/leave/deferred-proposal & dungeon completion polling safely
+    // with LFGMgr, flushes queued binds/disbands/outcomes atomically to MySQL, and reloads memberships.
     static void TickCoopLfgOnWorldThread();
     static void FlushCoopGroupMutations();
     static void ReloadCoopMemberships();
