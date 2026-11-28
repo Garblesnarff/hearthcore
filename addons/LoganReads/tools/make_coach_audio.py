@@ -51,6 +51,8 @@ LINES = {
     "closer": "Move closer!",
     "stance": "Battle Stance!",
     "newpower": "New power!",
+    "dodged": "They dodged!",
+    "missed": "You missed!",
     "praise1": "Good!",
     "praise2": "Nice!",
     "praise3": "Great job!",
