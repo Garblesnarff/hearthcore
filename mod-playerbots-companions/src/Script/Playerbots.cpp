@@ -424,25 +424,41 @@ public:
 
     void OnPlayerGiveXP(Player* player, uint32& amount, Unit* /*victim*/, uint8 /*xpSource*/) override
     {
-        // companion bots gain no XP at owner level + CompanionLevelLead; quests still complete
-        if (sCompanionBotMgr.IsCompanion(player) && sCompanionBotMgr.IsXpCapped(player))
+        // companion bots gain no XP at assigned owner level + CompanionLevelLead (or expansion cap / fail-closed unknown);
+        // quests still complete.
+        if (sCompanionBotMgr.IsCompanion(player))
         {
-            // Debug proof of the cap: at most one line per companion per 10 minutes (WARN, shown at playerbots=3).
-            uint32 now = static_cast<uint32>(GameTime::GetGameTime().count());
-            if (sCompanionBotMgr.ShouldLogXpBlock(player->GetGUID().GetCounter(), now))
+            CompanionOwnerXpCap::BotXpCapResolution const capRes = sCompanionBotMgr.ResolveXpCapFor(player);
+            if (capRes.xpCapped)
             {
-                uint32 ownerLevel = sCompanionBotMgr.GetOwnerLevel();
-                uint32 lead = sPlayerbotAIConfig.companionLevelLead;
-                if (!ownerLevel)
-                    LOG_WARN("playerbots", "[CompanionXP] blocked: {} level {}, owner level unknown yet, XP {} zeroed",
-                             player->GetName(), player->GetLevel(), amount);
-                else
-                    LOG_WARN("playerbots",
-                             "[CompanionXP] blocked: {} level {} >= cap {} (owner {} + lead {}), XP {} zeroed",
-                             player->GetName(), player->GetLevel(), ownerLevel + lead, ownerLevel, lead, amount);
+                // Debug proof of the cap: at most one line per companion per 10 minutes (WARN, shown at playerbots=3).
+                uint32 now = static_cast<uint32>(GameTime::GetGameTime().count());
+                if (sCompanionBotMgr.ShouldLogXpBlock(player->GetGUID().GetCounter(), now))
+                {
+                    if (capRes.failClosed)
+                    {
+                        LOG_WARN("playerbots",
+                                 "[CompanionXP] blocked: {} level {}, owner '{}' state={}, fail-closed, XP {} zeroed",
+                                 player->GetName(), player->GetLevel(), capRes.ownerName,
+                                 CompanionOwnerXpCap::ResolutionStateName(capRes.state), amount);
+                    }
+                    else if (capRes.expansionCapped && capRes.ownerLevel == 0)
+                    {
+                        LOG_WARN("playerbots",
+                                 "[CompanionXP] blocked: {} level {} >= expansion cap {}, XP {} zeroed",
+                                 player->GetName(), player->GetLevel(), capRes.capLevel, amount);
+                    }
+                    else
+                    {
+                        LOG_WARN("playerbots",
+                                 "[CompanionXP] blocked: {} level {} >= cap {} (owner '{}' {}, state={}), XP {} zeroed",
+                                 player->GetName(), player->GetLevel(), capRes.capLevel, capRes.ownerName,
+                                 capRes.ownerLevel, CompanionOwnerXpCap::ResolutionStateName(capRes.state), amount);
+                    }
+                }
+                amount = 0;
+                return;
             }
-            amount = 0;
-            return;
         }
 
         // early return

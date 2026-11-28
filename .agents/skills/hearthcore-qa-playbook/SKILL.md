@@ -102,3 +102,11 @@ This is a living skill updated continuously after every Claude Opus 5.5 High QA 
   - Probe DB health BEFORE flushing pending exits/disbands; distinguish missing rows (`SELECT 1` succeeds) from real DB outages; cap unconfirmable exit retries (`COOP_EXIT_MAX_RETRIES`) so one bad row never wedges unrelated disbands.
   - Keep per-member recall/shift-end deadlines separate from group-level drain deadlines so a single offline recalled bot can never sweep healthy groupmates out of ownership.
   - Guard startup race (`IsCoopBootProbeDone()`) so `TickBot` never stray-disbands a pre-existing committed bot-only group before the first world-thread boot probe runs (never holding human-led groups).
+- **MySQL 8.0 migrations & exact column lengths:**
+  - `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` is **MariaDB-only** and fails on MySQL 8.0+. Always use `information_schema.columns` + `PREPARE`/`EXECUTE`/`DEALLOCATE PREPARE`, and test applying every migration **twice** on a pre-migration schema in `tests/test_mysql_integration.py`.
+  - Check exact `VARCHAR(N)` column lengths in `ops/sql/companion_schema.sql` (`reason_code` is `varchar(64)`, `outcome_reason` is `varchar(120)`) and truncate tokens before SQL writes.
+- **Exact AzerothCore LFG / map-thread / encounter traps (Issues #20 & #21):**
+  - `LFGMgr::GetState(ObjectGuid)` uses non-const `PlayersStore[guid]` (`std::map::operator[]` insert!) — NEVER call `sLFGMgr->GetState`/`GetLockedDungeons` from map threads; drive all cooperative `LFGMgr` reads on the **world thread** (`CompanionBrain::Update`).
+  - `LfgLockMap` is `std::map<uint32, uint32>` (no `LFG_LOCKSTATUS_NONE` enum — check `lockStatus != 0`); `LFGDungeonEntry::Faction` is commented out in AC `DBCStructure.h`.
+  - Use map-local O(1) `ObjectAccessor::GetPlayer(*bot, slot.guid)` for same-map peer lookups (never cross-map `Player*` dereference or continent-wide `GetPlayers()` scans); use `FindConnectedPlayer(slot.guid) != nullptr` ONLY for null-check online presence.
+  - Hold completed LFG dungeon exits until `LFG_STATE_FINISHED_DUNGEON` (bounded by hard cap) so bots don't trigger `LFG_SPELL_DUNGEON_DESERTER`; distinguish `FinalBossKill` vs `LfgFinished` honestly without fabricating boss IDs; verify exact encounter boss entries in `instance_encounters.sql` (Stockade final boss `1716`; Deadmines Sneed door boss `643`, VanCleef `639`).

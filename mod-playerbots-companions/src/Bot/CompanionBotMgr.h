@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "CompanionOwnerXpCapLogic.h"
 #include "ObjectGuid.h"
 #include "Position.h"
 
@@ -43,13 +44,19 @@ public:
     bool IsCompanion(Player const* player) const;
     bool IsCompanionName(std::string const& name) const;
 
-    // Any thread. True when the companion may gain no XP (level >= owner level + lead). While an owner is configured
-    // and his level is not known yet, also true (AiPlayerbot.Companion.XpCap.WaitForOwnerLevel, default 1).
+    // Any thread. True when the companion may gain no XP (at owner level + lead, at server expansion cap,
+    // or fail-closed while an applicable owner assignment/level is unresolved, unknown, or stale).
     bool IsXpCapped(Player const* player) const;
-    // Any thread. True while an owner is configured but his level has not been read yet.
+    // Any thread. Authoritative per-companion owner & XP cap resolution (Issue #31).
+    // Never falls back to primary owner when an explicit per-bot AiPlayerbot.Companion.Owner.<Name> exists.
+    CompanionOwnerXpCap::BotXpCapResolution ResolveXpCapFor(Player const* player) const;
+    CompanionOwnerXpCap::BotXpCapResolution ResolveXpCapForName(std::string const& name, uint32 botLevel) const;
+    // Any thread. Lock-free primary-owner status (kept fresh by world-thread RefreshOwnerLevel).
     bool OwnerConfigured() const { return _ownerConfigured.load(); }
     bool OwnerLevelUnknown() const { return _ownerConfigured.load() && _ownerLevel.load() == 0; }
-    // Any thread. Owner character low GUID, 0 when unknown.
+    // World thread. True when at least one configured owner is due for a retry/early probe (respecting backoff).
+    bool AnyOwnerDueForRefresh() const;
+    // Any thread. Primary owner character low GUID, 0 when unknown.
     uint32 OwnerLow() const { return _ownerLow.load(); }
 
     // Any thread. False when equipping proto would replace an equipped heirloom (quality 7) in any slot it can take.
@@ -193,6 +200,8 @@ public:
     void EnsureClassSpells(Player* player);
 
     uint32 GetOwnerLevel() const { return _ownerLevel.load(); }
+    uint32 LevelLead() const { return _xpLevelLead.load(); }
+    uint32 ExpansionMaxLevel() const { return _xpExpansionCap.load(); }
 
     // Companion lead mode (dungeon pulls with the owner). Per companion; the default is AiPlayerbot.Companion.Lead.Default.
     // Any thread.
@@ -259,27 +268,30 @@ private:
     bool BuildZoneLevels();
     static uint32 ZoneOf(uint32 mapId, float x, float y, float z);
     void LoginMissingCompanions();
-    void RefreshOwnerLevel();
+    void RefreshOwnerLevel(bool forceAll = false);
+    CompanionOwnerXpCap::OwnerXpCapConfig CurrentXpCapConfig() const;
     void SyncLevelSpells();
 
     std::atomic<bool> _configLoaded{false};     // published after the fields below are filled
     bool _classQuestsLoaded = false;
     std::set<std::string> _names;               // lower-case; written before _configLoaded is set
     std::vector<std::string> _displayNames;     // as configured, for login by name
-    std::string _ownerName;
-    std::atomic<uint32> _ownerLow{0};           // owner character low GUID, 0 when unknown
-    std::atomic<uint32> _ownerGuildId{0};       // owner character guild id, 0 when unknown
-    std::atomic<uint32> _ownerLevel{0};
-    std::unordered_map<std::string, std::string> _botOwnerName; // lower bot name -> configured owner name (if custom)
-    std::unordered_map<std::string, uint32> _botOwnerLow;       // lower bot name -> resolved owner low guid
-    std::set<uint32> _allOwnerLows;                             // all configured owner low guids (Wonky, Logan, ...)
-    std::unordered_map<uint32, uint32> _ownerLevels;            // owner low guid -> cached level (under _stateMutex)
+    std::string _ownerName;                     // initial configured primary owner (immutable after LoadConfig)
+    std::atomic<uint32> _ownerLow{0};           // primary owner character low GUID, 0 when unknown/unresolved
+    std::atomic<uint32> _ownerGuildId{0};       // primary owner character guild id, 0 when unknown
+    std::atomic<uint32> _ownerLevel{0};         // primary owner fresh level, 0 when unknown/unresolved/stale
+    CompanionOwnerXpCap::OwnerRegistry _ownerRegistry;          // authoritative primary + secondary owner state (under _stateMutex)
+    std::unordered_map<std::string, CompanionOwnerXpCap::OwnerResolutionState> _lastLoggedOwnerState; // world-thread transition log dedup
     std::unordered_map<std::string, ScheduleEntry> _schedules;  // lower bot name -> play schedule (under _stateMutex)
     bool _schedulesLoaded = false;
     bool _scheduleMissingLogged = false;
     uint32 _scheduleTimer = 0;
     std::atomic<bool> _ownerConfigured{false};      // AiPlayerbot.CompanionOwner is set
     std::atomic<bool> _xpWaitForOwner{true};        // AiPlayerbot.Companion.XpCap.WaitForOwnerLevel
+    std::atomic<uint32> _xpLevelLead{3};            // AiPlayerbot.CompanionLevelLead (hot-refreshed)
+    std::atomic<uint32> _xpExpansionCap{80};        // CONFIG_MAX_PLAYER_LEVEL cached atomically on world thread
+    std::atomic<uint32> _xpStaleSeconds{300};       // AiPlayerbot.Companion.XpCap.StaleSeconds (clamped >= 2x refresh)
+    std::atomic<uint32> _xpMaxFailures{2};          // AiPlayerbot.Companion.XpCap.MaxConsecutiveFailures
     std::vector<ClassQuest> _classQuests;
     // Armour types per companion (lower-case name -> tokens: cloth, leather, mail, plate, best). Read at load.
     std::unordered_map<std::string, std::vector<std::string>> _armorTypes;

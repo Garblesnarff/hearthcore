@@ -440,14 +440,38 @@ def _is_proposal_executable(
     return True, "executable"
 
 
-def resolve_bracket(level: int, *, raid_stage: int = 0) -> dict[str, Any]:
-    """Resolve the character's active level bracket & progression cap; fails closed on unknown raid_stage (P3)."""
+def resolve_bracket(
+    level: int,
+    *,
+    raid_stage: int = 0,
+    xp_cap_level: int | None = None,
+    xp_fail_closed: bool = False,
+) -> dict[str, Any]:
+    """Resolve the character's active level bracket & progression cap; fails closed on unknown raid_stage (P3 / Issue #31).
+
+    Invariants (Issue #31):
+    - Bots cannot lose levels: if `xp_cap_level < level` (e.g. owner recreated at Lv 1 while bot is Lv 10),
+      effective level cap clamps to `min(server_cap, max(level, xp_cap_level))` so the bot stays in its real
+      current bracket rather than regressing to a lower bracket.
+    - When `xp_fail_closed=True` or `xp_cap_level == 0`, fail closed by capping effective level at
+      `min(server_cap, level)` (current bracket only — never permissively planning up to Lv 60/80!).
+    """
     st = int(raid_stage)
     if st not in RAID_STAGE_LEVEL_CAP:
         raise ValueError(f"Unknown raid_stage: {raid_stage}")
     lvl = max(1, int(level))
-    cap = RAID_STAGE_LEVEL_CAP[st]
-    eff_lvl = min(lvl, cap)
+    server_cap = RAID_STAGE_LEVEL_CAP[st]
+    eff_lvl = min(lvl, server_cap)
+    xp_cap_authoritative = False
+    if xp_fail_closed or (xp_cap_level is not None and int(xp_cap_level) <= 0):
+        cap = eff_lvl
+        xp_cap_authoritative = True
+    elif xp_cap_level is not None and int(xp_cap_level) > 0:
+        cap = min(server_cap, max(eff_lvl, int(xp_cap_level)))
+        xp_cap_authoritative = True
+    else:
+        cap = server_cap
+
     for idx, (b_id, b_min, b_max, b_stage) in enumerate(LEVEL_BRACKETS):
         if b_min <= eff_lvl <= b_max:
             return {
@@ -455,18 +479,29 @@ def resolve_bracket(level: int, *, raid_stage: int = 0) -> dict[str, Any]:
                 "bracket_index": idx,
                 "min_level": b_min,
                 "max_level": min(b_max, cap),
-                "server_level_cap": cap,
+                "server_level_cap": server_cap,
+                "effective_level_cap": cap,
+                "xp_cap_authoritative": xp_cap_authoritative,
+                "xp_fail_closed": bool(xp_fail_closed or (xp_cap_level is not None and int(xp_cap_level) <= 0)),
                 "raid_stage": st,
                 "bracket_stage": b_stage,
             }
     raise ValueError(f"Unable to resolve bracket for level={level}, raid_stage={raid_stage}")
 
 
-def resolve_horizon_brackets(level: int, *, raid_stage: int = 0, brackets: tuple[str, ...] = ("current",)) -> list[dict[str, Any]]:
-    """Resolve requested bracket windows ('current', 'next', 'cap') deterministically (P1-7)."""
-    cur = resolve_bracket(level, raid_stage=raid_stage)
-    cap = int(cur["server_level_cap"])
-    cap_bracket = resolve_bracket(cap, raid_stage=raid_stage)
+def resolve_horizon_brackets(
+    level: int,
+    *,
+    raid_stage: int = 0,
+    brackets: tuple[str, ...] = ("current",),
+    xp_cap_level: int | None = None,
+    xp_fail_closed: bool = False,
+) -> list[dict[str, Any]]:
+    """Resolve requested bracket windows ('current', 'next', 'cap') deterministically (P1-7 / Issue #31)."""
+    cur = resolve_bracket(level, raid_stage=raid_stage, xp_cap_level=xp_cap_level, xp_fail_closed=xp_fail_closed)
+    cap = int(cur["effective_level_cap"])
+    server_cap = int(cur["server_level_cap"])
+    cap_bracket = resolve_bracket(cap, raid_stage=raid_stage, xp_cap_level=xp_cap_level, xp_fail_closed=xp_fail_closed)
     out: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     for tag in brackets:
@@ -481,7 +516,10 @@ def resolve_horizon_brackets(level: int, *, raid_stage: int = 0, brackets: tuple
                     "bracket_index": nxt_idx,
                     "min_level": nb[1],
                     "max_level": min(nb[2], cap),
-                    "server_level_cap": cap,
+                    "server_level_cap": server_cap,
+                    "effective_level_cap": cap,
+                    "xp_cap_authoritative": bool(cur["xp_cap_authoritative"]),
+                    "xp_fail_closed": bool(cur["xp_fail_closed"]),
                     "raid_stage": int(raid_stage),
                     "bracket_stage": nb[3],
                     "horizon_kind": "next",
@@ -1474,6 +1512,8 @@ def plan_character_gear_ambitions(
     identity: dict[str, Any] | None = None,
     raid_stage: int = 0,
     brackets: tuple[str, ...] = ("current",),
+    xp_cap_level: int | None = None,
+    xp_fail_closed: bool = False,
     max_targets_per_slot: int = DEFAULT_MAX_TARGETS_PER_SLOT,
     min_upgrade_delta: float = DEFAULT_MIN_UPGRADE_DELTA,
     now_ts: int | None = None,
@@ -1493,7 +1533,13 @@ def plan_character_gear_ambitions(
 
     eff_max_targets = max(1, min(int(max_targets_per_slot), MAX_TARGETS_PER_SLOT_CEILING))
     try:
-        horizon_brackets = resolve_horizon_brackets(level, raid_stage=raid_stage, brackets=brackets)
+        horizon_brackets = resolve_horizon_brackets(
+            level,
+            raid_stage=raid_stage,
+            brackets=brackets,
+            xp_cap_level=xp_cap_level,
+            xp_fail_closed=xp_fail_closed,
+        )
     except ValueError as exc:
         return {"ok": False, "reason": str(exc)}
 
@@ -1939,6 +1985,8 @@ def plan_character_gear_ambitions(
         "role": role,
         "level": int(level),
         "bracket": primary["bracket"],
+        "xp_cap_authoritative": bool(primary["bracket"].get("xp_cap_authoritative")),
+        "xp_fail_closed": bool(primary["bracket"].get("xp_fail_closed")),
         "coop_enabled_live": coop_enabled(),
         "raid_readiness_gold_reserve_copper": eff_reserve,
         "discretionary_gold_copper": max(0, int(gold_copper) - max(0, eff_reserve)),
@@ -1947,6 +1995,54 @@ def plan_character_gear_ambitions(
         "slots": primary["slots"],
         "bracket_plans": bracket_plans,
     }
+
+
+def extract_companion_cap_params(companion: dict[str, Any]) -> dict[str, Any]:
+    """Single shared extractor for per-companion authoritative XP cap & fail-closed state (Issue #31)."""
+    ll = companion.get("level_lead_state") if isinstance(companion.get("level_lead_state"), dict) else {}
+    raw_cap = companion.get("xp_cap_level")
+    if raw_cap is None:
+        raw_cap = ll.get("owner_cap_level")
+    xp_cap_level = int(raw_cap) if raw_cap is not None and int(raw_cap) > 0 else None
+    xp_fail_closed = bool(
+        companion.get("xp_fail_closed") is True
+        or ll.get("xp_fail_closed") is True
+        or str(companion.get("xp_cap_state") or ll.get("xp_cap_state") or "").strip().lower()
+        in ("unresolved_assignment", "level_unknown", "stale_level", "fail_closed")
+    )
+    if xp_cap_level is None and (companion.get("xp_eligible") is False or ll.get("xp_eligible") is False):
+        xp_fail_closed = True
+    return {
+        "xp_cap_level": xp_cap_level,
+        "xp_fail_closed": xp_fail_closed,
+    }
+
+
+def plan_companion_gear_ambitions(
+    companion: dict[str, Any],
+    *,
+    catalog: dict[int, CatalogItem],
+    role: str,
+    equipped_items: dict[str, Any],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Production companion wrapper that forwards authoritative per-companion XP cap & fail-closed state (Issue #31)."""
+    raw_class_id = companion.get("class_id")
+    if raw_class_id is None or int(raw_class_id) <= 0:
+        return {"ok": False, "reason": "missing_class_id"}
+    cap_params = extract_companion_cap_params(companion)
+    kwargs.setdefault("xp_cap_level", cap_params["xp_cap_level"])
+    kwargs.setdefault("xp_fail_closed", cap_params["xp_fail_closed"])
+    return plan_character_gear_ambitions(
+        catalog=catalog,
+        class_id=int(raw_class_id),
+        race_id=int(companion.get("race_id") or 1),
+        faction=str(companion.get("faction") or "alliance"),
+        level=int(companion.get("level") or 1),
+        role=role,
+        equipped_items=equipped_items,
+        **kwargs,
+    )
 
 
 class GearAmbitionStore:

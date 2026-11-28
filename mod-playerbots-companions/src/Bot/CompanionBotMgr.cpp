@@ -63,6 +63,7 @@
 #include "SharedDefines.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
+#include "World.h"
 #include "WorldDatabase.h"
 
 namespace
@@ -112,33 +113,25 @@ void CompanionBotMgr::LoadConfig()
 
     _ownerName = Trim(sPlayerbotAIConfig.companionOwner);
     _ownerConfigured.store(!_ownerName.empty());
-    _xpWaitForOwner.store(sConfigMgr->GetOption<bool>("AiPlayerbot.Companion.XpCap.WaitForOwnerLevel", true));
-    if (!_ownerName.empty())
-    {
-        ObjectGuid ownerGuid = sCharacterCache->GetCharacterGuidByName(_ownerName);
-        if (ownerGuid)
-        {
-            _ownerLow.store(ownerGuid.GetCounter());
-            _ownerGuildId.store(sCharacterCache->GetCharacterGuildIdByGuid(ownerGuid));
-            _allOwnerLows.insert(ownerGuid.GetCounter());
-        }
-        else
-            LOG_WARN("playerbots", "Companion owner '{}' was not found in the character cache", _ownerName);
-    }
+    _xpWaitForOwner.store(sConfigMgr->GetOption<bool>("AiPlayerbot.Companion.XpCap.WaitForOwnerLevel", true, false));
+    uint32 const initLead = sConfigMgr->GetOption<uint32>("AiPlayerbot.CompanionLevelLead", sPlayerbotAIConfig.companionLevelLead, false);
+    _xpLevelLead.store(initLead);
+    _xpExpansionCap.store(sWorld ? sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL) : 80u);
+    uint32 const rawStale = sConfigMgr->GetOption<uint32>("AiPlayerbot.Companion.XpCap.StaleSeconds", 300, false);
+    _xpStaleSeconds.store(CompanionOwnerXpCap::ClampStaleSeconds(rawStale, OWNER_LEVEL_REFRESH_MS / 1000u));
+    _xpMaxFailures.store(std::max<uint32>(1u, sConfigMgr->GetOption<uint32>("AiPlayerbot.Companion.XpCap.MaxConsecutiveFailures", 2, false)));
 
     // Per-companion owner override: AiPlayerbot.Companion.Owner.<Name> = "Logan" (defaults to CompanionOwner).
+    std::unordered_map<std::string, std::string> botOwnerOverrides;
     for (std::string const& display : _displayNames)
     {
         std::string customOwner = Trim(sConfigMgr->GetOption<std::string>("AiPlayerbot.Companion.Owner." + display, "", false));
-        if (customOwner.empty())
-            continue;
-        std::string const lowerBot = Lower(display);
-        _botOwnerName[lowerBot] = customOwner;
-        if (ObjectGuid og = sCharacterCache->GetCharacterGuidByName(customOwner))
-        {
-            _botOwnerLow[lowerBot] = og.GetCounter();
-            _allOwnerLows.insert(og.GetCounter());
-        }
+        if (!customOwner.empty())
+            botOwnerOverrides[Lower(display)] = customOwner;
+    }
+    {
+        std::lock_guard<std::mutex> lock(_stateMutex);
+        _ownerRegistry.Configure(_ownerName, botOwnerOverrides);
     }
 
     // Per-companion armour types: AiPlayerbot.Companion.ArmorTypes.<Name> = "best" or a list like "leather,best".
@@ -162,12 +155,12 @@ void CompanionBotMgr::LoadConfig()
         _armorTypes[Lower(display)] = tokens;
     }
 
-    // B10: read the owner's level now (world thread, DB when he is offline), not one refresh interval later; until it
-    // is known the XP cap stays closed (IsXpCapped).
-    RefreshOwnerLevel();
+    // B10: read EVERY configured owner's level now (world thread, DB when offline), not one refresh interval later;
+    // until known the XP cap stays closed (IsXpCapped).
+    RefreshOwnerLevel(/*forceAll=*/true);
 
     LOG_INFO("playerbots", "Companion bots: {} configured, owner '{}', level lead {}", _displayNames.size(),
-             _ownerName, sPlayerbotAIConfig.companionLevelLead);
+             _ownerName, _xpLevelLead.load());
     _configLoaded.store(true);
 }
 
@@ -782,12 +775,16 @@ void CompanionBotMgr::Update(uint32 elapsed)
         LoginMissingCompanions();
     }
 
-    // Every refresh interval; every 5 s while the level is still unknown (the XP cap is closed until then).
-    if (_levelTimer >= OWNER_LEVEL_REFRESH_MS || (OwnerLevelUnknown() && _levelTimer >= 5000))
+    // Every refresh interval (full sweep), or every 5 s for ONLY owners due for retry/early probe (with per-owner backoff).
+    if (_levelTimer >= OWNER_LEVEL_REFRESH_MS)
     {
         _levelTimer = 0;
-        _xpWaitForOwner.store(sConfigMgr->GetOption<bool>("AiPlayerbot.Companion.XpCap.WaitForOwnerLevel", true));
-        RefreshOwnerLevel();
+        RefreshOwnerLevel(/*forceAll=*/true);
+    }
+    else if (_levelTimer >= 5000 && AnyOwnerDueForRefresh())
+    {
+        _levelTimer = 0;
+        RefreshOwnerLevel(/*forceAll=*/false);
     }
 
     if (_spellTimer >= SPELL_PASS_MS)
@@ -796,7 +793,8 @@ void CompanionBotMgr::Update(uint32 elapsed)
         SyncLevelSpells();
     }
 
-    // Lightweight 3-second atomic live-position snapshot for Azeroth Watch (zero DB queries, <0.05 ms).
+    // Lightweight 3-second atomic live-position snapshot for Azeroth Watch & Hearthcore bridge
+    // (zero DB queries, <0.05 ms). Exports authoritative per-companion XP cap state for #23/#24/#31.
     static uint32 sLivePosTimer = 0;
     sLivePosTimer += elapsed;
     if (sLivePosTimer >= 3000)
@@ -809,7 +807,7 @@ void CompanionBotMgr::Update(uint32 elapsed)
             std::string const outPath = logDir + "/live_positions.json";
             if (FILE* fp = std::fopen(tmpPath.c_str(), "w"))
             {
-                std::string const wkEv = CompanionLife::ActiveWeeklyEventLabel();
+                std::string const wkEv = CompanionOwnerXpCap::EscapeJsonString(CompanionLife::ActiveWeeklyEventLabel());
                 std::fprintf(fp, "{\"t\":%u,\"weekly_event\":\"%s\",\"units\":[",
                              static_cast<uint32>(GameTime::GetGameTime().count()), wkEv.c_str());
                 bool first = true;
@@ -822,9 +820,34 @@ void CompanionBotMgr::Update(uint32 elapsed)
                     if (!first)
                         std::fputc(',', fp);
                     first = false;
-                    std::fprintf(fp, "{\"g\":%u,\"m\":%u,\"z\":%u,\"x\":%.1f,\"y\":%.1f,\"hp\":%u}",
-                                 p->GetGUID().GetCounter(), p->GetMapId(), p->GetZoneId(),
-                                 p->GetPositionX(), p->GetPositionY(), p->IsAlive() ? p->GetHealth() : 0u);
+                    if (IsCompanion(p))
+                    {
+                        CompanionOwnerXpCap::BotXpCapResolution const capRes = ResolveXpCapFor(p);
+                        std::fprintf(
+                            fp,
+                            "{\"g\":%u,\"m\":%u,\"z\":%u,\"x\":%.1f,\"y\":%.1f,\"hp\":%u,"
+                            "\"xp_eligible\":%s,\"xp_cap_level\":%u,\"xp_cap_state\":\"%s\","
+                            "\"xp_fail_closed\":%s,\"xp_owner_override\":%s",
+                            p->GetGUID().GetCounter(), p->GetMapId(), p->GetZoneId(),
+                            p->GetPositionX(), p->GetPositionY(), p->IsAlive() ? p->GetHealth() : 0u,
+                            capRes.xpCapped ? "false" : "true",
+                            capRes.capLevel,
+                            CompanionOwnerXpCap::ResolutionStateName(capRes.state),
+                            capRes.failClosed ? "true" : "false",
+                            capRes.assignment == CompanionOwnerXpCap::OwnerAssignmentKind::AssignedOverride ? "true" : "false");
+                        if (!capRes.ownerName.empty())
+                        {
+                            std::string const escapedOwner = CompanionOwnerXpCap::EscapeJsonString(capRes.ownerName);
+                            std::fprintf(fp, ",\"owner_name\":\"%s\"", escapedOwner.c_str());
+                        }
+                        std::fputc('}', fp);
+                    }
+                    else
+                    {
+                        std::fprintf(fp, "{\"g\":%u,\"m\":%u,\"z\":%u,\"x\":%.1f,\"y\":%.1f,\"hp\":%u}",
+                                     p->GetGUID().GetCounter(), p->GetMapId(), p->GetZoneId(),
+                                     p->GetPositionX(), p->GetPositionY(), p->IsAlive() ? p->GetHealth() : 0u);
+                    }
                 }
                 std::fputs("]}\n", fp);
                 std::fclose(fp);
@@ -972,68 +995,228 @@ void CompanionBotMgr::LoginMissingCompanions()
     }
 }
 
-void CompanionBotMgr::RefreshOwnerLevel()
+CompanionOwnerXpCap::OwnerXpCapConfig CompanionBotMgr::CurrentXpCapConfig() const
 {
-    auto readOwnerLevel = [](uint32 ownerLow, char const*& source) -> uint32
-    {
-        if (!ownerLow)
-            return 0;
-        if (Player* owner = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(ownerLow)))
-        {
-            source = "online";
-            return owner->GetLevel();
-        }
-        source = "db";
-        QueryResult result = CharacterDatabase.Query("SELECT level FROM characters WHERE guid = {}", ownerLow);
-        return result ? result->Fetch()[0].Get<uint32>() : 0;
-    };
+    CompanionOwnerXpCap::OwnerXpCapConfig cfg;
+    cfg.levelLead = _xpLevelLead.load();
+    cfg.expansionMaxLevel = _xpExpansionCap.load();
+    cfg.waitForOwnerLevel = _xpWaitForOwner.load();
+    cfg.staleAfterSec = _xpStaleSeconds.load();
+    cfg.maxConsecutiveFailures = _xpMaxFailures.load();
+    cfg.normalRefreshSec = OWNER_LEVEL_REFRESH_MS / 1000u;
+    return cfg;
+}
 
-    uint32 ownerLow = _ownerLow.load();
-    if (!ownerLow && !_ownerName.empty())
+void CompanionBotMgr::RefreshOwnerLevel(bool forceAll)
+{
+    // Re-read config options silently (showLogs=false prevents missing-property log spam) so `.reload config`
+    // and owner reassignments take effect without restarting worldserver (Issue #31).
+    std::string const primaryName = Trim(sConfigMgr->GetOption<std::string>("AiPlayerbot.CompanionOwner", _ownerName, false));
+    _ownerConfigured.store(!primaryName.empty());
+    _xpWaitForOwner.store(sConfigMgr->GetOption<bool>("AiPlayerbot.Companion.XpCap.WaitForOwnerLevel", true, false));
+    uint32 const liveLead = sConfigMgr->GetOption<uint32>("AiPlayerbot.CompanionLevelLead", sPlayerbotAIConfig.companionLevelLead, false);
+    _xpLevelLead.store(liveLead);
+    _xpExpansionCap.store(sWorld ? sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL) : 80u);
+    uint32 const rawStale = sConfigMgr->GetOption<uint32>("AiPlayerbot.Companion.XpCap.StaleSeconds", 300, false);
+    _xpStaleSeconds.store(CompanionOwnerXpCap::ClampStaleSeconds(rawStale, OWNER_LEVEL_REFRESH_MS / 1000u));
+    _xpMaxFailures.store(std::max<uint32>(1u, sConfigMgr->GetOption<uint32>("AiPlayerbot.Companion.XpCap.MaxConsecutiveFailures", 2, false)));
+
+    std::unordered_map<std::string, std::string> botOwnerOverrides;
+    for (std::string const& display : _displayNames)
     {
-        if (ObjectGuid ownerGuid = sCharacterCache->GetCharacterGuidByName(_ownerName))
-        {
-            ownerLow = ownerGuid.GetCounter();
-            _ownerLow.store(ownerLow);
-            std::lock_guard<std::mutex> lock(_stateMutex);
-            _allOwnerLows.insert(ownerLow);
-        }
+        std::string customOwner = Trim(sConfigMgr->GetOption<std::string>("AiPlayerbot.Companion.Owner." + display, "", false));
+        if (!customOwner.empty())
+            botOwnerOverrides[Lower(display)] = customOwner;
     }
 
-    // Resolve any custom per-companion owners that weren't in cache at boot.
-    std::set<uint32> ownersToCheck;
-    if (ownerLow)
-        ownersToCheck.insert(ownerLow);
+    uint32 const probeStartSec = static_cast<uint32>(GameTime::GetUptime().count());
+    CompanionOwnerXpCap::OwnerXpCapConfig const cfg = CurrentXpCapConfig();
+
+    std::vector<std::string> ownerNames;
+    bool primaryOwnerChanged = false;
     {
         std::lock_guard<std::mutex> lock(_stateMutex);
-        for (auto const& [lowerBot, ownerName] : _botOwnerName)
-        {
-            if (_botOwnerLow.find(lowerBot) == _botOwnerLow.end())
-            {
-                if (ObjectGuid og = sCharacterCache->GetCharacterGuidByName(ownerName))
-                {
-                    _botOwnerLow[lowerBot] = og.GetCounter();
-                    _allOwnerLows.insert(og.GetCounter());
-                }
-            }
-        }
-        for (uint32 ol : _allOwnerLows)
-            ownersToCheck.insert(ol);
+        std::string const prevPrimaryKey = Lower(_ownerRegistry.PrimaryOwnerName());
+        primaryOwnerChanged = (prevPrimaryKey != Lower(primaryName));
+        _ownerRegistry.Configure(primaryName, botOwnerOverrides);
+        ownerNames = _ownerRegistry.OwnersDueForProbe(probeStartSec, cfg, forceAll || primaryOwnerChanged);
     }
 
-    for (uint32 ol : ownersToCheck)
+    struct OwnerProbeOutcome
     {
-        char const* source = "online";
-        uint32 const level = readOwnerLevel(ol, source);
-        if (!level)
-            continue;
+        std::string ownerName;
+        uint32 resolvedLow = 0;
+        uint32 level = 0;
+        uint32 guildId = 0;
+        char const* source = "unresolved";
+        bool unresolved = false;
+        bool transientDbError = false;
+    };
+
+    std::vector<OwnerProbeOutcome> outcomes;
+    outcomes.reserve(ownerNames.size());
+
+    // Perform all CharacterCache, ObjectAccessor, and CharacterDatabase lookups WITHOUT holding _stateMutex.
+    for (std::string const& ownerName : ownerNames)
+    {
+        OwnerProbeOutcome out;
+        out.ownerName = ownerName;
+        ObjectGuid const ownerGuid = sCharacterCache->GetCharacterGuidByName(ownerName);
+        if (!ownerGuid)
         {
-            std::lock_guard<std::mutex> lock(_stateMutex);
-            _ownerLevels[ol] = level;
+            out.unresolved = true;
+            outcomes.push_back(std::move(out));
+            continue;
         }
-        if (ol == ownerLow && !_ownerLevel.exchange(level))
-            LOG_INFO("playerbots", "Companion XP cap: owner level known level={} source={} uptime={}s", level, source,
-                     GameTime::GetUptime().count());
+
+        uint32 const low = ownerGuid.GetCounter();
+        out.resolvedLow = low;
+        out.guildId = sCharacterCache->GetCharacterGuildIdByGuid(ownerGuid);
+
+        if (Player* online = ObjectAccessor::FindConnectedPlayer(ownerGuid))
+        {
+            if (Lower(online->GetName()) == Lower(ownerName))
+            {
+                out.level = online->GetLevel();
+                out.source = "online";
+                outcomes.push_back(std::move(out));
+                continue;
+            }
+            // Character renamed while online before cache caught up -> fail closed immediately.
+            out.resolvedLow = 0;
+            out.unresolved = true;
+            out.source = "renamed";
+            outcomes.push_back(std::move(out));
+            continue;
+        }
+
+        // Verify name AND deleteDate IS NULL (guards against CharDelete.Method=1 soft-delete & cache-lag rename).
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT level, name, deleteDate FROM characters WHERE guid = {}", low);
+        if (result)
+        {
+            Field* fields = result->Fetch();
+            uint32 const dbLevel = fields[0].Get<uint32>();
+            std::string const dbName = fields[1].Get<std::string>();
+            bool const softDeleted = !fields[2].IsNull();
+            if (softDeleted || Lower(dbName) != Lower(ownerName))
+            {
+                out.resolvedLow = 0;
+                out.unresolved = true;
+                out.source = softDeleted ? "soft_deleted" : "renamed_db";
+            }
+            else
+            {
+                out.level = dbLevel;
+                out.source = "db";
+            }
+        }
+        else
+        {
+            // Distinguish a deleted character row (DB healthy, 0 rows -> immediate UnresolvedAssignment)
+            // from a transient DB outage (SELECT 1 also fails -> RecordLevelRead failure / StaleLevel).
+            // Note: if a transient single-query error happens right before SELECT 1 succeeds, this fails
+            // closed safely and recovers automatically on the next backoff retry.
+            QueryResult dbHealth = CharacterDatabase.Query("SELECT 1");
+            if (dbHealth)
+            {
+                out.resolvedLow = 0;
+                out.unresolved = true;
+                out.source = "deleted";
+            }
+            else
+            {
+                out.level = 0;
+                out.source = "db_error";
+                out.transientDbError = true;
+            }
+        }
+        outcomes.push_back(std::move(out));
+    }
+
+    uint32 const nowSec = static_cast<uint32>(GameTime::GetUptime().count());
+    std::string const lowerPrimary = Lower(primaryName);
+    uint32 primaryLow = 0;
+    uint32 primaryGuildId = 0;
+    bool primaryProbed = false;
+    bool primaryDefinitiveUnresolved = false;
+    bool primaryTransientDbError = false;
+    uint32 primaryFreshLevel = 0;
+
+    struct TransitionLog
+    {
+        std::string ownerName;
+        CompanionOwnerXpCap::OwnerResolutionState prevState;
+        CompanionOwnerXpCap::OwnerResolutionState nextState;
+        uint32 level;
+        char const* source;
+    };
+    std::vector<TransitionLog> logs;
+
+    {
+        std::lock_guard<std::mutex> lock(_stateMutex);
+        for (OwnerProbeOutcome const& out : outcomes)
+        {
+            std::string const key = Lower(out.ownerName);
+            if (key == lowerPrimary)
+                primaryProbed = true;
+            if (out.unresolved || out.resolvedLow == 0)
+            {
+                _ownerRegistry.RecordGuidResolution(out.ownerName, 0, nowSec, cfg.normalRefreshSec);
+                if (key == lowerPrimary)
+                    primaryDefinitiveUnresolved = true;
+            }
+            else
+            {
+                _ownerRegistry.RecordGuidResolution(out.ownerName, out.resolvedLow, nowSec, cfg.normalRefreshSec);
+                _ownerRegistry.RecordLevelRead(out.ownerName, out.resolvedLow, out.level, nowSec, cfg.normalRefreshSec);
+                if (key == lowerPrimary)
+                {
+                    primaryGuildId = out.guildId;
+                    primaryTransientDbError = out.transientDbError;
+                }
+            }
+
+            CompanionOwnerXpCap::OwnerResolutionState const nextState =
+                _ownerRegistry.OwnerStateForName(out.ownerName, nowSec, cfg);
+
+            auto it = _lastLoggedOwnerState.find(key);
+            if (it == _lastLoggedOwnerState.end() || it->second != nextState)
+            {
+                CompanionOwnerXpCap::OwnerResolutionState const prev =
+                    (it == _lastLoggedOwnerState.end())
+                        ? CompanionOwnerXpCap::OwnerResolutionState::Unconfigured
+                        : it->second;
+                _lastLoggedOwnerState[key] = nextState;
+                logs.push_back(TransitionLog{out.ownerName, prev, nextState, out.level, out.source});
+            }
+        }
+
+        primaryLow = _ownerRegistry.PrimaryOwnerLow();
+        primaryFreshLevel = _ownerRegistry.PrimaryOwnerLevel(nowSec, cfg);
+    }
+
+    _ownerLow.store(primaryLow);
+    _ownerLevel.store(primaryFreshLevel);
+    // Update _ownerGuildId accurately: clear on config empty/change or definitive delete/rename;
+    // update to exact guildId (including 0 if owner left guild) on healthy resolve; preserve only on transient db_error.
+    if (primaryName.empty() || primaryOwnerChanged || primaryDefinitiveUnresolved)
+        _ownerGuildId.store(0);
+    else if (primaryProbed && !primaryTransientDbError && primaryLow != 0)
+        _ownerGuildId.store(primaryGuildId);
+
+    for (TransitionLog const& entry : logs)
+    {
+        if (entry.nextState == CompanionOwnerXpCap::OwnerResolutionState::ResolvedFresh)
+        {
+            LOG_INFO("playerbots", "Companion XP cap: owner '{}' level known level={} source={} uptime={}s",
+                     entry.ownerName, entry.level, entry.source, nowSec);
+        }
+        else
+        {
+            LOG_WARN("playerbots", "Companion XP cap: owner '{}' state={} source={} (XP cap failing closed)",
+                     entry.ownerName, CompanionOwnerXpCap::ResolutionStateName(entry.nextState), entry.source);
+        }
     }
 }
 
@@ -1250,30 +1433,49 @@ bool CompanionBotMgr::TankKeepsShield(Player const* player) const
     return false;
 }
 
+CompanionOwnerXpCap::BotXpCapResolution CompanionBotMgr::ResolveXpCapForName(std::string const& name, uint32 botLevel) const
+{
+    uint32 const nowSec = static_cast<uint32>(GameTime::GetUptime().count());
+    CompanionOwnerXpCap::OwnerXpCapConfig const cfg = CurrentXpCapConfig();
+    std::lock_guard<std::mutex> lock(_stateMutex);
+    return _ownerRegistry.ResolveForBot(name, botLevel, nowSec, cfg);
+}
+
+CompanionOwnerXpCap::BotXpCapResolution CompanionBotMgr::ResolveXpCapFor(Player const* player) const
+{
+    if (!player)
+        return {};
+    return ResolveXpCapForName(player->GetName(), player->GetLevel());
+}
+
+bool CompanionBotMgr::AnyOwnerDueForRefresh() const
+{
+    uint32 const nowSec = static_cast<uint32>(GameTime::GetUptime().count());
+    CompanionOwnerXpCap::OwnerXpCapConfig const cfg = CurrentXpCapConfig();
+    std::lock_guard<std::mutex> lock(_stateMutex);
+    return _ownerRegistry.AnyOwnerDueForProbe(nowSec, cfg);
+}
+
 uint32 CompanionBotMgr::OwnerLowFor(Player const* bot) const
 {
-    if (bot)
-    {
-        std::string const lowerBot = Lower(bot->GetName());
-        std::lock_guard<std::mutex> lock(_stateMutex);
-        auto it = _botOwnerLow.find(lowerBot);
-        if (it != _botOwnerLow.end() && it->second != 0)
-            return it->second;
-    }
-    return _ownerLow.load();
+    if (!bot)
+        return _ownerLow.load();
+    // Issue #31: Allocation-free fast path; never falls back to primary owner when an explicit override is unresolved.
+    uint32 const nowSec = static_cast<uint32>(GameTime::GetUptime().count());
+    CompanionOwnerXpCap::OwnerXpCapConfig const cfg = CurrentXpCapConfig();
+    std::lock_guard<std::mutex> lock(_stateMutex);
+    return _ownerRegistry.ResolveFastForBot(bot->GetName(), bot->GetLevel(), nowSec, cfg).ownerLowGuid;
 }
 
 uint32 CompanionBotMgr::OwnerLevelFor(Player const* bot) const
 {
-    uint32 const ol = OwnerLowFor(bot);
-    if (ol)
-    {
-        std::lock_guard<std::mutex> lock(_stateMutex);
-        auto it = _ownerLevels.find(ol);
-        if (it != _ownerLevels.end() && it->second > 0)
-            return it->second;
-    }
-    return _ownerLevel.load();
+    if (!bot)
+        return _ownerLevel.load();
+    // Issue #31: Allocation-free fast path; never falls back to primary owner level when unresolved/unknown/stale.
+    uint32 const nowSec = static_cast<uint32>(GameTime::GetUptime().count());
+    CompanionOwnerXpCap::OwnerXpCapConfig const cfg = CurrentXpCapConfig();
+    std::lock_guard<std::mutex> lock(_stateMutex);
+    return _ownerRegistry.ResolveFastForBot(bot->GetName(), bot->GetLevel(), nowSec, cfg).ownerLevel;
 }
 
 Player* CompanionBotMgr::FindOwnerOnlineFor(Player const* bot) const
@@ -1295,10 +1497,8 @@ bool CompanionBotMgr::IsAnyOwnerLow(uint32 lowGuid) const
 {
     if (!lowGuid)
         return false;
-    if (_ownerLow.load() == lowGuid)
-        return true;
     std::lock_guard<std::mutex> lock(_stateMutex);
-    return _allOwnerLows.count(lowGuid) > 0;
+    return _ownerRegistry.IsAnyResolvedOwnerLow(lowGuid);
 }
 
 bool CompanionBotMgr::IsCompanionSlot(ObjectGuid guid, std::string const& slotName) const
@@ -1548,10 +1748,10 @@ bool CompanionBotMgr::IsXpCapped(Player const* player) const
 {
     if (!player)
         return false;
-    uint32 const ownerLevel = OwnerLevelFor(player);
-    if (!ownerLevel)
-        return _ownerConfigured.load() && _xpWaitForOwner.load();   // B10: closed until the owner's level is read
-    return player->GetLevel() >= ownerLevel + sPlayerbotAIConfig.companionLevelLead;
+    uint32 const nowSec = static_cast<uint32>(GameTime::GetUptime().count());
+    CompanionOwnerXpCap::OwnerXpCapConfig const cfg = CurrentXpCapConfig();
+    std::lock_guard<std::mutex> lock(_stateMutex);
+    return _ownerRegistry.ResolveFastForBot(player->GetName(), player->GetLevel(), nowSec, cfg).xpCapped;
 }
 
 Player* CompanionBotMgr::FindOwnerOnline() const

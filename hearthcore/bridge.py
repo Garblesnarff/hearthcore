@@ -631,6 +631,15 @@ def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = No
                 xe = _opt_bool(lp.get("xp_eligible"))
                 if xe is not None:
                     companions[slug]["xp_eligible"] = xe
+                xcs = lp.get("xp_cap_state")
+                if isinstance(xcs, str) and xcs.strip():
+                    companions[slug]["xp_cap_state"] = xcs.strip().lower()
+                xfc = _opt_bool(lp.get("xp_fail_closed"))
+                if xfc is not None:
+                    companions[slug]["xp_fail_closed"] = xfc
+                xoo = _opt_bool(lp.get("xp_owner_override"))
+                if xoo is not None:
+                    companions[slug]["xp_owner_override"] = xoo
                 if lp.get("owner_name"):
                     companions[slug]["owner_name"] = str(lp["owner_name"])
 
@@ -960,13 +969,24 @@ def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = No
         for r in human_rows if len(r) >= 3
     ]
 
-    # Authoritative owner levels & CompanionLevelLead discovered dynamically (Issue #23 — no hardcoded owners/+3!)
-    owner_bindings = discover_owner_bindings(companions)
-    owner_names_wanted = sorted({v for v in owner_bindings.values() if v})
+    # Authoritative owner levels, per-bot overrides & CompanionLevelLead discovered dynamically (Issue #23 & #31)
+    bot_owner_overrides = load_per_bot_owner_overrides()
+    owner_bindings, conflicting_owner_groups = discover_owner_bindings_with_conflicts(companions)
+    owner_names_wanted = sorted(
+        {v for v in owner_bindings.values() if v}
+        | {v for v in bot_owner_overrides.values() if v}
+        | {
+            str(c.get("owner_name") or "").strip().lower()
+            for c in companions.values()
+            if str(c.get("owner_name") or "").strip()
+        }
+    )
     owner_levels: dict[str, int] = {}
     if owner_names_wanted:
         in_clause = ", ".join(f"'{_sql_esc(n)}'" for n in owner_names_wanted)
-        for r in run_sql(f"SELECT name, level FROM characters WHERE LOWER(name) IN ({in_clause});"):
+        for r in run_sql(
+            f"SELECT name, level FROM characters WHERE LOWER(name) IN ({in_clause}) AND deleteDate IS NULL;"
+        ):
             if len(r) >= 2:
                 owner_levels[r[0].lower()] = int(r[1])
     companion_level_lead = load_companion_level_lead()
@@ -986,13 +1006,15 @@ def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = No
         "humans": humans,
         "owner_levels": owner_levels,
         "owner_bindings": owner_bindings,
+        "conflicting_owner_groups": conflicting_owner_groups,
+        "bot_owner_overrides": bot_owner_overrides,
         "companion_level_lead": companion_level_lead,
         "qm_focus": qm_focus,
         "qm_mats_by_skill": qm_mats_by_skill,
         "qm_directives_meta": qm_meta,
         "proposals_by_plan_id": proposals_by_plan_id,
     }
-    # Export per-companion level lead/cap status cleanly (Issue #14 & #23)
+    # Export per-companion level lead/cap status cleanly (Issue #14, #23, #24, #31)
     for comp in companions.values():
         cap_st = _xp_cap_prof_catchup_state(comp, world_ctx)
         comp["level_lead_state"] = {
@@ -1000,9 +1022,46 @@ def fetch_world_context(mem: MemoryEngine | None = None, now_ts: int | None = No
             "owner_cap_level": int(cap_st["cap_level"]),
             "at_level_cap": bool(cap_st["at_cap"]),
             "near_level_cap": bool(cap_st["near_cap"]),
-            "xp_eligible": comp.get("xp_eligible"),
+            "xp_eligible": comp.get("xp_eligible") if comp.get("xp_eligible") is not None else (not bool(cap_st.get("fail_closed"))),
+            "xp_cap_state": comp.get("xp_cap_state") or ("fail_closed" if cap_st.get("fail_closed") else None),
+            "xp_fail_closed": bool(cap_st.get("fail_closed")),
         }
     return world_ctx
+
+
+def load_per_bot_owner_overrides(conf_path: Path | None = None) -> dict[str, str]:
+    """Read authoritative per-bot `AiPlayerbot.Companion.Owner.<Name>` overrides from playerbots.conf (Issue #31)."""
+    cfg = conf_path
+    if cfg is None:
+        env_cfg = (os.getenv("HEARTHCORE_PLAYERBOTS_CONF") or "").strip()
+        cfg = Path(env_cfg) if env_cfg else (
+            Path.home() / "AzerothCore" / "azerothcore-wotlk" / "env" / "dist" / "etc" / "modules" / "playerbots.conf"
+        )
+    overrides: dict[str, str] = {}
+    prefix = "AiPlayerbot.Companion.Owner."
+    try:
+        if cfg.is_file():
+            for raw in cfg.read_text(encoding="utf-8", errors="replace").splitlines():
+                ln = raw.split("#", 1)[0].strip()
+                if not ln or "=" not in ln:
+                    continue
+                k, v = ln.split("=", 1)
+                k = k.strip()
+                if k.startswith(prefix) and len(k) > len(prefix):
+                    bot_slug = k[len(prefix):].strip().lower()
+                    owner_name = v.strip().strip('"').strip("'").lower()
+                    if bot_slug and owner_name:
+                        overrides[bot_slug] = owner_name
+    except OSError as exc:
+        logger.warning("Failed reading per-bot owner overrides from %s: %s", cfg, exc)
+    return overrides
+
+
+def authoritative_cap_params_for_companion(comp: dict[str, Any]) -> dict[str, Any]:
+    """Extract authoritative XP-cap parameters from a companion dict for Issue #24 gear planning (Issue #31)."""
+    from hearthcore.gear_ambition import extract_companion_cap_params
+
+    return extract_companion_cap_params(comp)
 
 
 def load_companion_level_lead(conf_path: Path | None = None) -> int:
@@ -1034,18 +1093,42 @@ def load_companion_level_lead(conf_path: Path | None = None) -> int:
     return 3
 
 
-def discover_owner_bindings(companions: dict[str, dict[str, Any]] | None = None) -> dict[str, str]:
-    """Build shift_group -> owner_character mapping from HEARTHCORE_OWNER_GROUPS and `core-<owner>` groups (Issue #23)."""
+def discover_owner_bindings_with_conflicts(
+    companions: dict[str, dict[str, Any]] | None = None,
+) -> tuple[dict[str, str], set[str]]:
+    """Build shift_group -> owner_character mapping and return dropped conflicting groups (Issue #23 & #31).
+
+    Invariants (Issue #31):
+    - Never promote a per-bot `owner_name` onto a shared non-core shift group (e.g. `day-crew`).
+    - Never let a primary-default bot (`xp_owner_override=False`) overwrite a `core-<owner>` group binding.
+    - If two bots in the same `core-*` group report conflicting explicit owners, log a warning, drop that
+      group binding, and record it in `dropped_conflicts` so downstream cap lookups never re-synthesize `sg[5:]`.
+    """
     bindings: dict[str, str] = {}
-    # 1. Dynamic convention: any shift_group named `core-<owner>` binds to `<owner>`
+    core_conflicts: set[str] = set()
+    core_explicit_owners: dict[str, set[str]] = {}
     if isinstance(companions, dict):
         for comp in companions.values():
             sg = str(comp.get("shift_group") or "").strip().lower()
-            if sg.startswith("core-") and len(sg) > 5:
-                bindings[sg] = sg[5:]
+            if not sg or not sg.startswith("core-") or len(sg) <= 5:
+                continue
+            prefix_owner = sg[5:]
+            bindings.setdefault(sg, prefix_owner)
             explicit_owner = str(comp.get("owner_name") or "").strip().lower()
-            if sg and explicit_owner:
-                bindings[sg] = explicit_owner
+            if explicit_owner and comp.get("xp_owner_override") is True:
+                core_explicit_owners.setdefault(sg, set()).add(explicit_owner)
+                if explicit_owner != prefix_owner:
+                    core_conflicts.add(sg)
+
+    dropped_conflicts: set[str] = set()
+    for sg, owners in core_explicit_owners.items():
+        if len(owners) > 1 or sg in core_conflicts:
+            logger.warning(
+                "Conflicting explicit owners %s in shift group %s; dropping shared group binding",
+                sorted(owners), sg,
+            )
+            bindings.pop(sg, None)
+            dropped_conflicts.add(sg)
 
     # 2. Explicit env config overrides/adds mappings: e.g. `core-wonky:Wonky,core-logan:Logan,team-alex:Alex`
     raw_env = (os.getenv("HEARTHCORE_OWNER_GROUPS") or "").strip()
@@ -1056,55 +1139,102 @@ def discover_owner_bindings(companions: dict[str, dict[str, Any]] | None = None)
             o_v = owner.strip().lower()
             if g_k and o_v:
                 bindings[g_k] = o_v
+                dropped_conflicts.discard(g_k)
+    return bindings, dropped_conflicts
+
+
+def discover_owner_bindings(companions: dict[str, dict[str, Any]] | None = None) -> dict[str, str]:
+    """Compatibility wrapper returning shift_group -> owner_character mapping (Issue #23 & #31)."""
+    bindings, _ = discover_owner_bindings_with_conflicts(companions)
     return bindings
 
 
 def _xp_cap_prof_catchup_state(comp: dict[str, Any], world_ctx: dict[str, Any]) -> dict[str, Any]:
-    """Compute authoritative per-character XP-cap & primary-profession catch-up state (Issue #23).
+    """Compute authoritative per-character XP-cap & primary-profession catch-up state (Issue #23 & #31).
 
     Rules:
     - Scoped ONLY to companions with an authoritative owner-cap binding (`xp_cap_level`, `owner_name`,
-      `world_ctx["owner_bindings"]`, or `core-<owner>` shift group). Ordinary guild bots never inherit
-      any owner's level cap!
+      per-bot `bot_owner_overrides`, `world_ctx["owner_bindings"]`, or `core-<owner>` shift group).
+      Ordinary guild bots never inherit any owner's level cap!
     - Reads authoritative `companion_level_lead` from `playerbots.conf` (`AiPlayerbot.CompanionLevelLead`)
       or `HEARTHCORE_COMPANION_LEVEL_LEAD` (fallback 3).
-    - Respects explicit `xp_eligible` exported by runtime (`live_positions.json` / C++ seam).
+    - Respects explicit `xp_eligible`, `xp_cap_state`, and `xp_fail_closed` exported by runtime (`live_positions.json`).
+    - When runtime is fail-closed (unknown/unresolved/stale owner, `cap_level == 0`), returns `mode="fail_closed"`
+      with `at_cap=False` and `fail_closed=True` so #23 does NOT trigger false profession catch-up while #14/#24
+      still fail closed.
+    - For offline companions with an explicit per-bot override whose owner level is missing from `owner_levels`,
+      also fails closed (`mode="fail_closed"`) without ever substituting the primary owner!
     - Distinguishes `at_cap` (0 XP) from `near_cap` (1 level below cap, still earning XP).
     - Respects trained skill ceilings (`val >= mx` and `mx < 300` -> needs profession trainer!).
     """
     lvl = int(comp.get("level") or 0)
     sg = str(comp.get("shift_group") or "").strip().lower()
+    slug = str(comp.get("slug") or comp.get("name") or "").strip().lower()
     owner_levels = world_ctx.get("owner_levels") or {}
-    owner_bindings = world_ctx.get("owner_bindings") or discover_owner_bindings(world_ctx.get("companions"))
+    if world_ctx.get("owner_bindings") is not None:
+        owner_bindings = world_ctx["owner_bindings"]
+        conflicting_groups = set(world_ctx.get("conflicting_owner_groups") or ())
+    else:
+        owner_bindings, conflicting_groups = discover_owner_bindings_with_conflicts(world_ctx.get("companions"))
+    bot_overrides = world_ctx.get("bot_owner_overrides") or {}
     if world_ctx.get("companion_level_lead") is not None:
         level_lead = max(0, int(world_ctx["companion_level_lead"]))
     else:
         level_lead = load_companion_level_lead()
+    max_player_level = int(world_ctx.get("max_player_level") or 80)
 
     cap_lvl = 0
+    runtime_fail_closed = (comp.get("xp_fail_closed") is True) or (
+        str(comp.get("xp_cap_state") or "").strip().lower()
+        in ("unresolved_assignment", "level_unknown", "stale_level")
+    )
     if comp.get("xp_cap_level") is not None:
-        cap_lvl = int(comp["xp_cap_level"])
-    else:
-        owner_name = str(comp.get("owner_name") or "").strip().lower()
-        if not owner_name and sg:
+        cap_lvl = max(0, int(comp["xp_cap_level"]))
+    elif not runtime_fail_closed:
+        override_owner = str(bot_overrides.get(slug) or "").strip().lower()
+        explicit_owner = (
+            str(comp.get("owner_name") or "").strip().lower()
+            if comp.get("xp_owner_override") is not False
+            else ""
+        )
+        owner_name = override_owner or explicit_owner
+        if not owner_name and sg and sg not in conflicting_groups:
             owner_name = owner_bindings.get(sg, "")
             if not owner_name and sg.startswith("core-") and len(sg) > 5:
                 owner_name = sg[5:]
-        if owner_name and owner_levels.get(owner_name, 0) > 0:
-            cap_lvl = int(owner_levels[owner_name]) + level_lead
+        if owner_name:
+            if owner_levels.get(owner_name, 0) > 0:
+                raw_cap = int(owner_levels[owner_name]) + level_lead
+                cap_lvl = min(raw_cap, max_player_level) if max_player_level > 0 else raw_cap
+            elif override_owner or comp.get("xp_owner_override") is True:
+                # Explicitly assigned secondary owner missing from DB -> fail closed, NEVER fall back to primary!
+                runtime_fail_closed = True
 
-    if cap_lvl <= 0 and comp.get("xp_eligible") is not False:
+    explicit_xp_elig = comp.get("xp_eligible")
+    if runtime_fail_closed and cap_lvl <= 0:
         return {
-            "mode": "none",
+            "mode": "fail_closed",
             "at_cap": False,
             "near_cap": False,
+            "fail_closed": True,
             "cap_level": 0,
             "lagging_primary": False,
             "needs_trainer": False,
             "target_skill": 0,
         }
 
-    explicit_xp_elig = comp.get("xp_eligible")
+    if cap_lvl <= 0 and explicit_xp_elig is not False:
+        return {
+            "mode": "none",
+            "at_cap": False,
+            "near_cap": False,
+            "fail_closed": False,
+            "cap_level": 0,
+            "lagging_primary": False,
+            "needs_trainer": False,
+            "target_skill": 0,
+        }
+
     at_cap = (explicit_xp_elig is False) or (cap_lvl > 0 and lvl >= cap_lvl)
     near_cap = (not at_cap) and (cap_lvl > 0 and lvl == cap_lvl - 1)
 
@@ -1113,6 +1243,7 @@ def _xp_cap_prof_catchup_state(comp: dict[str, Any], world_ctx: dict[str, Any]) 
             "mode": "none",
             "at_cap": False,
             "near_cap": False,
+            "fail_closed": False,
             "cap_level": cap_lvl,
             "lagging_primary": False,
             "needs_trainer": False,
@@ -1139,6 +1270,7 @@ def _xp_cap_prof_catchup_state(comp: dict[str, Any], world_ctx: dict[str, Any]) 
         "mode": mode,
         "at_cap": mode == "at_cap",
         "near_cap": mode == "near_cap",
+        "fail_closed": False,
         "cap_level": cap_lvl,
         "lagging_primary": lagging_trainable,
         "needs_trainer": needs_trainer,

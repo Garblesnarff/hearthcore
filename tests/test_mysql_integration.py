@@ -244,7 +244,8 @@ class MySQLIntegrationTests(unittest.TestCase):
             guid INT PRIMARY KEY, account INT NOT NULL, name VARCHAR(32) NOT NULL,
             race TINYINT UNSIGNED NOT NULL DEFAULT 1, class TINYINT UNSIGNED NOT NULL DEFAULT 1,
             level TINYINT UNSIGNED NOT NULL, zone INT NOT NULL, map INT NOT NULL,
-            money INT NOT NULL, online TINYINT NOT NULL, xp INT NOT NULL
+            money INT NOT NULL, online TINYINT NOT NULL, xp INT NOT NULL,
+            deleteDate INT UNSIGNED DEFAULT NULL
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
         CREATE TABLE IF NOT EXISTS `{db_name}`.character_skills (
             guid INT NOT NULL, skill SMALLINT NOT NULL, value SMALLINT NOT NULL, max SMALLINT NOT NULL
@@ -464,7 +465,8 @@ class MySQLIntegrationTests(unittest.TestCase):
             race TINYINT NOT NULL DEFAULT 1, class TINYINT NOT NULL DEFAULT 1, gender TINYINT NOT NULL DEFAULT 0,
             level TINYINT UNSIGNED NOT NULL, xp INT NOT NULL DEFAULT 0, money INT NOT NULL DEFAULT 0,
             zone INT NOT NULL DEFAULT 0, map INT NOT NULL DEFAULT 0, online TINYINT NOT NULL DEFAULT 0,
-            totaltime INT NOT NULL DEFAULT 0, health INT NOT NULL DEFAULT 100, power1 INT NOT NULL DEFAULT 0
+            totaltime INT NOT NULL DEFAULT 0, health INT NOT NULL DEFAULT 100, power1 INT NOT NULL DEFAULT 0,
+            deleteDate INT UNSIGNED DEFAULT NULL
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
         DROP TABLE IF EXISTS `{db_name}`.character_inventory;
         CREATE TABLE `{db_name}`.character_inventory (guid INT, bag INT, slot TINYINT, item INT);
