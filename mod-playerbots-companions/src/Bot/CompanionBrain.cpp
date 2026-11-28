@@ -183,7 +183,7 @@ CompanionCoopAdmission::AdmissionConfig LoadNativeAdmissionConfig()
 {
     CompanionCoopAdmission::AdmissionConfig cfg;
     cfg.coopEnabled = CompanionBrain::CoopEnabled();
-    cfg.enabledDungeonMaps = CompanionCoopAdmission::ParseEnabledMapList(
+    cfg.enabledDungeonMaps = CompanionLfgBridge::ParseSupportedDungeonMapFilter(
         sConfigMgr->GetOption<std::string>("AiPlayerbot.Companion.Coop.EnabledDungeonMaps", "", false));
     cfg.maxManagedGroups = sConfigMgr->GetOption<uint32>(
         "AiPlayerbot.Companion.Coop.MaxManagedGroups", CompanionCoopAdmission::DEFAULT_MAX_MANAGED_GROUPS, false);
@@ -1587,7 +1587,8 @@ bool CompanionBrain::TryBuildCompanionLfgJoin(Player const* bot, bool shiftEnded
                 hasSelf = true;
         if (!hasSelf)
             continue;
-        if (auto const* spec = CompanionLfgBridge::ResolveSupportedLfgDungeon(run.targetMapId, run.difficulty))
+        if (auto const* spec = CompanionLfgBridge::ResolveSupportedLfgDungeon(run.targetMapId, run.difficulty,
+                                                                          run.lfgDungeonId))
         {
             if (LFGDungeonEntry const* dbc = sLFGDungeonStore.LookupEntry(spec->lfgDungeonId))
             {
@@ -1842,6 +1843,12 @@ CompanionCoopLifecycle::MemberControlDecision CompanionBrain::EvaluateCoopLifecy
     in.opportunityId = opportunityId;
     in.groupId = group->GetGUID().GetCounter();
     in.targetMapId = targetMapId;
+    {
+        std::lock_guard<std::mutex> lock(gCoopMutex);
+        for (auto const& run : gCoopRegistry.Runs())
+            if (run.opportunityId == opportunityId)
+                in.lfgDungeonId = run.lfgDungeonId;
+    }
     in.isLfgGroup = group->isLFGGroup();
     in.groupedWithOwner = sCompanionBotMgr.IsGroupedWithOwner(bot);
     in.botInTargetDungeon = (bot->GetMap() && bot->GetMap()->IsNonRaidDungeon() && bot->GetMapId() == targetMapId);
@@ -3146,7 +3153,8 @@ void CompanionBrain::ReloadCoopMemberships()
         "i.character_guid, i.role, i.state, i.opportunity_revision, "
         "p.enrolled_coop, p.state, "
         "EXISTS(SELECT 1 FROM companion_persona_characters pc "
-        "  WHERE pc.persona_id = i.persona_id AND pc.character_guid = i.character_guid AND pc.active = 1) "
+        "  WHERE pc.persona_id = i.persona_id AND pc.character_guid = i.character_guid AND pc.active = 1), "
+        "o.lfg_dungeon_id "
         "FROM companion_opportunities o "
         "JOIN ("
         "  SELECT id FROM companion_opportunities "
@@ -3194,6 +3202,7 @@ void CompanionBrain::ReloadCoopMemberships()
                 run.revision = rev;
                 run.targetMapId = mapId;
                 run.difficulty = diff;
+                run.lfgDungeonId = f[17].Get<uint32>();
                 run.expectedGroupId = grpGuid;
                 run.runState = runState;
                 run.assemblyDeadline = baseUntil + assemblyGraceSec;

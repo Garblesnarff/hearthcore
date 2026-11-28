@@ -1,6 +1,7 @@
 """Tests for Issue #18: Future voluntary dungeon commitments across staggered shifts."""
 from __future__ import annotations
 
+import gc
 import hashlib
 import os
 import sqlite3
@@ -276,6 +277,10 @@ class TestIssue18FutureCommitments(unittest.TestCase):
             self.assertEqual(len(found), 1)
             self.assertEqual(found[0]["persona_id"], tank["persona_id"])
 
+            # Settle sidecars first: a GC'd setup handle checkpoints and removes -wal, and the digest's own
+            # mode=ro reader then recreates it. Neither is a write by the pass under test.
+            gc.collect()
+            _wal_aware_db_digest(db_path)
             before_hash = _wal_aware_db_digest(db_path)
             shadow = run_shadow_match_snapshot(
                 {"companions": {}, "observed_at": "2026-11-30T12:00:00Z"},

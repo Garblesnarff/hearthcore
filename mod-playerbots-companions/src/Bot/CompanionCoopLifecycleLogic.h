@@ -7,6 +7,8 @@
 #ifndef PLAYERBOTS_COMPANION_COOP_LIFECYCLE_LOGIC_H
 #define PLAYERBOTS_COMPANION_COOP_LIFECYCLE_LOGIC_H
 
+#include "CompanionLfgBridgeLogic.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -124,6 +126,7 @@ struct MemberControlInput
     std::uint64_t opportunityId = 0;
     std::uint32_t groupId = 0;
     std::uint32_t targetMapId = 0;
+    std::uint32_t lfgDungeonId = 0;              // Picks the wing on multi-wing maps (0 = unknown)
     bool isLfgGroup = false;
     bool groupedWithOwner = false;
     bool hasHumanMember = false;
@@ -174,6 +177,7 @@ struct RunProgressRecord
     std::uint64_t opportunityId = 0;
     std::uint32_t groupId = 0;
     std::uint32_t targetMapId = 0;
+    std::uint32_t lfgDungeonId = 0;
     RunPhase phase = RunPhase::WaitingForGroupEntry;
     std::uint32_t entryClockStartedAt = 0;  // Starts ONLY once LFG group formed or any member enters dungeon (P1-5)
     std::uint32_t enteredDungeonAt = 0;
@@ -241,7 +245,8 @@ public:
     bool HasActiveRuns() const { return !_runs.empty(); }
 
     void RegisterOrRefreshRun(std::uint64_t opportunityId, std::uint32_t groupId, std::uint32_t targetMapId,
-                              std::uint32_t nowSec, bool startEntryClock = false)
+                              std::uint32_t nowSec, bool startEntryClock = false,
+                              std::uint32_t lfgDungeonId = 0)
     {
         if (opportunityId == 0 || groupId == 0 || targetMapId == 0)
             return;
@@ -264,6 +269,8 @@ public:
             if (startEntryClock && rec.entryClockStartedAt == 0)
                 rec.entryClockStartedAt = nowSec;
         }
+        if (lfgDungeonId != 0)
+            rec.lfgDungeonId = lfgDungeonId;
         _oppByGroup[groupId] = opportunityId;
     }
 
@@ -291,10 +298,14 @@ public:
                                                            [creatureEntry](DungeonWaypoint const& wp) {
                                                                return wp.bossEntry == creatureEntry;
                                                            }));
+        // Dungeons without a scripted route take their final boss from the supported-dungeon table. 0 (unknown
+        // or ambiguous wing) leaves completion to the native LFG_STATE_FINISHED_DUNGEON observation.
+        std::uint32_t const finalBoss =
+            spec ? spec->finalBossEntry : CompanionLfgBridge::LookupDungeonFinalBoss(mapId, rec.lfgDungeonId);
         if (isDungeonBoss || isKnownRouteBoss)
             rec.killedBossEntries.insert(creatureEntry);
 
-        if (spec && creatureEntry == spec->finalBossEntry)
+        if (finalBoss != 0 && creatureEntry == finalBoss)
         {
             rec.finalBossEntryKilled = creatureEntry;
             rec.completionSource = CompletionSource::FinalBossKill;
@@ -382,7 +393,8 @@ public:
             return dec;
 
         bool const shouldStartEntryClock = (in.isLfgGroup || in.botInTargetDungeon);
-        RegisterOrRefreshRun(in.opportunityId, in.groupId, in.targetMapId, nowSec, shouldStartEntryClock);
+        RegisterOrRefreshRun(in.opportunityId, in.groupId, in.targetMapId, nowSec, shouldStartEntryClock,
+                             in.lfgDungeonId);
         auto runIt = _runs.find(in.opportunityId);
         if (runIt == _runs.end())
             return dec;

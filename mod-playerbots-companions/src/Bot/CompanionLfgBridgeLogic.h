@@ -8,7 +8,9 @@
 #define PLAYERBOTS_COMPANION_LFG_BRIDGE_LOGIC_H
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -76,34 +78,115 @@ struct SupportedLfgDungeon
 {
     std::uint32_t lfgDungeonId = 0;   // WotLK 3.3.5a LFGDungeons.dbc ID
     std::uint32_t mapId = 0;
-    std::uint8_t difficulty = 0;      // 0 = Normal 5-player only
+    std::uint8_t difficulty = 0;      // 0 = Normal 5-player, 1 = Heroic 5-player (raids >= 2 rejected)
     std::uint8_t minLevel = 15;       // fallback if DBC bounds not supplied
     std::uint8_t maxLevel = 80;
-    bool allianceOnly = false;
+    std::uint8_t faction = 0;         // 0 = both, 1 = Alliance only, 2 = Horde only
+    std::uint8_t expansion = 0;       // 0 = Classic, 1 = TBC, 2 = WotLK
+    std::uint32_t finalBossEntry = 0; // instance_encounters.creditEntry (0 = spell/event credit via LFG_STATE_FINISHED_DUNGEON)
     char const* slug = "";
 };
 
-// Phase II pilot supported dungeon allowlist matching hearthcore/dungeons.py (unsupported dungeons return nullptr ->
-// fail closed!). Live C++ callers also supply DBC bounds from sLFGDungeonStore so level/faction rules follow DBC.
+// Complete WotLK 3.3.5a 5-player RDF dungeon table (60 Normal + 32 Heroic = 92 dungeons) matching hearthcore/dungeons.py.
+// Raids, battlegrounds, random dungeon IDs, and seasonal holiday events are excluded (fail closed -> nullptr).
+// Live C++ callers also supply DBC bounds from sLFGDungeonStore so level rules follow the installed server DBC.
 inline std::vector<SupportedLfgDungeon> const& SupportedDungeonTable()
 {
     static std::vector<SupportedLfgDungeon> const kTable = {
-        {12, 34, 0, 15, 34, true, "stockade_n"},   // The Stockade (Normal, Alliance)
-        {6, 36, 0, 15, 28, false, "deadmines_n"},  // The Deadmines (Normal, Both)
+        {12, 34, 0, 15, 34, 1, 0, 1716, "stockade_n"},
+        {6, 36, 0, 15, 28, 0, 0, 639, "deadmines_n"},
+        {1, 43, 0, 15, 25, 0, 0, 3654, "wailing_caverns_n"},
+        {4, 389, 0, 15, 21, 2, 0, 11520, "ragefire_chasm_n"},
+        {8, 33, 0, 16, 26, 0, 0, 4275, "sfk_n"},
+        {10, 48, 0, 19, 29, 0, 0, 4829, "bfd_n"},
+        {16, 47, 0, 22, 32, 0, 0, 4421, "razorfen_kraul_n"},
+        {14, 90, 0, 23, 33, 0, 0, 7800, "gnomeregan_n"},
+        {18, 189, 0, 27, 37, 0, 0, 4543, "scarlet_monastery_graveyard_n"},
+        {165, 189, 0, 30, 40, 0, 0, 6487, "scarlet_monastery_library_n"},
+        {20, 129, 0, 32, 42, 0, 0, 7358, "razorfen_downs_n"},
+        {163, 189, 0, 32, 42, 0, 0, 3975, "scarlet_monastery_armory_n"},
+        {22, 70, 0, 35, 45, 0, 0, 2748, "uldaman_n"},
+        {164, 189, 0, 35, 45, 0, 0, 3977, "scarlet_monastery_cathedral_n"},
+        {272, 349, 0, 39, 49, 0, 0, 12236, "maraudon_purple_crystals_n"},
+        {24, 209, 0, 41, 51, 0, 0, 7267, "zulfarrak_n"},
+        {26, 349, 0, 41, 51, 0, 0, 12258, "maraudon_orange_crystals_n"},
+        {273, 349, 0, 43, 53, 0, 0, 12201, "maraudon_pristine_waters_n"},
+        {28, 109, 0, 45, 55, 0, 0, 5709, "sunken_temple_n"},
+        {30, 230, 0, 47, 57, 0, 0, 9018, "blackrock_depths_prison_n"},
+        {276, 230, 0, 51, 61, 0, 0, 9019, "blackrock_depths_upper_city_n"},
+        {34, 429, 0, 53, 63, 0, 0, 11492, "dire_maul_east_n"},
+        {2, 289, 0, 55, 65, 0, 0, 1853, "scholomance_n"},
+        {32, 229, 0, 55, 65, 0, 0, 9568, "lower_blackrock_spire_n"},
+        {36, 429, 0, 55, 65, 0, 0, 11486, "dire_maul_west_n"},
+        {38, 429, 0, 55, 65, 0, 0, 11501, "dire_maul_north_n"},
+        {40, 329, 0, 55, 65, 0, 0, 10813, "stratholme_main_gate_n"},
+        {274, 329, 0, 55, 65, 0, 0, 10440, "stratholme_service_entrance_n"},
+        {136, 543, 0, 57, 67, 0, 1, 17537, "hellfire_ramparts_n"},
+        {137, 542, 0, 59, 68, 0, 1, 17377, "blood_furnace_n"},
+        {140, 547, 0, 60, 69, 0, 1, 17942, "slave_pens_n"},
+        {146, 546, 0, 61, 70, 0, 1, 17882, "underbog_n"},
+        {148, 557, 0, 62, 71, 0, 1, 18344, "mana_tombs_n"},
+        {149, 558, 0, 63, 72, 0, 1, 18373, "auchenai_crypts_n"},
+        {170, 560, 0, 64, 73, 0, 1, 18096, "escape_from_durnholde_n"},
+        {150, 556, 0, 65, 73, 0, 1, 18473, "sethekk_halls_n"},
+        {138, 540, 0, 67, 75, 0, 1, 16808, "shattered_halls_n"},
+        {147, 545, 0, 67, 75, 0, 1, 17798, "steamvault_n"},
+        {151, 555, 0, 67, 75, 0, 1, 18708, "shadow_labyrinth_n"},
+        {172, 554, 0, 67, 75, 0, 1, 19220, "mechanar_n"},
+        {173, 553, 0, 67, 75, 0, 1, 17977, "botanica_n"},
+        {171, 269, 0, 68, 75, 0, 1, 17881, "black_morass_n"},
+        {174, 552, 0, 68, 75, 0, 1, 20912, "arcatraz_n"},
+        {198, 585, 0, 68, 75, 0, 1, 24664, "magisters_terrace_n"},
+        {178, 558, 1, 70, 75, 0, 1, 18373, "auchenai_crypts_h"},
+        {179, 557, 1, 70, 75, 0, 1, 18344, "mana_tombs_h"},
+        {180, 556, 1, 70, 75, 0, 1, 18473, "sethekk_halls_h"},
+        {181, 555, 1, 70, 75, 0, 1, 18708, "shadow_labyrinth_h"},
+        {182, 269, 1, 70, 75, 0, 1, 17881, "black_morass_h"},
+        {183, 560, 1, 70, 75, 0, 1, 18096, "escape_from_durnholde_h"},
+        {184, 547, 1, 70, 75, 0, 1, 17942, "slave_pens_h"},
+        {185, 545, 1, 70, 75, 0, 1, 17798, "steamvault_h"},
+        {186, 546, 1, 70, 75, 0, 1, 17882, "underbog_h"},
+        {187, 542, 1, 70, 75, 0, 1, 17377, "blood_furnace_h"},
+        {188, 543, 1, 70, 75, 0, 1, 17537, "hellfire_ramparts_h"},
+        {189, 540, 1, 70, 75, 0, 1, 16808, "shattered_halls_h"},
+        {190, 552, 1, 70, 75, 0, 1, 20912, "arcatraz_h"},
+        {191, 553, 1, 70, 75, 0, 1, 17977, "botanica_h"},
+        {192, 554, 1, 70, 75, 0, 1, 19220, "mechanar_h"},
+        {201, 585, 1, 70, 75, 0, 1, 24664, "magisters_terrace_h"},
+        {202, 574, 0, 68, 80, 0, 2, 23954, "utgarde_keep_n"},
+        {225, 576, 0, 69, 80, 0, 2, 26723, "nexus_n"},
+        {204, 601, 0, 70, 80, 0, 2, 29120, "azjol_nerub_n"},
+        {218, 619, 0, 71, 80, 0, 2, 29311, "ahnkahet_the_old_kingdom_n"},
+        {214, 600, 0, 72, 80, 0, 2, 0, "draktharon_keep_n"},
+        {220, 608, 0, 73, 80, 0, 2, 31134, "violet_hold_n"},
+        {216, 604, 0, 74, 80, 0, 2, 29306, "gundrak_n"},
+        {208, 599, 0, 75, 80, 0, 2, 27978, "halls_of_stone_n"},
+        {203, 575, 0, 77, 80, 0, 2, 26861, "utgarde_pinnacle_n"},
+        {206, 578, 0, 77, 80, 0, 2, 27656, "oculus_n"},
+        {207, 602, 0, 77, 80, 0, 2, 28923, "halls_of_lightning_n"},
+        {209, 595, 0, 77, 80, 0, 2, 0, "culling_of_stratholme_n"},
+        {245, 650, 0, 80, 80, 0, 2, 0, "trial_of_the_champion_n"},
+        {251, 632, 0, 80, 80, 0, 2, 36502, "forge_of_souls_n"},
+        {253, 658, 0, 80, 80, 0, 2, 36658, "pit_of_saron_n"},
+        {255, 668, 0, 80, 80, 0, 2, 0, "halls_of_reflection_n"},
+        {205, 575, 1, 80, 80, 0, 2, 26861, "utgarde_pinnacle_h"},
+        {210, 595, 1, 80, 80, 0, 2, 0, "culling_of_stratholme_h"},
+        {211, 578, 1, 80, 80, 0, 2, 27656, "oculus_h"},
+        {212, 602, 1, 80, 80, 0, 2, 28923, "halls_of_lightning_h"},
+        {213, 599, 1, 80, 80, 0, 2, 27978, "halls_of_stone_h"},
+        {215, 600, 1, 80, 80, 0, 2, 0, "draktharon_keep_h"},
+        {217, 604, 1, 80, 80, 0, 2, 29306, "gundrak_h"},
+        {219, 619, 1, 80, 80, 0, 2, 29311, "ahnkahet_the_old_kingdom_h"},
+        {221, 608, 1, 80, 80, 0, 2, 31134, "violet_hold_h"},
+        {226, 576, 1, 80, 80, 0, 2, 26723, "nexus_h"},
+        {241, 601, 1, 80, 80, 0, 2, 29120, "azjol_nerub_h"},
+        {242, 574, 1, 80, 80, 0, 2, 23954, "utgarde_keep_h"},
+        {249, 650, 1, 80, 80, 0, 2, 0, "trial_of_the_champion_h"},
+        {252, 632, 1, 80, 80, 0, 2, 36502, "forge_of_souls_h"},
+        {254, 658, 1, 80, 80, 0, 2, 36658, "pit_of_saron_h"},
+        {256, 668, 1, 80, 80, 0, 2, 0, "halls_of_reflection_h"},
     };
     return kTable;
-}
-
-inline SupportedLfgDungeon const* ResolveSupportedLfgDungeon(std::uint32_t mapId, std::uint8_t difficulty)
-{
-    if (difficulty != 0)
-        return nullptr;  // Heroics / raids are unsupported in Phase II pilot
-    for (auto const& d : SupportedDungeonTable())
-    {
-        if (d.mapId == mapId && d.difficulty == difficulty)
-            return &d;
-    }
-    return nullptr;
 }
 
 inline SupportedLfgDungeon const* LookupSupportedLfgDungeonById(std::uint32_t rawDungeonEntry)
@@ -117,6 +200,124 @@ inline SupportedLfgDungeon const* LookupSupportedLfgDungeonById(std::uint32_t ra
             return &d;
     }
     return nullptr;
+}
+
+// Resolve a supported 5-player dungeon by (mapId, difficulty) and optional preferredLfgDungeonId.
+// Multi-wing maps (Scarlet Monastery 189, Maraudon 349, BRD 230, Dire Maul 429, Stratholme 329) REQUIRE
+// preferredLfgDungeonId > 0 so companions never queue the wrong wing; single-wing maps resolve uniquely.
+inline SupportedLfgDungeon const* ResolveSupportedLfgDungeon(std::uint32_t mapId,
+                                                             std::uint8_t difficulty,
+                                                             std::uint32_t preferredLfgDungeonId = 0)
+{
+    if (difficulty > 1)
+        return nullptr;  // Raids (>= 2) are never queued by 5-player cooperative RDF
+    if (preferredLfgDungeonId != 0)
+    {
+        SupportedLfgDungeon const* exact = LookupSupportedLfgDungeonById(preferredLfgDungeonId);
+        if (exact && exact->mapId == mapId && exact->difficulty == difficulty)
+            return exact;
+        return nullptr;
+    }
+    SupportedLfgDungeon const* match = nullptr;
+    for (auto const& d : SupportedDungeonTable())
+    {
+        if (d.mapId == mapId && d.difficulty == difficulty)
+        {
+            if (match != nullptr)
+                return nullptr;  // Ambiguous multi-wing map without explicit lfgDungeonId -> fail closed!
+            match = &d;
+        }
+    }
+    return match;
+}
+
+// Returns the final boss creature entry for a supported 5-player dungeon (0 if spell/event-credit or unknown).
+inline std::uint32_t LookupDungeonFinalBoss(std::uint32_t mapId, std::uint32_t lfgDungeonId = 0)
+{
+    if (lfgDungeonId != 0)
+    {
+        if (SupportedLfgDungeon const* exact = LookupSupportedLfgDungeonById(lfgDungeonId))
+        {
+            if (exact->mapId == mapId)
+                return exact->finalBossEntry;
+        }
+        return 0;
+    }
+    std::uint32_t boss = 0;
+    for (auto const& d : SupportedDungeonTable())
+    {
+        if (d.mapId != mapId)
+            continue;
+        if (d.finalBossEntry == 0)
+            continue;
+        if (boss != 0 && boss != d.finalBossEntry)
+            return 0;  // Multi-wing map with distinct wing bosses requires explicit lfgDungeonId!
+        boss = d.finalBossEntry;
+    }
+    return boss;
+}
+
+// Expands comma-separated AiPlayerbot.Companion.Coop.EnabledDungeonMaps tokens supporting numeric map IDs
+// PLUS safe expansion keywords: "all" / "*", "classic", "tbc", "wotlk" (NEVER admits raids or unknown maps).
+inline std::unordered_set<std::uint32_t> ParseSupportedDungeonMapFilter(std::string const& raw)
+{
+    std::unordered_set<std::uint32_t> out;
+    std::unordered_set<std::uint32_t> validMaps;
+    for (auto const& d : SupportedDungeonTable())
+        validMaps.insert(d.mapId);
+
+    size_t start = 0;
+    while (start <= raw.size())
+    {
+        size_t comma = raw.find(',', start);
+        std::string tok = raw.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        size_t f = tok.find_first_not_of(" \t\r\n\"");
+        if (f != std::string::npos)
+        {
+            size_t l = tok.find_last_not_of(" \t\r\n\"");
+            tok = tok.substr(f, l - f + 1);
+            std::transform(tok.begin(), tok.end(), tok.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (tok == "all" || tok == "*")
+            {
+                for (auto const& d : SupportedDungeonTable())
+                    out.insert(d.mapId);
+            }
+            else if (tok == "classic")
+            {
+                for (auto const& d : SupportedDungeonTable())
+                    if (d.expansion == 0)
+                        out.insert(d.mapId);
+            }
+            else if (tok == "tbc")
+            {
+                for (auto const& d : SupportedDungeonTable())
+                    if (d.expansion == 1)
+                        out.insert(d.mapId);
+            }
+            else if (tok == "wotlk")
+            {
+                for (auto const& d : SupportedDungeonTable())
+                    if (d.expansion == 2)
+                        out.insert(d.mapId);
+            }
+            else
+            {
+                char* endp = nullptr;
+                unsigned long v = std::strtoul(tok.c_str(), &endp, 10);
+                if (endp && *endp == '\0' && v > 0 && v <= 0xFFFFFFFFul)
+                {
+                    std::uint32_t const mapId = static_cast<std::uint32_t>(v);
+                    if (validMaps.count(mapId) > 0)
+                        out.insert(mapId);
+                }
+            }
+        }
+        if (comma == std::string::npos)
+            break;
+        start = comma + 1;
+    }
+    return out;
 }
 
 inline std::uint8_t ParseCoopRoleMask(std::string const& role)
@@ -364,7 +565,7 @@ inline BotOnlyMatchResult CanMatchBotOnlyProposal(bool coopEnabled,
             continue;  // Already bound to a live native group (do not match a second LFG group!)
         if (run.assemblyDeadline > 0 && nowSec >= run.assemblyDeadline)
             continue;
-        SupportedLfgDungeon const* spec = ResolveSupportedLfgDungeon(run.targetMapId, run.difficulty);
+        SupportedLfgDungeon const* spec = ResolveSupportedLfgDungeon(run.targetMapId, run.difficulty, run.lfgDungeonId);
         if (!spec)
             continue;
         if (run.roster.size() != CompanionCoopAuth::MAX_COOP_PARTY_SIZE)
@@ -497,13 +698,13 @@ public:
                 return dec;
             }
 
-            SupportedLfgDungeon const* spec = ResolveSupportedLfgDungeon(run.targetMapId, run.difficulty);
+            SupportedLfgDungeon const* spec = ResolveSupportedLfgDungeon(run.targetMapId, run.difficulty, run.lfgDungeonId);
             if (!spec)
             {
                 dec.reason = "unsupported_dungeon";
                 return dec;
             }
-            if (spec->allianceOnly && !in.isAlliance)
+            if ((spec->faction == 1 && !in.isAlliance) || (spec->faction == 2 && in.isAlliance))
             {
                 dec.reason = "faction_ineligible";
                 return dec;
@@ -883,6 +1084,8 @@ public:
             if (!run.boundToNativeGroup && run.assemblyDeadline > 0 && nowSec >= run.assemblyDeadline)
                 continue;
             if (run.targetMapId != spec->mapId || run.difficulty != spec->difficulty)
+                continue;
+            if (run.lfgDungeonId != 0 && run.lfgDungeonId != spec->lfgDungeonId)
                 continue;
             if (!ValidateConfirmedRoleComposition(run.roster, run.requiredRoles, run.revision))
                 continue;

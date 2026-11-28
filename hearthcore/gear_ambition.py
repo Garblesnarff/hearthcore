@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from .commitments import _parse_realm_id, _verify_persona_with_snapshot
-from .dungeons import CLASS_CAPABLE_ROLES, CLASS_ID_TO_NAME, DUNGEON_BY_ID, DUNGEON_BY_MAP, enabled_dungeon_ids
+from .dungeons import CLASS_CAPABLE_ROLES, CLASS_ID_TO_NAME, DUNGEON_BY_ID, DUNGEONS_BY_MAP, enabled_dungeon_ids
 from .identity import PersonaRegistry
 from .opportunities import coop_enabled
 
@@ -717,8 +717,11 @@ def load_catalog_from_db(
             for sp in _fetch_dicts(world_conn, "SELECT id, map FROM creature"):
                 cid = int(sp["id"])
                 cmap = int(sp["map"])
-                if cid not in boss_dmap and cmap in DUNGEON_BY_MAP:
-                    boss_dmap[cid] = DUNGEON_BY_MAP[cmap].dungeon_id
+                # `creature` only says which map a spawn is on. On multi-wing maps that cannot name the wing,
+                # so leave it unmapped rather than credit another wing's loot.
+                normals = [s for s in DUNGEONS_BY_MAP.get(cmap, ()) if s.difficulty != 1]
+                if cid not in boss_dmap and len(normals) == 1:
+                    boss_dmap[cid] = normals[0].dungeon_id
 
         ref_rows_by_entry: dict[int, list[dict[str, Any]]] = {}
         if "reference_loot_template" in tables:
