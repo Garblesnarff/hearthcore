@@ -445,8 +445,9 @@ class Issue22CoopDrainTests(unittest.TestCase):
         self.assertIn("HandleCompanionRecallCommand", script)
         self.assertIn("CompanionBrain::RequestCoopOwnerRecall(", script)
 
-        # Pending LFG queue cancelled cleanly when coop mode switches to Off/Draining
-        self.assertIn("if (CompanionBrain::CoopEnabled())", lfg)
+        # Pending LFG queue cancelled cleanly on world thread when coop mode switches to Off/Draining
+        self.assertIn("EvaluateLeaveQueue(", brain)
+        self.assertIn("TickCoopLfgOnWorldThread()", brain)
 
 
 if __name__ == "__main__":

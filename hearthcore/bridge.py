@@ -2684,7 +2684,19 @@ def run_cycle(
             "skipped": max(0, len(world_ctx.get("companions") or {}) - len(targets)),
         }
         day_key_utc = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+        coop_sync: dict[str, Any] = {"ok": True, "skipped": "shadow_mode"}
         try:
+            if apply:
+                from .native_lfg_bridge import sync_coop_native_lfg_bridge
+                try:
+                    coop_sync = sync_coop_native_lfg_bridge(
+                        db_path=store.path,
+                        sql_exec=sql_exec if sql_exec is not None else run_sql,
+                        now_ts=now_ts,
+                    )
+                except Exception as exc:
+                    logger.warning("Native coop LFG bridge sync skipped on error: %s", exc)
+                    coop_sync = {"ok": False, "error": str(exc)}
             for comp in targets:
                 if _STOP_EVENT.is_set():
                     logger.warning("Graceful stop requested (SIGTERM); ending cycle cleanly before %s", comp.get("name"))
@@ -2874,5 +2886,6 @@ def run_cycle(
             "failed": failed,
             "counters": counters,
             "sequence_sync": seq_info,
+            "coop_sync": coop_sync,
             "summary": summary,
         }

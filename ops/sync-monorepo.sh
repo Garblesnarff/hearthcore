@@ -93,6 +93,8 @@ if [[ "$MODE" == "mirror-cpp" ]]; then
     "src/Ai/Base/Strategy/CompanionLeadStrategy.cpp"
     "src/Ai/Base/Strategy/CompanionCraftStrategy.cpp"
     "src/Script/PlayerbotCommandScript.cpp"
+    # Mirrored upstream file with surgical OnPlayerbotCheckLFGQueue patch (Issue #20): review diff against upstream on sync!
+    "src/Script/Playerbots.cpp"
   )
   for f in "$MPB_SRC"/src/Bot/Companion*.h "$MPB_SRC"/src/Bot/Companion*.cpp; do
     [[ -f "$f" ]] || { echo "ERROR: Missing Companion* source in $MPB_SRC/src/Bot" >&2; exit 1; }

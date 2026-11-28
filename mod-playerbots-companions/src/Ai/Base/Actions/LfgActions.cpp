@@ -8,6 +8,7 @@
 #include "AiFactory.h"
 #include "CompanionBotMgr.h"
 #include "CompanionBrain.h"
+#include "CompanionLfgBridgeLogic.h"
 #include "ItemVisitors.h"
 #include "LFGMgr.h"
 #include "Opcodes.h"
@@ -86,6 +87,12 @@ uint32 LfgJoinAction::GetRoles()
 
 bool LfgJoinAction::JoinLFG()
 {
+    // Issue #20 (P1-9 & P2-1): Cooperative companions NEVER fall through to the random-bot LfgDungeons list or
+    // touch non-thread-safe LFGMgr state from map-thread AI actions; solo voluntary cooperative RDF queueing is
+    // driven exclusively on the world thread by CompanionBrain::TickCoopLfgOnWorldThread() -> SendCompanionLfgJoin().
+    if (sCompanionBotMgr.IsCompanion(bot) && !sCompanionBotMgr.IsGroupedWithOwner(bot))
+        return false;
+
     // check if already in lfg
     LfgState state = sLFGMgr->GetState(bot->GetGUID());
     if (state != LFG_STATE_NONE)
@@ -246,29 +253,76 @@ bool LfgAcceptAction::Execute(Event event)
             return false;
         for (Group::MemberSlot const& slot : grp->GetMemberSlots())
         {
-            if (!sCompanionBotMgr.IsCompanionSlot(slot.guid, slot.name))
+            if (sCompanionBotMgr.IsAnyOwnerLow(slot.guid.GetCounter()))
                 return true;
+            if (Player* member = ObjectAccessor::FindConnectedPlayer(slot.guid))
+            {
+                if (!GET_PLAYERBOT_AI(member))
+                    return true;
+            }
+            else if (!sCompanionBotMgr.IsCompanionSlot(slot.guid, slot.name))
+            {
+                return true;
+            }
         }
         return false;
     };
 
-    // Try accept if already stored
+    auto handleCompanionProposal = [this](uint32 propId, uint32 rawDungeon, uint8 propState) -> bool
+    {
+        bool const shiftEnded = !sCompanionBotMgr.IsScheduledOnline(bot->GetName(), bot);
+        CompanionLfgBridge::ProposalDecision const dec =
+            CompanionBrain::EvaluateCompanionLfgProposal(bot, propId, rawDungeon, propState, shiftEnded);
+
+        if (dec.action == CompanionLfgBridge::ProposalAction::ClearStoredOnly)
+        {
+            botAI->GetAiObjectContext()->GetValue<uint32>("lfg proposal")->Set(0);
+            CompanionBrain::OnCompanionLfgProposalFinished(bot->GetGUID().GetCounter(), propId, propState);
+            return true;
+        }
+        if (dec.action == CompanionLfgBridge::ProposalAction::Ignore)
+            return false;
+        if (dec.action == CompanionLfgBridge::ProposalAction::DeferInCombat)
+        {
+            // Keep proposal stored while finishing combat / flight / vehicle / cast; world-thread
+            // CompanionBrain::TickCoopLfgOnWorldThread re-evaluates every 2s until safe boundary or timeout.
+            botAI->GetAiObjectContext()->GetValue<uint32>("lfg proposal")->Set(propId);
+            return true;
+        }
+        if (dec.action == CompanionLfgBridge::ProposalAction::Decline)
+        {
+            LOG_INFO("playerbots", "[CompanionCoop] {} LFG proposal {} declined ({})", bot->GetName(), propId,
+                     dec.reason);
+            botAI->GetAiObjectContext()->GetValue<uint32>("lfg proposal")->Set(0);
+            WorldPacket* packet = new WorldPacket(CMSG_LFG_PROPOSAL_RESULT);
+            *packet << propId << false;
+            bot->GetSession()->QueuePacket(packet);
+            CompanionBrain::OnCompanionLfgProposalDeclined(bot->GetGUID().GetCounter(), propId, dec.reason);
+            return true;
+        }
+        // Accept at safe boundary (P2-3: do NOT call ClearUnitState(UNIT_STATE_ALL_STATE) or botAI->Reset(),
+        // which can corrupt taxi/vehicle or companion mode/lease state!).
+        botAI->GetAiObjectContext()->GetValue<uint32>("lfg proposal")->Set(0);
+        WorldPacket* packet = new WorldPacket(CMSG_LFG_PROPOSAL_RESULT);
+        *packet << propId << true;
+        bot->GetSession()->QueuePacket(packet);
+        CompanionBrain::OnCompanionLfgProposalAccepted(bot->GetGUID().GetCounter(), dec.opportunityId, propId,
+                                                       dec.lfgDungeonId);
+        LOG_INFO("playerbots", "[CompanionCoop] {} accepted native LFG proposal {} for opp #{} (lfgId={})",
+                 bot->GetName(), propId, dec.opportunityId, dec.lfgDungeonId);
+        return true;
+    };
+
+    bool const isCoopCompanion =
+        sCompanionBotMgr.IsCompanion(bot) && !sCompanionBotMgr.IsGroupedWithOwner(bot) && !isHumanLedGroup();
+
+    // Try accept if already stored (world-thread TickCoopLfgOnWorldThread handles deferred coop proposals safely
+    // without map-thread LFGMgr reads — P1-9!)
     if (id)
     {
-        bool blockedByAdmission = false;
-        if (sCompanionBotMgr.IsCompanion(bot) && !sCompanionBotMgr.IsGroupedWithOwner(bot) && !isHumanLedGroup())
-        {
-            uint32 const knownDungeon =
-                sLFGMgr->GetDungeon(bot->GetGroup() ? bot->GetGroup()->GetGUID() : bot->GetGUID(), true);
-            std::string admitReason;
-            if (!CompanionBrain::TryAdmitCompanionLfgProposal(bot, id, knownDungeon, &admitReason))
-            {
-                LOG_INFO("playerbots", "[CompanionCoop] {} LFG proposal {} declined ({})", bot->GetName(), id,
-                         admitReason);
-                blockedByAdmission = true;
-            }
-        }
-        if (bot->IsInCombat() || bot->isDead() || blockedByAdmission)
+        if (isCoopCompanion)
+            return false;
+        if (bot->IsInCombat() || bot->isDead())
         {
             botAI->GetAiObjectContext()->GetValue<uint32>("lfg proposal")->Set(0);
             WorldPacket* packet = new WorldPacket(CMSG_LFG_PROPOSAL_RESULT);
@@ -294,7 +348,7 @@ bool LfgAcceptAction::Execute(Event event)
         return true;
     }
 
-    // If we get the proposal packet, accept immediately
+    // If we get the proposal packet, check state & safe boundary
     if (!event.getPacket().empty())
     {
         WorldPacket p(event.getPacket());
@@ -304,18 +358,14 @@ bool LfgAcceptAction::Execute(Event event)
 
         if (id)
         {
-            bool blockedByAdmission = false;
-            if (sCompanionBotMgr.IsCompanion(bot) && !sCompanionBotMgr.IsGroupedWithOwner(bot) && !isHumanLedGroup())
+            if (isCoopCompanion)
+                return handleCompanionProposal(id, dungeonId, state);
+            if (state != lfg::LFG_PROPOSAL_INITIATING)
             {
-                std::string admitReason;
-                if (!CompanionBrain::TryAdmitCompanionLfgProposal(bot, id, dungeonId, &admitReason))
-                {
-                    LOG_INFO("playerbots", "[CompanionCoop] {} LFG proposal {} (dungeon {}) declined ({})",
-                             bot->GetName(), id, dungeonId, admitReason);
-                    blockedByAdmission = true;
-                }
+                botAI->GetAiObjectContext()->GetValue<uint32>("lfg proposal")->Set(0);
+                return true;
             }
-            if (bot->IsInCombat() || bot->isDead() || blockedByAdmission)
+            if (bot->IsInCombat() || bot->isDead())
             {
                 botAI->GetAiObjectContext()->GetValue<uint32>("lfg proposal")->Set(0);
                 WorldPacket* packet = new WorldPacket(CMSG_LFG_PROPOSAL_RESULT);
@@ -359,15 +409,10 @@ bool LfgLeaveAction::Execute(Event /*event*/)
     // otherwise pulls random bots straight back out, so LFGQueue::CheckCompatibility never
     // sees a role-complete pool that holds still long enough to form a group. Turning
     // RandomBotJoinLfg off still lets whoever is mid-queue fall through and leave.
-    // Issue #22: When coop admission mode is Off or Draining, cancel pending queued companions cleanly.
+    // Issue #20 & #22 (P1-9 & P2-2): Cooperative companion queue leaves are driven exclusively on the world thread
+    // by CompanionBrain::TickCoopLfgOnWorldThread() so map-thread random triggers never race LFGMgr or spam leaves.
     if (sCompanionBotMgr.IsCompanion(bot) && !sCompanionBotMgr.IsGroupedWithOwner(bot))
-    {
-        if (CompanionBrain::CoopEnabled())
-            return false;
-        WorldPacket* packet = new WorldPacket(CMSG_LFG_LEAVE);
-        bot->GetSession()->QueuePacket(packet);
-        return true;
-    }
+        return false;
     if (sPlayerbotAIConfig.randomBotJoinLfg && RandomPlayerbotMgr::instance().IsRandomBot(bot))
         return false;
 
@@ -402,6 +447,11 @@ bool LfgTeleportAction::Execute(Event event)
 
 bool LfgJoinAction::isUseful()
 {
+    // Issue #20 (P0-2, P1-9, P2-1): Cooperative companions queue exclusively on the world thread via
+    // CompanionBrain::TickCoopLfgOnWorldThread() — never via map-thread LfgJoinAction or random-bot LfgDungeons!
+    if (sCompanionBotMgr.IsCompanion(bot) && !sCompanionBotMgr.IsGroupedWithOwner(bot))
+        return false;
+
     if (!sPlayerbotAIConfig.randomBotJoinLfg)
     {
         // botAI->ChangeStrategy("-lfg", BOT_STATE_NON_COMBAT);
@@ -433,11 +483,11 @@ bool LfgJoinAction::isUseful()
     if (bot->isDead())
         return false;
 
-    if (!RandomPlayerbotMgr::instance().IsRandomBot(bot))
-        return false;
-
     Map* map = bot->GetMap();
     if (map && map->Instanceable())
+        return false;
+
+    if (!RandomPlayerbotMgr::instance().IsRandomBot(bot))
         return false;
 
     LfgState state = sLFGMgr->GetState(bot->GetGUID());

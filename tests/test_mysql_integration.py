@@ -12,6 +12,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from hearthcore.bridge import (
     BrainStore,
@@ -736,6 +737,104 @@ class MySQLIntegrationTests(unittest.TestCase):
                 "WHERE opportunity_id = 5001 AND character_guid = 101;"
             )[0],
             ["released", "coop_toggled_off", "0"],
+        )
+
+        # 5) Issue #20: Verify MySQL 8.0 idempotent migration (P0-1) on a PRE-#20 table WITHOUT the 5 LFG columns!
+        db_name = os.environ["HEARTHCORE_DB_NAME"]
+        mig_sql = (ROOT / "ops" / "sql" / "migrations" / "2026_11_27_issue20_native_lfg_columns.sql").read_text(
+            encoding="utf-8"
+        )
+        run_sql(
+            "ALTER TABLE companion_opportunities "
+            "DROP COLUMN lfg_dungeon_id, DROP COLUMN native_queue_id, "
+            "DROP COLUMN native_proposal_id, DROP COLUMN native_run_id, DROP COLUMN correlation_key;"
+        )
+        # Apply migration TWICE to prove MySQL 8.0 syntax AND strict idempotency!
+        run_sql(mig_sql)
+        run_sql(mig_sql)
+        col_cnt = run_sql(
+            f"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = '{db_name}' "
+            "AND table_name = 'companion_opportunities' "
+            "AND column_name IN ('lfg_dungeon_id', 'native_queue_id', 'native_proposal_id', 'native_run_id', 'correlation_key');"
+        )[0][0]
+        self.assertEqual(col_cnt, "5")
+
+        # 6) Issue #20: Verify transactional publish (P1-10), empty native_queue_id on publish (P1-5),
+        #    correlation_key collision guard, AND exact C++ SQL templates for queue -> proposal -> bind -> run -> cancel!
+        from hearthcore.native_lfg_bridge import build_mysql_publish_statements
+        sample_opp = {
+            "id": 6001,
+            "revision": 2,
+            "creator_guid": 101,
+            "faction": "alliance",
+            "guild_id": 6,
+            "dungeon_id": "stockade_n",
+            "state": "confirmed",
+            "is_shadow": False,
+            "created_at": now - 30,
+            "recruit_until": now + 600,
+            "estimated_minutes": 30,
+            "correlation_key": "opp:6001:r2",
+            "members": [
+                {"persona_id": "p_101", "character_guid": 101, "role": "tank", "state": "accepted", "available_until": now + 3600},
+                {"persona_id": "p_102", "character_guid": 102, "role": "healer", "state": "accepted", "available_until": now + 3600},
+                {"persona_id": "p_103", "character_guid": 103, "role": "damage", "state": "accepted", "available_until": now + 3600},
+                {"persona_id": "p_104", "character_guid": 104, "role": "damage", "state": "accepted", "available_until": now + 3600},
+                {"persona_id": "p_105", "character_guid": 105, "role": "damage", "state": "accepted", "available_until": now + 3600},
+            ],
+        }
+        with mock.patch.dict(os.environ, {"HEARTHCORE_COOP_ENABLED": "1", "HEARTHCORE_COOP_MODE": "enabled", "HEARTHCORE_COOP_DUNGEONS": "stockade_n"}):
+            ok, reason, stmts = build_mysql_publish_statements(sample_opp, now_ts=now, include_lfg_columns=True)
+        self.assertTrue(ok, reason)
+        run_sql("\n".join(stmts))
+        # Native queue ID MUST start empty at publish time (P1-5)!
+        self.assertEqual(
+            run_sql("SELECT native_queue_id, (SELECT COUNT(*) FROM companion_opportunity_interests WHERE opportunity_id = 6001) FROM companion_opportunities WHERE id = 6001;")[0],
+            ["", "5"],
+        )
+
+        # P1-10: Attempting to publish a DIFFERENT opportunity with colliding id=6001 & different correlation_key
+        # MUST NOT attach foreign interest rows (character_guid 201..205)!
+        colliding_opp = dict(sample_opp, correlation_key="opp:6001:foreign", members=[
+            {"persona_id": "p_201", "character_guid": 201, "role": "tank", "state": "accepted", "available_until": now + 3600},
+            {"persona_id": "p_202", "character_guid": 202, "role": "healer", "state": "accepted", "available_until": now + 3600},
+            {"persona_id": "p_203", "character_guid": 203, "role": "damage", "state": "accepted", "available_until": now + 3600},
+            {"persona_id": "p_204", "character_guid": 204, "role": "damage", "state": "accepted", "available_until": now + 3600},
+            {"persona_id": "p_205", "character_guid": 205, "role": "damage", "state": "accepted", "available_until": now + 3600},
+        ])
+        with mock.patch.dict(os.environ, {"HEARTHCORE_COOP_ENABLED": "1", "HEARTHCORE_COOP_MODE": "enabled", "HEARTHCORE_COOP_DUNGEONS": "stockade_n"}):
+            ok2, _, stmts2 = build_mysql_publish_statements(colliding_opp, now_ts=now, include_lfg_columns=True)
+        self.assertTrue(ok2)
+        run_sql("\n".join(stmts2))
+        self.assertEqual(
+            run_sql("SELECT COUNT(*) FROM companion_opportunity_interests WHERE opportunity_id = 6001 AND character_guid = 201;")[0][0],
+            "0",
+        )
+
+        # Exact C++ FlushCoopGroupMutations SQL templates: Queued -> ProposalAccepted -> Bind -> Post-bind RunEntered!
+        run_sql(
+            "UPDATE companion_opportunities SET lfg_dungeon_id = 12, "
+            "native_queue_id = IF(native_queue_id = '', 'lfgq:6001:12', native_queue_id) "
+            "WHERE id = 6001 AND is_shadow = 0 AND state IN ('assembling', 'active');"
+        )
+        run_sql(
+            "UPDATE companion_opportunities SET lfg_dungeon_id = 12, native_proposal_id = 91 "
+            "WHERE id = 6001 AND is_shadow = 0 AND state IN ('assembling', 'active');"
+        )
+        run_sql(
+            "UPDATE companion_opportunities SET group_guid = 955, state = 'active' "
+            "WHERE id = 6001 AND revision = 2 AND is_shadow = 0 AND state IN ('assembling', 'active');"
+        )
+        run_sql(
+            "UPDATE companion_opportunities SET native_run_id = IF(native_run_id = '', 'lfgr:955:401:34', native_run_id) "
+            "WHERE id = 6001 AND group_guid = 955 AND is_shadow = 0 AND state = 'active';"
+        )
+        self.assertEqual(
+            run_sql(
+                "SELECT lfg_dungeon_id, native_queue_id, native_proposal_id, group_guid, native_run_id, correlation_key "
+                "FROM companion_opportunities WHERE id = 6001;"
+            )[0],
+            ["12", "lfgq:6001:12", "91", "955", "lfgr:955:401:34", "opp:6001:r2"],
         )
 
 

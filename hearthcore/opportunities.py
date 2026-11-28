@@ -1088,6 +1088,34 @@ class OpportunityCoordinator:
         finally:
             conn.close()
 
+    def list_opportunities(
+        self,
+        *,
+        include_shadow: bool = False,
+        states: tuple[str, ...] | None = None,
+    ) -> list[dict[str, Any]]:
+        conn = self._conn()
+        try:
+            clauses: list[str] = []
+            params: list[Any] = []
+            if not include_shadow:
+                clauses.append("is_shadow = 0")
+            if states:
+                ph = ",".join("?" for _ in states)
+                clauses.append(f"state IN ({ph})")
+                params.extend(states)
+            where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+            rows = conn.execute(f"SELECT id FROM opportunities{where} ORDER BY id ASC", params).fetchall()
+            opp_ids = [int(r["id"]) for r in rows]
+        finally:
+            conn.close()
+        out: list[dict[str, Any]] = []
+        for oid in opp_ids:
+            opp = self.get_opportunity(oid)
+            if opp is not None:
+                out.append(opp)
+        return out
+
     def reserve_party(
         self,
         opportunity_id: int,

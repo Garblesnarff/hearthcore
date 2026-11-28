@@ -10,6 +10,7 @@
 #include "CompanionCoopAdmissionLogic.h"
 #include "CompanionCoopAuthLogic.h"
 #include "CompanionCoopDrainLogic.h"
+#include "CompanionLfgBridgeLogic.h"
 #include "CompanionDuty.h"
 #include "CompanionCraft.h"
 #include "CompanionLife.h"
@@ -24,6 +25,7 @@
 #include <sstream>
 #include <unordered_set>
 
+#include "AiObjectContext.h"
 #include "Bag.h"
 #include "Config.h"
 #include "DBCStores.h"
@@ -39,11 +41,13 @@
 #include "Map.h"
 #include "MapMgr.h"
 #include "ObjectAccessor.h"
+#include "Opcodes.h"
 #include "Player.h"
 #include "Playerbots.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotAIConfig.h"
 #include "StringFormat.h"
+#include "WorldPacket.h"
 #include "WorldSessionMgr.h"
 
 namespace
@@ -116,6 +120,33 @@ std::mutex gDrainMutex;
 CompanionCoopDrain::DrainCoordinator gDrainCoordinator;
 std::atomic<bool> gCoopBootProbeDone{false};
 std::atomic<bool> gCoopDbHealthy{true};
+
+// Issue #20: Native WotLK RDF/LFG voluntary queue bridge & world-thread DB outcome persistence.
+std::mutex gLfgBridgeMutex;
+CompanionLfgBridge::LfgBridgeController gLfgBridge;
+std::vector<CompanionLfgBridge::LfgLifecycleEvent> gPendingLfgEvents;  // guarded by gCoopQueueMutex
+std::unordered_set<uint64> gRecordedRunEnteredOpps;                     // guarded by gLfgBridgeMutex
+std::atomic<bool> gHasNativeLfgColumns{false};
+bool gNativeLfgColumnsProbed = false;
+uint32 gCoopLfgTickTimer = 0;
+constexpr uint32 COOP_LFG_TICK_MS = 2000;
+
+std::string SanitizeSqlToken(std::string const& raw, size_t maxLen = 64)
+{
+    std::string out;
+    out.reserve(std::min(raw.size(), maxLen));
+    for (unsigned char c : raw)
+    {
+        if (out.size() >= maxLen)
+            break;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' ||
+            c == ':')
+            out.push_back(static_cast<char>(c));
+        else
+            out.push_back('_');
+    }
+    return out;
+}
 
 // Issue #12: Native admission controller, world-tick p99 ring buffer & host telemetry sampler.
 std::mutex gAdmissionMutex;
@@ -621,6 +652,15 @@ void CompanionBrain::Update(uint32 elapsed)
     }
 
     FlushCoopGroupMutations();
+
+    // Issue #20 (P1-9): Drive cooperative LFG join/leave/confirmed-queue/deferred-proposal lifecycle exclusively on
+    // the world thread every 2s (ZERO map-thread sLFGMgr calls; ZERO work when coop is OFF and nothing is tracked!).
+    gCoopLfgTickTimer += elapsed;
+    if (gCoopLfgTickTimer >= COOP_LFG_TICK_MS)
+    {
+        gCoopLfgTickTimer = 0;
+        TickCoopLfgOnWorldThread();
+    }
 
     _timer += elapsed;
     _proposalTimer += elapsed;
@@ -1435,6 +1475,544 @@ bool CompanionBrain::CoopHeadroomPaused()
     return gAdmissionController.IsHeadroomPaused();
 }
 
+bool CompanionBrain::IsCoopLfgTrackedBot(uint32 botGuid)
+{
+    if (!botGuid)
+        return false;
+    std::lock_guard<std::mutex> llock(gLfgBridgeMutex);
+    return gLfgBridge.HasTrackedBot(botGuid);
+}
+
+bool CompanionBrain::AllowBotOnlyLfgProposal(std::vector<uint32> const& candidateGuids)
+{
+    if (!CoopEnabled())
+        return false;
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    std::vector<CompanionCoopAuth::AuthorizedRun> runsCopy;
+    {
+        std::lock_guard<std::mutex> lock(gCoopMutex);
+        runsCopy = gCoopRegistry.Runs();
+    }
+    CompanionLfgBridge::BotOnlyMatchResult const match =
+        CompanionLfgBridge::CanMatchBotOnlyProposal(true, runsCopy, candidateGuids, now);
+    if (!match.allowed)
+        return false;
+
+    // Count offline members outside locks (Issue #12: zero forced mass logins!)
+    uint32 offlineCount = 0;
+    for (uint32 g : candidateGuids)
+    {
+        if (!ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(g)))
+            ++offlineCount;
+    }
+    std::string admitReason;
+    if (!TryAdmitCoopQueue(match.opportunityId, match.targetMapId, /*allMembersEnrolled=*/true, offlineCount,
+                           &admitReason))
+    {
+        LOG_INFO("playerbots", "[CompanionCoop] Bot-only LFG proposal blocked for opp #{} ({})", match.opportunityId,
+                 admitReason);
+        return false;
+    }
+    return true;
+}
+
+bool CompanionBrain::TryBuildCompanionLfgJoin(Player const* bot, bool shiftEnded,
+                                              CompanionLfgBridge::JoinDecision& outDecision)
+{
+    outDecision = CompanionLfgBridge::JoinDecision{};
+    if (!bot || !CoopEnabled())
+    {
+        outDecision.reason = "coop_disabled";
+        return false;
+    }
+
+    uint32 const botLow = bot->GetGUID().GetCounter();
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+
+    std::vector<CompanionCoopAuth::AuthorizedRun> runsCopy;
+    {
+        std::lock_guard<std::mutex> lock(gCoopMutex);
+        runsCopy = gCoopRegistry.Runs();
+    }
+
+    CompanionLfgBridge::JoinEligibilityInput in;
+    in.botGuid = botLow;
+    in.botLevel = bot->GetLevel();
+    in.botClass = bot->getClass();
+    in.isAlliance = (bot->GetTeamId() == TEAM_ALLIANCE);
+    in.nativeLfgState = static_cast<uint8>(sLFGMgr->GetState(bot->GetGUID()));
+    in.inGroup = (bot->GetGroup() != nullptr);
+    in.groupedWithOwner = sCompanionBotMgr.IsGroupedWithOwner(bot);
+    in.inCombat = bot->IsInCombat();
+    in.isDead = bot->isDead();
+    in.inBattlegroundOrQueue = (bot->InBattleground() || bot->InBattlegroundQueue());
+    in.inInstance = (bot->GetMap() && bot->GetMap()->Instanceable());
+    in.hasLfgDeserter = bot->HasAura(CompanionCoopDrain::SPELL_LFG_DUNGEON_DESERTER);
+    in.hasLfgCooldown = bot->HasAura(CompanionCoopDrain::SPELL_LFG_DUNGEON_COOLDOWN);
+    in.shiftEnded = shiftEnded;
+    {
+        std::lock_guard<std::mutex> dlock(gDrainMutex);
+        in.ownerRecalled = gDrainCoordinator.HasPendingRecall(botLow);
+    }
+    // Preserve core AzerothCore locked dungeon rules (level/gear/quest/heroic lockout; LfgLockMap value != 0).
+    for (auto const& [rawEntry, lockStatus] : sLFGMgr->GetLockedDungeons(bot->GetGUID()))
+    {
+        if (lockStatus != 0)
+            in.lockedLfgDungeonIds.insert(rawEntry & 0x00FFFFFFu);
+    }
+    // P2-5: Populate live DBC level bounds from sLFGDungeonStore for this bot's assembling dungeon!
+    for (auto const& run : runsCopy)
+    {
+        if (run.isShadow || run.runState != "assembling" || run.boundToNativeGroup)
+            continue;
+        bool hasSelf = false;
+        for (auto const& m : run.roster)
+            if (m.characterGuid == botLow)
+                hasSelf = true;
+        if (!hasSelf)
+            continue;
+        if (auto const* spec = CompanionLfgBridge::ResolveSupportedLfgDungeon(run.targetMapId, run.difficulty))
+        {
+            if (LFGDungeonEntry const* dbc = sLFGDungeonStore.LookupEntry(spec->lfgDungeonId))
+            {
+                in.dbcMinLevel = static_cast<uint8>(dbc->MinLevel);
+                in.dbcMaxLevel = static_cast<uint8>(dbc->MaxLevel);
+            }
+        }
+        break;
+    }
+
+    {
+        std::lock_guard<std::mutex> llock(gLfgBridgeMutex);
+        outDecision = gLfgBridge.EvaluateJoinEligibility(true, runsCopy, in, now);
+    }
+    if (!outDecision.canJoin)
+        return false;
+
+    // Enforce Issue #12 native admission flags, allowlist, headroom + hysteresis, and caps BEFORE queueing!
+    std::string admitReason;
+    if (!TryAdmitCompanionLfgJoin(bot, {outDecision.targetMapId}, &admitReason))
+    {
+        outDecision.canJoin = false;
+        outDecision.reason = admitReason.empty() ? "admission_gate_blocked" : admitReason;
+        return false;
+    }
+    return true;
+}
+
+bool CompanionBrain::SendCompanionLfgJoin(Player* bot, PlayerbotAI* botAI, bool shiftEnded)
+{
+    if (!bot || !botAI || !CoopEnabled())
+        return false;
+    CompanionLfgBridge::JoinDecision joinDec;
+    if (!TryBuildCompanionLfgJoin(bot, shiftEnded, joinDec))
+    {
+        if (joinDec.reason != "no_assembling_opportunity" && joinDec.reason != "coop_disabled" &&
+            joinDec.reason != "join_packet_in_flight" && joinDec.reason != "already_in_native_lfg")
+            LOG_INFO("playerbots", "[CompanionCoop] {} native LFG join skipped ({})", bot->GetName(), joinDec.reason);
+        return false;
+    }
+    LFGDungeonEntry const* entry = sLFGDungeonStore.LookupEntry(joinDec.lfgDungeonId);
+    if (!entry || entry->TypeID == lfg::LFG_TYPE_RANDOM || entry->MapID <= 0 ||
+        static_cast<uint32>(entry->MapID) != joinDec.targetMapId)
+        return false;
+
+    std::string const gs = std::to_string(botAI->GetEquipGearScore(bot));
+    WorldPacket* data = new WorldPacket(CMSG_LFG_JOIN);
+    *data << static_cast<uint32>(joinDec.roleMask);
+    *data << static_cast<bool>(false);
+    *data << static_cast<bool>(false);
+    *data << static_cast<uint8>(1);
+    *data << static_cast<uint32>(joinDec.lfgDungeonId);
+    *data << static_cast<uint8>(3) << static_cast<uint8>(0) << static_cast<uint8>(0) << static_cast<uint8>(0);
+    *data << gs;
+    bot->GetSession()->QueuePacket(data);
+    MarkCompanionLfgJoinSent(bot->GetGUID().GetCounter(), joinDec.opportunityId, joinDec.lfgDungeonId);
+    LOG_INFO("playerbots",
+             "[CompanionCoop] {} sent native RDF join for opp #{} (lfgId={}, map={}, roleMask={})",
+             bot->GetName(), joinDec.opportunityId, joinDec.lfgDungeonId, joinDec.targetMapId, joinDec.roleMask);
+    return true;
+}
+
+void CompanionBrain::MarkCompanionLfgJoinSent(uint32 botGuid, uint64 opportunityId, uint32 lfgDungeonId)
+{
+    if (!botGuid || !opportunityId || !lfgDungeonId)
+        return;
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    std::lock_guard<std::mutex> llock(gLfgBridgeMutex);
+    // P1-5: Do NOT emit Queued to MySQL on packet send; emit only once core confirms LFG_STATE_QUEUED!
+    gLfgBridge.MarkJoinPacketSent(botGuid, opportunityId, lfgDungeonId, now);
+}
+
+bool CompanionBrain::ShouldCompanionLeaveLfgQueue(Player const* bot, bool shiftEnded, std::string* outReason)
+{
+    if (outReason)
+        outReason->clear();
+    if (!bot)
+        return false;
+    uint32 const botLow = bot->GetGUID().GetCounter();
+    uint8 const lfgState = static_cast<uint8>(sLFGMgr->GetState(bot->GetGUID()));
+    bool const groupedWithOwner = sCompanionBotMgr.IsGroupedWithOwner(bot);
+    bool const inBgOrInst =
+        bot->InBattleground() || bot->InBattlegroundQueue() || (bot->GetMap() && bot->GetMap()->Instanceable());
+    bool recalled = false;
+    {
+        std::lock_guard<std::mutex> dlock(gDrainMutex);
+        recalled = gDrainCoordinator.HasPendingRecall(botLow);
+    }
+    std::vector<CompanionCoopAuth::AuthorizedRun> runsCopy;
+    {
+        std::lock_guard<std::mutex> lock(gCoopMutex);
+        runsCopy = gCoopRegistry.Runs();
+    }
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    std::lock_guard<std::mutex> llock(gLfgBridgeMutex);
+    return gLfgBridge.ShouldLeaveQueue(CoopEnabled(), runsCopy, botLow, lfgState, groupedWithOwner, recalled,
+                                       shiftEnded, inBgOrInst, now, outReason);
+}
+
+void CompanionBrain::OnCompanionLfgQueueLeft(uint32 botGuid, std::string const& reason, bool isStaleRequeue)
+{
+    if (!botGuid)
+        return;
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    CompanionLfgBridge::LfgLifecycleEvent ev;
+    {
+        std::lock_guard<std::mutex> llock(gLfgBridgeMutex);
+        ev = gLfgBridge.OnQueueCancelled(botGuid, reason, now, isStaleRequeue);
+    }
+    if (ev.opportunityId == 0)
+        return;
+    std::lock_guard<std::mutex> qlock(gCoopQueueMutex);
+    gPendingLfgEvents.push_back(std::move(ev));
+}
+
+void CompanionBrain::OnCompanionJoinedOwnerGroup(uint32 botGuid)
+{
+    if (!botGuid)
+        return;
+    // P0-2 & P2-6: Only clear & release if this bot ACTUALLY had a solo coop LFG queue tracked by the bridge!
+    // Use forceRelease=true so an in-flight leave packet never drops the release/cancel event!
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    CompanionLfgBridge::LfgLifecycleEvent ev;
+    {
+        std::lock_guard<std::mutex> llock(gLfgBridgeMutex);
+        if (!gLfgBridge.HasTrackedBot(botGuid))
+            return;
+        ev = gLfgBridge.OnQueueCancelled(botGuid, "grouped_with_owner", now, false, /*forceRelease=*/true);
+        gLfgBridge.ClearBot(botGuid);
+    }
+    if (ev.opportunityId == 0)
+        return;
+    std::lock_guard<std::mutex> qlock(gCoopQueueMutex);
+    gPendingLfgEvents.push_back(std::move(ev));
+}
+
+void CompanionBrain::OnCompanionLogout(uint32 botGuid)
+{
+    if (!botGuid)
+        return;
+    // P2-6: Emit release/cancel event before pruning offline tracked bot so remaining 4 bots don't sit queued!
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    CompanionLfgBridge::LfgLifecycleEvent ev;
+    {
+        std::lock_guard<std::mutex> llock(gLfgBridgeMutex);
+        if (gLfgBridge.HasTrackedBot(botGuid))
+            ev = gLfgBridge.OnQueueCancelled(botGuid, "bot_offline", now, false, /*forceRelease=*/true);
+        gLfgBridge.ClearBot(botGuid);
+    }
+    if (ev.opportunityId == 0)
+        return;
+    std::lock_guard<std::mutex> qlock(gCoopQueueMutex);
+    gPendingLfgEvents.push_back(std::move(ev));
+}
+
+void CompanionBrain::TickCoopLfgOnWorldThread()
+{
+    bool const enabled = CoopEnabled();
+    bool hasTracked = false;
+    std::unordered_set<uint32> candidateGuids;
+    std::vector<CompanionCoopAuth::AuthorizedRun> runsCopy;
+    {
+        std::lock_guard<std::mutex> llock(gLfgBridgeMutex);
+        hasTracked = gLfgBridge.HasAnyTrackedState();
+        for (uint32 g : gLfgBridge.TrackedBotGuids())
+            candidateGuids.insert(g);
+    }
+    if (!enabled && !hasTracked)
+        return;  // P0-2 & P1-9: Zero sLFGMgr reads and zero work when coop is OFF and nothing is tracked!
+
+    {
+        std::lock_guard<std::mutex> lock(gCoopMutex);
+        runsCopy = gCoopRegistry.Runs();
+    }
+    if (enabled)
+    {
+        for (auto const& run : runsCopy)
+        {
+            if (run.isShadow || run.runState != "assembling" || run.boundToNativeGroup)
+                continue;
+            for (auto const& m : run.roster)
+                candidateGuids.insert(m.characterGuid);
+        }
+    }
+    if (candidateGuids.empty())
+        return;
+
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    for (uint32 botLow : candidateGuids)
+    {
+        Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(botLow));
+        if (!bot || !bot->IsInWorld())
+        {
+            // Prune offline tracked bot cleanly (P2-7)
+            if (!bot)
+                OnCompanionLogout(botLow);
+            continue;
+        }
+        PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+        if (!botAI || !sCompanionBotMgr.IsCompanion(bot))
+            continue;
+
+        if (sCompanionBotMgr.IsGroupedWithOwner(bot))
+        {
+            OnCompanionJoinedOwnerGroup(botLow);
+            continue;
+        }
+        if (bot->GetGroup() != nullptr)
+            continue;  // Already in a native group; managed by AuthorizeCoopGroup & EvaluateCoopDrain
+
+        bool const shiftEnded = !sCompanionBotMgr.IsScheduledOnline(bot->GetName(), bot);
+        lfg::LfgState const lfgState = sLFGMgr->GetState(bot->GetGUID());
+
+        // 1. Re-evaluate any combat/unsafe-boundary deferred native LFG proposal safely on the world thread (P1-2!)
+        uint32 const deferredPropId = botAI->GetAiObjectContext()->GetValue<uint32>("lfg proposal")->Get();
+        if (deferredPropId != 0)
+        {
+            if (lfgState != lfg::LFG_STATE_PROPOSAL)
+            {
+                // P1-2: Proposal already expired/failed/completed in LFGMgr — NEVER send packet or record false accept!
+                botAI->GetAiObjectContext()->GetValue<uint32>("lfg proposal")->Set(0);
+                OnCompanionLfgProposalFinished(botLow, deferredPropId, CompanionLfgBridge::PROPOSAL_STATE_FAILED);
+                continue;
+            }
+            CompanionLfgBridge::ProposalDecision const pdec = EvaluateCompanionLfgProposal(
+                bot, deferredPropId, /*rawDungeonEntry=*/0, CompanionLfgBridge::PROPOSAL_STATE_INITIATING, shiftEnded);
+            if (pdec.action == CompanionLfgBridge::ProposalAction::ClearStoredOnly)
+            {
+                botAI->GetAiObjectContext()->GetValue<uint32>("lfg proposal")->Set(0);
+                OnCompanionLfgProposalFinished(botLow, deferredPropId, CompanionLfgBridge::PROPOSAL_STATE_FAILED);
+            }
+            else if (pdec.action == CompanionLfgBridge::ProposalAction::Decline)
+            {
+                botAI->GetAiObjectContext()->GetValue<uint32>("lfg proposal")->Set(0);
+                WorldPacket* pkt = new WorldPacket(CMSG_LFG_PROPOSAL_RESULT);
+                *pkt << deferredPropId << false;
+                bot->GetSession()->QueuePacket(pkt);
+                OnCompanionLfgProposalDeclined(botLow, deferredPropId, pdec.reason);
+                LOG_INFO("playerbots", "[CompanionCoop] {} deferred LFG proposal {} declined ({})", bot->GetName(),
+                         deferredPropId, pdec.reason);
+            }
+            else if (pdec.action == CompanionLfgBridge::ProposalAction::Accept)
+            {
+                botAI->GetAiObjectContext()->GetValue<uint32>("lfg proposal")->Set(0);
+                WorldPacket* pkt = new WorldPacket(CMSG_LFG_PROPOSAL_RESULT);
+                *pkt << deferredPropId << true;
+                bot->GetSession()->QueuePacket(pkt);
+                OnCompanionLfgProposalAccepted(botLow, pdec.opportunityId, deferredPropId, pdec.lfgDungeonId);
+                LOG_INFO("playerbots",
+                         "[CompanionCoop] {} accepted deferred LFG proposal {} at safe boundary for opp #{}",
+                         bot->GetName(), deferredPropId, pdec.opportunityId);
+            }
+            continue;
+        }
+
+        // 2. When core confirms LFG_STATE_QUEUED: record real queue confirmation (P1-5) & evaluate clean leave/requeue
+        if (lfgState == lfg::LFG_STATE_QUEUED)
+        {
+            CompanionLfgBridge::LfgLifecycleEvent qEv;
+            {
+                std::lock_guard<std::mutex> llock(gLfgBridgeMutex);
+                qEv = gLfgBridge.ObserveNativeQueued(botLow, now, runsCopy);
+            }
+            if (qEv.kind == CompanionLfgBridge::LfgLifecycleEventKind::Queued && qEv.opportunityId != 0)
+            {
+                std::lock_guard<std::mutex> qlock(gCoopQueueMutex);
+                gPendingLfgEvents.push_back(std::move(qEv));
+            }
+
+            bool const inBgOrInst =
+                bot->InBattleground() || bot->InBattlegroundQueue() || (bot->GetMap() && bot->GetMap()->Instanceable());
+            bool recalled = false;
+            {
+                std::lock_guard<std::mutex> dlock(gDrainMutex);
+                recalled = gDrainCoordinator.HasPendingRecall(botLow);
+            }
+            CompanionLfgBridge::LeaveQueueDecision ldec;
+            {
+                std::lock_guard<std::mutex> llock(gLfgBridgeMutex);
+                ldec = gLfgBridge.EvaluateLeaveQueue(enabled, runsCopy, botLow, static_cast<uint8>(lfgState),
+                                                     /*groupedWithOwner=*/false, recalled, shiftEnded, inBgOrInst, now);
+            }
+            if (ldec.shouldLeave)
+            {
+                WorldPacket* leavePkt = new WorldPacket(CMSG_LFG_LEAVE);
+                bot->GetSession()->QueuePacket(leavePkt);
+                OnCompanionLfgQueueLeft(botLow, ldec.reason, ldec.isStaleRequeue);
+                LOG_INFO("playerbots", "[CompanionCoop] {} left native LFG queue ({}, requeue={})", bot->GetName(),
+                         ldec.reason, ldec.isStaleRequeue ? "yes" : "no");
+            }
+            continue;
+        }
+
+        // 3. When idle in LFG_STATE_NONE: prune stale post-timeout/post-failure tracking (P2-A) and, if coop is
+        //    Enabled, queue eligible specific dungeon natively!
+        if (lfgState == lfg::LFG_STATE_NONE)
+        {
+            {
+                std::lock_guard<std::mutex> llock(gLfgBridgeMutex);
+                gLfgBridge.PruneIfIdleInNone(botLow, runsCopy, now);
+            }
+            if (enabled)
+                SendCompanionLfgJoin(bot, botAI, shiftEnded);
+        }
+    }
+}
+
+CompanionLfgBridge::ProposalDecision CompanionBrain::EvaluateCompanionLfgProposal(Player const* bot, uint32 proposalId,
+                                                                                  uint32 rawDungeonEntry,
+                                                                                  uint8 proposalState, bool shiftEnded)
+{
+    CompanionLfgBridge::ProposalDecision empty;
+    if (!bot || !proposalId)
+        return empty;
+    uint32 const botLow = bot->GetGUID().GetCounter();
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+
+    bool hasHuman = false;
+    if (Group const* grp = bot->GetGroup())
+    {
+        for (Group::MemberSlot const& slot : grp->GetMemberSlots())
+        {
+            if (sCompanionBotMgr.IsAnyOwnerLow(slot.guid.GetCounter()))
+            {
+                hasHuman = true;
+                break;
+            }
+            if (Player* member = ObjectAccessor::FindConnectedPlayer(slot.guid))
+            {
+                if (!GET_PLAYERBOT_AI(member))
+                {
+                    hasHuman = true;
+                    break;
+                }
+            }
+            else if (!sCompanionBotMgr.IsCompanionSlot(slot.guid, slot.name))
+            {
+                hasHuman = true;
+                break;
+            }
+        }
+    }
+
+    uint32 effectiveRawDungeon = rawDungeonEntry;
+    if (effectiveRawDungeon == 0)
+    {
+        uint32 trackedProp = 0;
+        uint32 trackedDungeon = 0;
+        std::lock_guard<std::mutex> llock(gLfgBridgeMutex);
+        if (gLfgBridge.HasTrackedProposal(botLow, trackedProp, trackedDungeon) && trackedProp == proposalId)
+            effectiveRawDungeon = trackedDungeon;
+    }
+
+    CompanionLfgBridge::ProposalInput in;
+    in.botGuid = botLow;
+    in.proposalId = proposalId;
+    in.rawDungeonEntry = effectiveRawDungeon;
+    in.proposalState = proposalState;
+    in.groupedWithOwner = sCompanionBotMgr.IsGroupedWithOwner(bot);
+    in.hasHumanMember = hasHuman;
+    in.inCombat = bot->IsInCombat();
+    in.inUnsafeBoundary =
+        bot->IsInFlight() || bot->GetVehicle() != nullptr || bot->IsNonMeleeSpellCast(false) || bot->IsFalling();
+    in.isDead = bot->isDead();
+    in.hasLfgDeserter = bot->HasAura(CompanionCoopDrain::SPELL_LFG_DUNGEON_DESERTER);
+    in.hasLfgCooldown = bot->HasAura(CompanionCoopDrain::SPELL_LFG_DUNGEON_COOLDOWN);
+    in.shiftEnded = shiftEnded;
+    {
+        std::lock_guard<std::mutex> dlock(gDrainMutex);
+        in.ownerRecalled = gDrainCoordinator.HasPendingRecall(botLow);
+    }
+
+    if (proposalState == CompanionLfgBridge::PROPOSAL_STATE_INITIATING && !in.groupedWithOwner && !in.hasHumanMember)
+    {
+        std::string admitReason;
+        in.admissionAllowed = TryAdmitCompanionLfgProposal(bot, proposalId, effectiveRawDungeon, &admitReason);
+        in.admissionReason = std::move(admitReason);
+    }
+
+    std::vector<CompanionCoopAuth::AuthorizedRun> runsCopy;
+    {
+        std::lock_guard<std::mutex> lock(gCoopMutex);
+        runsCopy = gCoopRegistry.Runs();
+    }
+    std::lock_guard<std::mutex> llock(gLfgBridgeMutex);
+    return gLfgBridge.EvaluateProposal(CoopEnabled(), runsCopy, in, now);
+}
+
+void CompanionBrain::OnCompanionLfgProposalAccepted(uint32 botGuid, uint64 opportunityId, uint32 proposalId,
+                                                    uint32 lfgDungeonId)
+{
+    if (!botGuid || !opportunityId || !proposalId)
+        return;
+    CompanionLfgBridge::LfgLifecycleEvent ev;
+    {
+        std::lock_guard<std::mutex> llock(gLfgBridgeMutex);
+        ev = gLfgBridge.MarkProposalAccepted(botGuid, opportunityId, proposalId, lfgDungeonId);
+    }
+    std::lock_guard<std::mutex> qlock(gCoopQueueMutex);
+    gPendingLfgEvents.push_back(std::move(ev));
+}
+
+void CompanionBrain::OnCompanionLfgProposalDeclined(uint32 botGuid, uint32 proposalId, std::string const& reason)
+{
+    if (!botGuid)
+        return;
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    CompanionLfgBridge::LfgLifecycleEvent ev;
+    {
+        std::lock_guard<std::mutex> llock(gLfgBridgeMutex);
+        ev = gLfgBridge.OnProposalDeclinedOrFailed(botGuid, proposalId, /*wasDecline=*/true, reason, now);
+    }
+    if (ev.opportunityId == 0)
+        return;
+    std::lock_guard<std::mutex> qlock(gCoopQueueMutex);
+    gPendingLfgEvents.push_back(std::move(ev));
+}
+
+void CompanionBrain::OnCompanionLfgProposalFinished(uint32 botGuid, uint32 proposalId, uint8 proposalState)
+{
+    if (!botGuid)
+        return;
+    if (proposalState == CompanionLfgBridge::PROPOSAL_STATE_SUCCESS)
+    {
+        std::lock_guard<std::mutex> llock(gLfgBridgeMutex);
+        gLfgBridge.OnProposalSucceeded(botGuid, proposalId);
+        return;
+    }
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    CompanionLfgBridge::LfgLifecycleEvent ev;
+    {
+        std::lock_guard<std::mutex> llock(gLfgBridgeMutex);
+        ev = gLfgBridge.OnProposalDeclinedOrFailed(botGuid, proposalId, /*wasDecline=*/false, "native_proposal_failed",
+                                                   now);
+    }
+    if (ev.opportunityId == 0)
+        return;
+    std::lock_guard<std::mutex> qlock(gCoopQueueMutex);
+    gPendingLfgEvents.push_back(std::move(ev));
+}
+
 void CompanionBrain::OnNativeGroupMemberRemoved(Group const* group, uint32 memberLowGuid)
 {
     if (!group || !memberLowGuid)
@@ -1575,26 +2153,29 @@ void CompanionBrain::FlushCoopGroupMutations()
     std::vector<PendingCoopDisband> disbands;
     std::vector<PendingCoopBind> binds;
     std::vector<PendingCoopExit> exits;
+    std::vector<CompanionLfgBridge::LfgLifecycleEvent> lfgEvents;
     {
         std::lock_guard<std::mutex> lock(gCoopQueueMutex);
         // When mode != Enabled (Draining or Off), cancel all pending uncommitted binds immediately while
-        // STILL retaining disbands and safe-boundary member exit commitment releases!
+        // STILL retaining disbands, safe-boundary exit releases, and LFG decline/cancel events!
         if (!CompanionCoopDrain::AllowsNewAdmissions(mode))
         {
             gPendingCoopBinds.clear();
             gFailedBindCooldown.clear();
         }
-        if (gPendingCoopDisbands.empty() && gPendingCoopBinds.empty() && gPendingCoopExits.empty())
+        if (gPendingCoopDisbands.empty() && gPendingCoopBinds.empty() && gPendingCoopExits.empty() &&
+            gPendingLfgEvents.empty())
             return;
         disbands.swap(gPendingCoopDisbands);
         exits.swap(gPendingCoopExits);
+        lfgEvents.swap(gPendingLfgEvents);
         binds.reserve(gPendingCoopBinds.size());
         for (auto& [oppId, req] : gPendingCoopBinds)
             binds.push_back(std::move(req));
         gPendingCoopBinds.clear();
     }
 
-    // Issue #22: Defer exits, disbands AND binds while DB is unhealthy so no writes are lost during outages
+    // Issue #22: Defer exits, disbands, LFG events AND binds while DB is unhealthy so no writes are lost during outages
     // and disbands can never race ahead of deferred drained exits!
     auto restoreDeferred = [&](std::vector<PendingCoopExit>& remExits)
     {
@@ -1605,6 +2186,9 @@ void CompanionBrain::FlushCoopGroupMutations()
         if (!disbands.empty())
             gPendingCoopDisbands.insert(gPendingCoopDisbands.begin(), std::make_move_iterator(disbands.begin()),
                                         std::make_move_iterator(disbands.end()));
+        if (!lfgEvents.empty())
+            gPendingLfgEvents.insert(gPendingLfgEvents.begin(), std::make_move_iterator(lfgEvents.begin()),
+                                     std::make_move_iterator(lfgEvents.end()));
         if (CompanionCoopDrain::AllowsNewAdmissions(mode))
         {
             for (auto& b : binds)
@@ -1788,6 +2372,100 @@ void CompanionBrain::FlushCoopGroupMutations()
         LOG_INFO("playerbots", "[CompanionCoop] Cleared DB group_guid {} after native group disband", d.groupId);
     }
 
+    // Issue #20: Persist pre-bind native WotLK RDF/LFG queue, proposal, decline, failure, and cancel events to MySQL!
+    // RunEntered events run AFTER binds below (P1-3) so state='active' AND group_guid are already committed!
+    // P2-7: If the boot column probe has not yet run, defer Queued/ProposalAccepted/RunEntered instead of dropping!
+    bool const colsProbed = gNativeLfgColumnsProbed;
+    bool const hasLfgCols = gHasNativeLfgColumns.load();
+    std::vector<CompanionLfgBridge::LfgLifecycleEvent> runEnteredEvents;
+    std::vector<CompanionLfgBridge::LfgLifecycleEvent> deferredPreProbeEvents;
+    bool cancelledAnyAssemblingOpp = false;
+    for (CompanionLfgBridge::LfgLifecycleEvent const& ev : lfgEvents)
+    {
+        if (!ev.opportunityId)
+            continue;
+        if (!colsProbed && (ev.kind == CompanionLfgBridge::LfgLifecycleEventKind::Queued ||
+                            ev.kind == CompanionLfgBridge::LfgLifecycleEventKind::ProposalAccepted ||
+                            ev.kind == CompanionLfgBridge::LfgLifecycleEventKind::RunEntered))
+        {
+            deferredPreProbeEvents.push_back(ev);
+            continue;
+        }
+        if (ev.kind == CompanionLfgBridge::LfgLifecycleEventKind::RunEntered)
+        {
+            runEnteredEvents.push_back(ev);
+            continue;
+        }
+        std::string const safeReason = SanitizeSqlToken(ev.reason, 64);
+        std::string const safeQueueId = SanitizeSqlToken(ev.nativeQueueId, 64);
+        if (ev.kind == CompanionLfgBridge::LfgLifecycleEventKind::Queued && hasLfgCols && !safeQueueId.empty())
+        {
+            CharacterDatabase.DirectExecute(Acore::StringFormat(
+                "UPDATE companion_opportunities SET lfg_dungeon_id = {}, "
+                "native_queue_id = IF(native_queue_id = '', '{}', native_queue_id) "
+                "WHERE id = {} AND is_shadow = 0 AND state IN ('assembling', 'active')",
+                ev.lfgDungeonId, safeQueueId, ev.opportunityId));
+        }
+        else if (ev.kind == CompanionLfgBridge::LfgLifecycleEventKind::ProposalAccepted && hasLfgCols)
+        {
+            CharacterDatabase.DirectExecute(Acore::StringFormat(
+                "UPDATE companion_opportunities SET lfg_dungeon_id = {}, native_proposal_id = {} "
+                "WHERE id = {} AND is_shadow = 0 AND state IN ('assembling', 'active')",
+                ev.lfgDungeonId, ev.proposalId, ev.opportunityId));
+        }
+        else if (ev.kind == CompanionLfgBridge::LfgLifecycleEventKind::ProposalDeclined ||
+                 ev.kind == CompanionLfgBridge::LfgLifecycleEventKind::ProposalFailed ||
+                 ev.kind == CompanionLfgBridge::LfgLifecycleEventKind::QueueCancelled)
+        {
+            // Release declining/recalled/timed-out/cancelled bot's reservation cleanly in authoritative MySQL!
+            if (ev.botGuid != 0)
+            {
+                CharacterDatabase.DirectExecute(Acore::StringFormat(
+                    "UPDATE companion_opportunity_interests SET state = 'released', reason_code = '{}', "
+                    "reserved_until = 0, updated_at = {} "
+                    "WHERE opportunity_id = {} AND character_guid = {} AND state IN ('reserved', 'accepted')",
+                    safeReason, now, ev.opportunityId, ev.botGuid));
+            }
+            // P1-1 & P1-4 & P1-8: When a member declines, times out, fails proposal, or is recalled while
+            // assembling, cancel the assembling opportunity AND release its admission token so the other 4 bots
+            // leave the native queue cleanly instead of sitting queued until expiresAt!
+            if (ev.cancelOpportunity)
+            {
+                ReleaseCoopAdmissionToken(ev.opportunityId);
+                {
+                    std::lock_guard<std::mutex> llock(gLfgBridgeMutex);
+                    gRecordedRunEnteredOpps.erase(ev.opportunityId);
+                }
+                if (hasLfgCols && ev.proposalId > 0)
+                {
+                    CharacterDatabase.DirectExecute(Acore::StringFormat(
+                        "UPDATE companion_opportunities SET state = 'cancelled', "
+                        "native_proposal_id = IF(native_proposal_id = 0, {}, native_proposal_id), "
+                        "outcome_reason = '{}' "
+                        "WHERE id = {} AND is_shadow = 0 AND state = 'assembling'",
+                        ev.proposalId, safeReason, ev.opportunityId));
+                }
+                else
+                {
+                    CharacterDatabase.DirectExecute(Acore::StringFormat(
+                        "UPDATE companion_opportunities SET state = 'cancelled', outcome_reason = '{}' "
+                        "WHERE id = {} AND is_shadow = 0 AND state = 'assembling'",
+                        safeReason, ev.opportunityId));
+                }
+                cancelledAnyAssemblingOpp = true;
+            }
+        }
+    }
+    if (!deferredPreProbeEvents.empty())
+    {
+        std::lock_guard<std::mutex> qlock(gCoopQueueMutex);
+        gPendingLfgEvents.insert(gPendingLfgEvents.begin(),
+                                 std::make_move_iterator(deferredPreProbeEvents.begin()),
+                                 std::make_move_iterator(deferredPreProbeEvents.end()));
+    }
+    if (cancelledAnyAssemblingOpp)
+        _proposalTimer = PROPOSAL_REFRESH_MS;  // Trigger immediate membership reload so remaining 4 bots leave queue!
+
     for (PendingCoopBind const& req : binds)
     {
         if (!req.opportunityId || !req.snap.groupId)
@@ -1962,6 +2640,30 @@ void CompanionBrain::FlushCoopGroupMutations()
                      req.opportunityId, bindReason);
         }
     }
+
+    // Issue #20 (P1-3): Persist native_run_id AFTER binds commit so state='active' AND group_guid are guaranteed
+    // present; confirm DB row persisted BEFORE recording in gRecordedRunEnteredOpps so writes are never lost!
+    if (hasLfgCols && !runEnteredEvents.empty())
+    {
+        for (CompanionLfgBridge::LfgLifecycleEvent const& ev : runEnteredEvents)
+        {
+            std::string const safeRunId = SanitizeSqlToken(ev.nativeRunId, 64);
+            if (!ev.opportunityId || !ev.groupId || safeRunId.empty())
+                continue;
+            CharacterDatabase.DirectExecute(Acore::StringFormat(
+                "UPDATE companion_opportunities SET native_run_id = IF(native_run_id = '', '{}', native_run_id) "
+                "WHERE id = {} AND group_guid = {} AND is_shadow = 0 AND state = 'active'",
+                safeRunId, ev.opportunityId, ev.groupId));
+            QueryResult rConfirm = CharacterDatabase.Query(Acore::StringFormat(
+                "SELECT 1 FROM companion_opportunities WHERE id = {} AND native_run_id != ''",
+                ev.opportunityId));
+            if (rConfirm)
+            {
+                std::lock_guard<std::mutex> llock(gLfgBridgeMutex);
+                gRecordedRunEnteredOpps.insert(ev.opportunityId);
+            }
+        }
+    }
 }
 
 void CompanionBrain::ReloadCoopMemberships()
@@ -1989,8 +2691,8 @@ void CompanionBrain::ReloadCoopMemberships()
             std::lock_guard<std::mutex> lock(gCoopQueueMutex);
             gPendingCoopBinds.clear();
             gFailedBindCooldown.clear();
-            hasPendingWrites =
-                (!gPendingCoopExits.empty() || !gPendingCoopDisbands.empty() || !gPendingDrainedOpps.empty());
+            hasPendingWrites = (!gPendingCoopExits.empty() || !gPendingCoopDisbands.empty() ||
+                                !gPendingDrainedOpps.empty() || !gPendingLfgEvents.empty());
         }
         if (mode == CompanionCoopDrain::CoopMode::Off && !hasOwned && !hasPendingWrites && gCoopBootProbeDone.load())
         {
@@ -2043,6 +2745,28 @@ void CompanionBrain::ReloadCoopMemberships()
     {
         std::lock_guard<std::mutex> lock(gDrainMutex);
         gDrainCoordinator.NoteDbHealthy();
+    }
+    // Issue #20: Probe once whether optional native RDF tracking columns exist on companion_opportunities
+    // so unmigrated live DBs never throw ER_BAD_FIELD_ERROR!
+    if (!gNativeLfgColumnsProbed)
+    {
+        QueryResult colProbe = CharacterDatabase.Query(
+            "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() "
+            "AND table_name = 'companion_opportunities' "
+            "AND column_name IN ('lfg_dungeon_id', 'native_queue_id', 'native_proposal_id', 'native_run_id', 'correlation_key')");
+        if (colProbe)
+        {
+            uint64 const colCount = colProbe->Fetch()[0].Get<uint64>();
+            gHasNativeLfgColumns.store(colCount >= 5);
+            gNativeLfgColumnsProbed = true;
+            if (colCount < 5)
+            {
+                LOG_WARN("playerbots",
+                         "[CompanionCoop] companion_opportunities is missing Issue #20 native LFG columns ({}/5 found); "
+                         "native queue/proposal/run ID persistence disabled until ops/sql/migrations/2026_11_27_issue20_native_lfg_columns.sql is applied",
+                         colCount);
+            }
+        }
     }
     // DB is confirmed healthy right now — flush pending exits, disbands (and binds if Enabled) before reading DB!
     FlushCoopGroupMutations();
@@ -2302,12 +3026,22 @@ void CompanionBrain::ReloadCoopMemberships()
     }
     if (reloaded)
     {
-        // Prune committed tokens ONLY for runs that are neither in liveOppIds nor still owned/draining!
+        // Prune committed tokens & recorded RunEntered opp IDs ONLY for runs neither live nor still draining (P2-7)!
         std::unordered_set<uint64_t> keepOppIds = liveOppIds;
         {
             std::lock_guard<std::mutex> dlock(gDrainMutex);
             for (uint64_t oid : gDrainCoordinator.OwnedOpportunityIds())
                 keepOppIds.insert(oid);
+        }
+        {
+            std::lock_guard<std::mutex> llock(gLfgBridgeMutex);
+            for (auto it = gRecordedRunEnteredOpps.begin(); it != gRecordedRunEnteredOpps.end();)
+            {
+                if (keepOppIds.count(*it) == 0)
+                    it = gRecordedRunEnteredOpps.erase(it);
+                else
+                    ++it;
+            }
         }
         std::lock_guard<std::mutex> lock(gAdmissionMutex);
         (void)gAdmissionController.PruneCommittedTokensNotIn(keepOppIds);
@@ -2365,6 +3099,43 @@ bool CompanionBrain::AuthorizeCoopGroup(Player const* bot, CompanionCoopAuth::Na
                 if (outReason)
                     *outReason = "runtime_pin_mismatch";
                 return false;
+            }
+        }
+    }
+
+    // Issue #20 (P1-3): Enqueue RunEntered without pre-marking gRecordedRunEnteredOpps (FlushCoopGroupMutations
+    // marks it ONLY after DB confirms native_run_id persisted, after binds commit!).
+    if (dec.authorized && botInNonRaidDungeon && botInstanceId != 0 && snap.groupId != 0)
+    {
+        bool alreadyRecorded = false;
+        {
+            std::lock_guard<std::mutex> llock(gLfgBridgeMutex);
+            alreadyRecorded = (gRecordedRunEnteredOpps.count(dec.opportunityId) > 0);
+        }
+        if (!alreadyRecorded)
+        {
+            std::lock_guard<std::mutex> qlock(gCoopQueueMutex);
+            bool alreadyQueued = false;
+            for (auto const& pev : gPendingLfgEvents)
+            {
+                if (pev.kind == CompanionLfgBridge::LfgLifecycleEventKind::RunEntered &&
+                    pev.opportunityId == dec.opportunityId)
+                {
+                    alreadyQueued = true;
+                    break;
+                }
+            }
+            if (!alreadyQueued)
+            {
+                CompanionLfgBridge::LfgLifecycleEvent ev;
+                ev.kind = CompanionLfgBridge::LfgLifecycleEventKind::RunEntered;
+                ev.opportunityId = dec.opportunityId;
+                ev.botGuid = botGuid;
+                ev.groupId = snap.groupId;
+                ev.instanceId = botInstanceId;
+                ev.nativeRunId = CompanionLfgBridge::FormatNativeRunId(snap.groupId, botInstanceId, botMapId);
+                ev.reason = "native_instance_entered";
+                gPendingLfgEvents.push_back(std::move(ev));
             }
         }
     }
