@@ -205,154 +205,203 @@ class DungeonSpec:
 
 # Verified against installed acore_world.instance_template, dungeon_access_template,
 # areatrigger_teleport & WotLK 3.3.5a LFGDungeons.dbc
-DUNGEON_CATALOG: tuple[DungeonSpec, ...] = (
+# Authoritative WotLK 3.3.5a 5-player RDF dungeon table (60 Normal + 32 Heroic = 92 dungeons),
+# generated directly from installed LFGDungeons.dbc + instance_template.sql + areatrigger_teleport.sql.
+# Tuple: (dungeon_id, name, map_id, diff, areatrigger_id, script, emap, ex, ey, ez, min_l, max_l, rec_min, rec_max, raid_stage, faction, est_min, travel_min, lfg_id, legal_min, entrance_zones)
+_SUPPORTED_RDF_DUNGEON_ROWS: tuple[tuple, ...] = (
+    ('stockade_n', 'The Stockade', 34, 0, 101, 'instance_the_stockade', 0, -8764.8, 846.1, 87.5, 15, 34, 22, 30, 0, 'alliance', 30, 8, 12, 15, (1519, 12)),
+    ('deadmines_n', 'The Deadmines', 36, 0, 78, 'instance_deadmines', 0, -11208.3, 1672.5, 24.7, 15, 28, 17, 24, 0, 'both', 45, 12, 6, 10, (40, 12, 1519)),
+    ('wailing_caverns_n', 'Wailing Caverns', 43, 0, 228, 'instance_wailing_caverns', 0, 0.0, 0.0, 0.0, 15, 25, 17, 20, 0, 'both', 45, 10, 1, 15, ()),
+    ('ragefire_chasm_n', 'Ragefire Chasm', 389, 0, 2230, 'instance_ragefire_chasm', 0, 0.0, 0.0, 0.0, 15, 21, 15, 16, 0, 'horde', 45, 10, 4, 15, ()),
+    ('sfk_n', 'Shadowfang Keep', 33, 0, 145, 'instance_shadowfang_keep', 0, -232.8, 1568.3, 76.9, 16, 26, 18, 21, 0, 'both', 45, 18, 8, 16, (130,)),
+    ('bfd_n', 'Blackfathom Deeps', 48, 0, 257, 'instance_blackfathom_deeps', 1, 4249.0, 740.0, -25.0, 19, 29, 21, 24, 0, 'both', 45, 18, 10, 19, (331, 148)),
+    ('razorfen_kraul_n', 'Razorfen Kraul', 47, 0, 244, 'instance_razorfen_kraul', 0, 0.0, 0.0, 0.0, 22, 32, 24, 27, 0, 'both', 45, 10, 16, 22, ()),
+    ('gnomeregan_n', 'Gnomeregan', 90, 0, 324, 'instance_gnomeregan', 0, -5163.3, 927.6, 257.2, 23, 33, 25, 28, 0, 'both', 55, 12, 14, 23, (1, 1537)),
+    ('scarlet_monastery_graveyard_n', 'Scarlet Monastery - Graveyard', 189, 0, 45, 'instance_scarlet_monastery', 0, 0.0, 0.0, 0.0, 27, 37, 29, 32, 0, 'both', 45, 10, 18, 27, ()),
+    ('scarlet_monastery_library_n', 'Scarlet Monastery - Library', 189, 0, 45, 'instance_scarlet_monastery', 0, 0.0, 0.0, 0.0, 30, 40, 32, 35, 0, 'both', 45, 10, 165, 30, ()),
+    ('razorfen_downs_n', 'Razorfen Downs', 129, 0, 442, 'instance_razorfen_downs', 0, 0.0, 0.0, 0.0, 32, 42, 34, 37, 0, 'both', 45, 10, 20, 32, ()),
+    ('scarlet_monastery_armory_n', 'Scarlet Monastery - Armory', 189, 0, 45, 'instance_scarlet_monastery', 0, 0.0, 0.0, 0.0, 32, 42, 34, 37, 0, 'both', 45, 10, 163, 32, ()),
+    ('uldaman_n', 'Uldaman', 70, 0, 286, 'instance_uldaman', 0, 0.0, 0.0, 0.0, 35, 45, 37, 40, 0, 'both', 45, 10, 22, 35, ()),
+    ('scarlet_monastery_cathedral_n', 'Scarlet Monastery - Cathedral', 189, 0, 45, 'instance_scarlet_monastery', 0, 0.0, 0.0, 0.0, 35, 45, 37, 40, 0, 'both', 45, 10, 164, 35, ()),
+    ('maraudon_purple_crystals_n', 'Maraudon - Purple Crystals', 349, 0, 3133, 'instance_maraudon', 0, 0.0, 0.0, 0.0, 39, 49, 41, 44, 0, 'both', 45, 10, 272, 39, ()),
+    ('zulfarrak_n', "Zul'Farrak", 209, 0, 0, 'instance_zulfarrak', 0, 0.0, 0.0, 0.0, 41, 51, 43, 46, 0, 'both', 45, 10, 24, 41, ()),
+    ('maraudon_orange_crystals_n', 'Maraudon - Orange Crystals', 349, 0, 3133, 'instance_maraudon', 0, 0.0, 0.0, 0.0, 41, 51, 43, 46, 0, 'both', 45, 10, 26, 41, ()),
+    ('maraudon_pristine_waters_n', 'Maraudon - Pristine Waters', 349, 0, 3133, 'instance_maraudon', 0, 0.0, 0.0, 0.0, 43, 53, 45, 48, 0, 'both', 45, 10, 273, 43, ()),
+    ('sunken_temple_n', 'Sunken Temple', 109, 0, 0, 'instance_sunken_temple', 0, 0.0, 0.0, 0.0, 45, 55, 47, 50, 0, 'both', 45, 10, 28, 45, ()),
+    ('blackrock_depths_prison_n', 'Blackrock Depths - Prison', 230, 0, 1466, 'instance_blackrock_depths', 0, 0.0, 0.0, 0.0, 47, 57, 49, 52, 0, 'both', 45, 10, 30, 47, ()),
+    ('blackrock_depths_upper_city_n', 'Blackrock Depths - Upper City', 230, 0, 1466, 'instance_blackrock_depths', 0, 0.0, 0.0, 0.0, 51, 61, 53, 56, 0, 'both', 45, 10, 276, 51, ()),
+    ('dire_maul_east_n', 'Dire Maul - East', 429, 0, 3183, 'instance_dire_maul', 0, 0.0, 0.0, 0.0, 53, 63, 55, 58, 0, 'both', 45, 10, 34, 53, ()),
+    ('scholomance_n', 'Scholomance', 289, 0, 2567, 'instance_scholomance', 0, 0.0, 0.0, 0.0, 55, 65, 55, 65, 0, 'both', 45, 10, 2, 55, ()),
+    ('lower_blackrock_spire_n', 'Lower Blackrock Spire', 229, 0, 1468, 'instance_blackrock_spire', 0, 0.0, 0.0, 0.0, 55, 65, 57, 58, 0, 'both', 45, 10, 32, 55, ()),
+    ('dire_maul_west_n', 'Dire Maul - West', 429, 0, 3183, 'instance_dire_maul', 0, 0.0, 0.0, 0.0, 55, 65, 58, 58, 0, 'both', 45, 10, 36, 55, ()),
+    ('dire_maul_north_n', 'Dire Maul - North', 429, 0, 3183, 'instance_dire_maul', 0, 0.0, 0.0, 0.0, 55, 65, 55, 65, 0, 'both', 45, 10, 38, 55, ()),
+    ('stratholme_main_gate_n', 'Stratholme - Main Gate', 329, 0, 2214, 'instance_stratholme', 0, 0.0, 0.0, 0.0, 55, 65, 55, 65, 0, 'both', 45, 10, 40, 55, ()),
+    ('stratholme_service_entrance_n', 'Stratholme - Service Entrance', 329, 0, 2214, 'instance_stratholme', 0, 0.0, 0.0, 0.0, 55, 65, 55, 65, 0, 'both', 45, 10, 274, 55, ()),
+    ('hellfire_ramparts_n', 'Hellfire Ramparts', 543, 0, 4150, 'instance_hellfire_ramparts', 530, 0.0, 0.0, 0.0, 57, 67, 59, 62, 1, 'both', 45, 10, 136, 57, ()),
+    ('blood_furnace_n', 'Blood Furnace', 542, 0, 4152, 'instance_blood_furnace', 530, 0.0, 0.0, 0.0, 59, 68, 61, 63, 1, 'both', 45, 10, 137, 59, ()),
+    ('slave_pens_n', 'Slave Pens', 547, 0, 4365, 'instance_the_slave_pens', 530, 0.0, 0.0, 0.0, 60, 69, 62, 64, 1, 'both', 45, 10, 140, 60, ()),
+    ('underbog_n', 'Underbog', 546, 0, 4363, 'instance_the_underbog', 530, 0.0, 0.0, 0.0, 61, 70, 63, 65, 1, 'both', 45, 10, 146, 61, ()),
+    ('mana_tombs_n', 'Mana-Tombs', 557, 0, 4405, 'instance_mana_tombs', 530, 0.0, 0.0, 0.0, 62, 71, 64, 66, 1, 'both', 45, 10, 148, 62, ()),
+    ('auchenai_crypts_n', 'Auchenai Crypts', 558, 0, 4404, 'instance_auchenai_crypts', 530, 0.0, 0.0, 0.0, 63, 72, 65, 67, 1, 'both', 45, 10, 149, 63, ()),
+    ('escape_from_durnholde_n', 'The Escape From Durnholde', 560, 0, 4321, 'instance_old_hillsbrad', 530, 0.0, 0.0, 0.0, 64, 73, 66, 68, 1, 'both', 45, 10, 170, 64, ()),
+    ('sethekk_halls_n', 'Sethekk Halls', 556, 0, 4406, 'instance_sethekk_halls', 530, 0.0, 0.0, 0.0, 65, 73, 67, 68, 1, 'both', 45, 10, 150, 65, ()),
+    ('shattered_halls_n', 'Shattered Halls', 540, 0, 4151, 'instance_shattered_halls', 530, 0.0, 0.0, 0.0, 67, 75, 67, 75, 1, 'both', 45, 10, 138, 67, ()),
+    ('steamvault_n', 'The Steamvault', 545, 0, 4364, 'instance_steam_vault', 530, 0.0, 0.0, 0.0, 67, 75, 67, 75, 1, 'both', 45, 10, 147, 67, ()),
+    ('shadow_labyrinth_n', 'Shadow Labyrinth', 555, 0, 4407, 'instance_shadow_labyrinth', 530, 0.0, 0.0, 0.0, 67, 75, 67, 75, 1, 'both', 45, 10, 151, 67, ()),
+    ('mechanar_n', 'The Mechanar', 554, 0, 4469, 'instance_mechanar', 530, 0.0, 0.0, 0.0, 67, 75, 67, 75, 1, 'both', 45, 10, 172, 67, ()),
+    ('botanica_n', 'The Botanica', 553, 0, 4467, 'instance_the_botanica', 530, 0.0, 0.0, 0.0, 67, 75, 67, 75, 1, 'both', 45, 10, 173, 67, ()),
+    ('black_morass_n', 'The Black Morass', 269, 0, 4320, 'instance_the_black_morass', 530, 0.0, 0.0, 0.0, 68, 75, 68, 75, 1, 'both', 45, 10, 171, 68, ()),
+    ('arcatraz_n', 'The Arcatraz', 552, 0, 4468, 'instance_arcatraz', 530, 0.0, 0.0, 0.0, 68, 75, 68, 75, 1, 'both', 45, 10, 174, 68, ()),
+    ('magisters_terrace_n', "Magisters' Terrace", 585, 0, 0, 'instance_magisters_terrace', 530, 0.0, 0.0, 0.0, 68, 75, 68, 75, 1, 'both', 45, 10, 198, 68, ()),
+    ('auchenai_crypts_h', 'Auchenai Crypts (Heroic)', 558, 1, 4404, 'instance_auchenai_crypts', 530, 0.0, 0.0, 0.0, 70, 75, 70, 73, 1, 'both', 50, 10, 178, 70, ()),
+    ('mana_tombs_h', 'Mana-Tombs (Heroic)', 557, 1, 4405, 'instance_mana_tombs', 530, 0.0, 0.0, 0.0, 70, 75, 70, 73, 1, 'both', 50, 10, 179, 70, ()),
+    ('sethekk_halls_h', 'Sethekk Halls (Heroic)', 556, 1, 4406, 'instance_sethekk_halls', 530, 0.0, 0.0, 0.0, 70, 75, 70, 73, 1, 'both', 50, 10, 180, 70, ()),
+    ('shadow_labyrinth_h', 'Shadow Labyrinth (Heroic)', 555, 1, 4407, 'instance_shadow_labyrinth', 530, 0.0, 0.0, 0.0, 70, 75, 70, 73, 1, 'both', 50, 10, 181, 70, ()),
+    ('black_morass_h', 'The Black Morass (Heroic)', 269, 1, 4320, 'instance_the_black_morass', 530, 0.0, 0.0, 0.0, 70, 75, 70, 73, 1, 'both', 50, 10, 182, 70, ()),
+    ('escape_from_durnholde_h', 'The Escape From Durnholde (Heroic)', 560, 1, 4321, 'instance_old_hillsbrad', 530, 0.0, 0.0, 0.0, 70, 75, 70, 73, 1, 'both', 50, 10, 183, 70, ()),
+    ('slave_pens_h', 'Slave Pens (Heroic)', 547, 1, 4365, 'instance_the_slave_pens', 530, 0.0, 0.0, 0.0, 70, 75, 70, 73, 1, 'both', 50, 10, 184, 70, ()),
+    ('steamvault_h', 'The Steamvault (Heroic)', 545, 1, 4364, 'instance_steam_vault', 530, 0.0, 0.0, 0.0, 70, 75, 70, 73, 1, 'both', 50, 10, 185, 70, ()),
+    ('underbog_h', 'Underbog (Heroic)', 546, 1, 4363, 'instance_the_underbog', 530, 0.0, 0.0, 0.0, 70, 75, 70, 73, 1, 'both', 50, 10, 186, 70, ()),
+    ('blood_furnace_h', 'Blood Furnace (Heroic)', 542, 1, 4152, 'instance_blood_furnace', 530, 0.0, 0.0, 0.0, 70, 75, 70, 73, 1, 'both', 50, 10, 187, 70, ()),
+    ('hellfire_ramparts_h', 'Hellfire Ramparts (Heroic)', 543, 1, 4150, 'instance_hellfire_ramparts', 530, 0.0, 0.0, 0.0, 70, 75, 70, 73, 1, 'both', 50, 10, 188, 70, ()),
+    ('shattered_halls_h', 'Shattered Halls (Heroic)', 540, 1, 4151, 'instance_shattered_halls', 530, 0.0, 0.0, 0.0, 70, 75, 70, 73, 1, 'both', 50, 10, 189, 70, ()),
+    ('arcatraz_h', 'The Arcatraz (Heroic)', 552, 1, 4468, 'instance_arcatraz', 530, 0.0, 0.0, 0.0, 70, 75, 70, 73, 1, 'both', 50, 10, 190, 70, ()),
+    ('botanica_h', 'The Botanica (Heroic)', 553, 1, 4467, 'instance_the_botanica', 530, 0.0, 0.0, 0.0, 70, 75, 70, 73, 1, 'both', 50, 10, 191, 70, ()),
+    ('mechanar_h', 'The Mechanar (Heroic)', 554, 1, 4469, 'instance_mechanar', 530, 0.0, 0.0, 0.0, 70, 75, 70, 73, 1, 'both', 50, 10, 192, 70, ()),
+    ('magisters_terrace_h', "Magisters' Terrace (Heroic)", 585, 1, 0, 'instance_magisters_terrace', 530, 0.0, 0.0, 0.0, 70, 75, 70, 73, 1, 'both', 50, 10, 201, 70, ()),
+    ('utgarde_keep_n', 'Utgarde Keep', 574, 0, 4745, 'instance_utgarde_keep', 571, 0.0, 0.0, 0.0, 68, 80, 69, 72, 2, 'both', 45, 10, 202, 68, ()),
+    ('nexus_n', 'The Nexus', 576, 0, 4983, 'instance_nexus', 571, 0.0, 0.0, 0.0, 69, 80, 71, 73, 2, 'both', 45, 10, 225, 69, ()),
+    ('azjol_nerub_n', 'Azjol-Nerub', 601, 0, 5117, 'instance_azjol_nerub', 571, 0.0, 0.0, 0.0, 70, 80, 72, 74, 2, 'both', 45, 10, 204, 70, ()),
+    ('ahnkahet_the_old_kingdom_n', "Ahn'kahet: The Old Kingdom", 619, 0, 0, 'instance_ahnkahet', 571, 0.0, 0.0, 0.0, 71, 80, 73, 75, 2, 'both', 45, 10, 218, 71, ()),
+    ('draktharon_keep_n', "Drak'Tharon Keep", 600, 0, 0, 'instance_drak_tharon_keep', 571, 0.0, 0.0, 0.0, 72, 80, 74, 76, 2, 'both', 45, 10, 214, 72, ()),
+    ('violet_hold_n', 'Violet Hold', 608, 0, 5209, 'instance_violet_hold', 571, 0.0, 0.0, 0.0, 73, 80, 75, 77, 2, 'both', 45, 10, 220, 73, ()),
+    ('gundrak_n', 'Gundrak', 604, 0, 5205, 'instance_gundrak', 571, 0.0, 0.0, 0.0, 74, 80, 76, 78, 2, 'both', 45, 10, 216, 74, ()),
+    ('halls_of_stone_n', 'Halls of Stone', 599, 0, 5010, 'instance_halls_of_stone', 571, 0.0, 0.0, 0.0, 75, 80, 77, 79, 2, 'both', 45, 10, 208, 75, ()),
+    ('utgarde_pinnacle_n', 'Utgarde Pinnacle', 575, 0, 4747, 'instance_utgarde_pinnacle', 571, 0.0, 0.0, 0.0, 77, 80, 79, 80, 2, 'both', 45, 10, 203, 77, ()),
+    ('oculus_n', 'The Oculus', 578, 0, 5246, 'instance_oculus', 571, 0.0, 0.0, 0.0, 77, 80, 79, 80, 2, 'both', 45, 10, 206, 77, ()),
+    ('halls_of_lightning_n', 'Halls of Lightning', 602, 0, 5093, 'instance_halls_of_lightning', 571, 0.0, 0.0, 0.0, 77, 80, 79, 80, 2, 'both', 45, 10, 207, 77, ()),
+    ('culling_of_stratholme_n', 'The Culling of Stratholme', 595, 0, 5150, 'instance_culling_of_stratholme', 571, 0.0, 0.0, 0.0, 77, 80, 79, 80, 2, 'both', 45, 10, 209, 77, ()),
+    ('trial_of_the_champion_n', 'Trial of the Champion', 650, 0, 5505, 'instance_trial_of_the_champion', 571, 0.0, 0.0, 0.0, 80, 80, 79, 80, 2, 'both', 45, 10, 245, 80, ()),
+    ('forge_of_souls_n', 'The Forge of Souls', 632, 0, 5635, 'instance_forge_of_souls', 571, 0.0, 0.0, 0.0, 80, 80, 79, 80, 2, 'both', 45, 10, 251, 80, ()),
+    ('pit_of_saron_n', 'Pit of Saron', 658, 0, 5637, 'instance_pit_of_saron', 571, 0.0, 0.0, 0.0, 80, 80, 79, 80, 2, 'both', 45, 10, 253, 80, ()),
+    ('halls_of_reflection_n', 'Halls of Reflection', 668, 0, 5636, 'instance_halls_of_reflection', 571, 0.0, 0.0, 0.0, 80, 80, 79, 80, 2, 'both', 45, 10, 255, 80, ()),
+    ('utgarde_pinnacle_h', 'Utgarde Pinnacle (Heroic)', 575, 1, 4747, 'instance_utgarde_pinnacle', 571, 0.0, 0.0, 0.0, 80, 80, 80, 80, 2, 'both', 50, 10, 205, 80, ()),
+    ('culling_of_stratholme_h', 'The Culling of Stratholme (Heroic)', 595, 1, 5150, 'instance_culling_of_stratholme', 571, 0.0, 0.0, 0.0, 80, 80, 80, 80, 2, 'both', 50, 10, 210, 80, ()),
+    ('oculus_h', 'The Oculus (Heroic)', 578, 1, 5246, 'instance_oculus', 571, 0.0, 0.0, 0.0, 80, 80, 80, 80, 2, 'both', 50, 10, 211, 80, ()),
+    ('halls_of_lightning_h', 'Halls of Lightning (Heroic)', 602, 1, 5093, 'instance_halls_of_lightning', 571, 0.0, 0.0, 0.0, 80, 80, 80, 80, 2, 'both', 50, 10, 212, 80, ()),
+    ('halls_of_stone_h', 'Halls of Stone (Heroic)', 599, 1, 5010, 'instance_halls_of_stone', 571, 0.0, 0.0, 0.0, 80, 80, 80, 80, 2, 'both', 50, 10, 213, 80, ()),
+    ('draktharon_keep_h', "Drak'Tharon Keep (Heroic)", 600, 1, 0, 'instance_drak_tharon_keep', 571, 0.0, 0.0, 0.0, 80, 80, 80, 80, 2, 'both', 50, 10, 215, 80, ()),
+    ('gundrak_h', 'Gundrak (Heroic)', 604, 1, 5205, 'instance_gundrak', 571, 0.0, 0.0, 0.0, 80, 80, 80, 80, 2, 'both', 50, 10, 217, 80, ()),
+    ('ahnkahet_the_old_kingdom_h', "Ahn'kahet: The Old Kingdom (Heroic)", 619, 1, 0, 'instance_ahnkahet', 571, 0.0, 0.0, 0.0, 80, 80, 80, 80, 2, 'both', 50, 10, 219, 80, ()),
+    ('violet_hold_h', 'Violet Hold (Heroic)', 608, 1, 5209, 'instance_violet_hold', 571, 0.0, 0.0, 0.0, 80, 80, 80, 80, 2, 'both', 50, 10, 221, 80, ()),
+    ('nexus_h', 'The Nexus (Heroic)', 576, 1, 4983, 'instance_nexus', 571, 0.0, 0.0, 0.0, 80, 80, 80, 80, 2, 'both', 50, 10, 226, 80, ()),
+    ('azjol_nerub_h', 'Azjol-Nerub (Heroic)', 601, 1, 5117, 'instance_azjol_nerub', 571, 0.0, 0.0, 0.0, 80, 80, 80, 80, 2, 'both', 50, 10, 241, 80, ()),
+    ('utgarde_keep_h', 'Utgarde Keep (Heroic)', 574, 1, 4745, 'instance_utgarde_keep', 571, 0.0, 0.0, 0.0, 80, 80, 80, 80, 2, 'both', 50, 10, 242, 80, ()),
+    ('trial_of_the_champion_h', 'Trial of the Champion (Heroic)', 650, 1, 5505, 'instance_trial_of_the_champion', 571, 0.0, 0.0, 0.0, 80, 80, 80, 80, 2, 'both', 50, 10, 249, 80, ()),
+    ('forge_of_souls_h', 'The Forge of Souls (Heroic)', 632, 1, 5635, 'instance_forge_of_souls', 571, 0.0, 0.0, 0.0, 80, 80, 80, 80, 2, 'both', 50, 10, 252, 80, ()),
+    ('pit_of_saron_h', 'Pit of Saron (Heroic)', 658, 1, 5637, 'instance_pit_of_saron', 571, 0.0, 0.0, 0.0, 80, 80, 80, 80, 2, 'both', 50, 10, 254, 80, ()),
+    ('halls_of_reflection_h', 'Halls of Reflection (Heroic)', 668, 1, 5636, 'instance_halls_of_reflection', 571, 0.0, 0.0, 0.0, 80, 80, 80, 80, 2, 'both', 50, 10, 256, 80, ()),
+)
+
+DUNGEON_CATALOG: tuple[DungeonSpec, ...] = tuple(
     DungeonSpec(
-        dungeon_id="stockade_n",
-        name="The Stockade",
-        map_id=34,
-        difficulty=0,
-        areatrigger_id=101,
-        script="instance_the_stockade",
-        entrance_map=0,
-        entrance_x=-8764.8,
-        entrance_y=846.1,
-        entrance_z=87.5,
-        min_level=15,
-        max_level=34,
-        recommended_min=22,
-        recommended_max=30,
-        raid_stage_min=0,
-        faction="alliance",
-        estimated_minutes=30,
-        travel_minutes=8,
+        dungeon_id=row[0],
+        name=row[1],
+        map_id=row[2],
+        difficulty=row[3],
+        areatrigger_id=row[4],
+        script=row[5],
+        entrance_map=row[6],
+        entrance_x=row[7],
+        entrance_y=row[8],
+        entrance_z=row[9],
+        min_level=row[10],
+        max_level=row[11],
+        recommended_min=row[12],
+        recommended_max=row[13],
+        raid_stage_min=row[14],
+        faction=row[15],
+        estimated_minutes=row[16],
+        travel_minutes=row[17],
         supported=True,
         pilot_default_enabled=False,
-        lfg_dungeon_id=12,
-        legal_min_level=15,
+        lfg_dungeon_id=row[18],
+        legal_min_level=row[19],
         legal_max_level=80,
-        entrance_zone_ids=(1519, 12),  # Stormwind City, Elwynn Forest
-    ),
+        entrance_zone_ids=row[20],
+    )
+    for row in _SUPPORTED_RDF_DUNGEON_ROWS
+) + (
+    # Explicit non-supported raid sentinel: raids are NEVER queued by 5-player cooperative RDF.
     DungeonSpec(
-        dungeon_id="deadmines_n",
-        name="The Deadmines",
-        map_id=36,
-        difficulty=0,
-        areatrigger_id=78,
-        script="instance_deadmines",
+        dungeon_id="molten_core_r",
+        name="Molten Core",
+        map_id=409,
+        difficulty=2,
+        areatrigger_id=2886,
+        script="instance_molten_core",
         entrance_map=0,
-        entrance_x=-11208.3,
-        entrance_y=1672.5,
-        entrance_z=24.7,
-        min_level=15,
-        max_level=28,
-        recommended_min=17,
-        recommended_max=24,
+        entrance_x=-7515.0,
+        entrance_y=-1045.0,
+        entrance_z=182.0,
+        min_level=60,
+        max_level=80,
+        recommended_min=60,
+        recommended_max=60,
         raid_stage_min=0,
         faction="both",
-        estimated_minutes=45,
-        travel_minutes=12,
-        supported=True,
-        pilot_default_enabled=False,
-        lfg_dungeon_id=6,
-        legal_min_level=10,
-        legal_max_level=80,
-        entrance_zone_ids=(40, 12, 1519),  # Westfall, Elwynn, Stormwind
-    ),
-    # Cataloged but explicitly DISABLED until encounter & pathing audit completes:
-    DungeonSpec(
-        dungeon_id="sfk_n",
-        name="Shadowfang Keep",
-        map_id=33,
-        difficulty=0,
-        areatrigger_id=145,
-        script="instance_shadowfang_keep",
-        entrance_map=0,
-        entrance_x=-232.8,
-        entrance_y=1568.3,
-        entrance_z=76.9,
-        min_level=18,
-        max_level=30,
-        recommended_min=20,
-        recommended_max=28,
-        raid_stage_min=0,
-        faction="both",
-        estimated_minutes=45,
-        travel_minutes=18,
+        estimated_minutes=180,
+        travel_minutes=15,
         supported=False,
         pilot_default_enabled=False,
-        lfg_dungeon_id=8,
-        legal_min_level=14,
+        lfg_dungeon_id=48,
+        legal_min_level=50,
         legal_max_level=80,
-        entrance_zone_ids=(130,),  # Silverpine Forest
-    ),
-    DungeonSpec(
-        dungeon_id="bfd_n",
-        name="Blackfathom Deeps",
-        map_id=48,
-        difficulty=0,
-        areatrigger_id=257,
-        script="instance_blackfathom_deeps",
-        entrance_map=1,
-        entrance_x=4249.0,
-        entrance_y=740.0,
-        entrance_z=-25.0,
-        min_level=20,
-        max_level=32,
-        recommended_min=22,
-        recommended_max=30,
-        raid_stage_min=0,
-        faction="both",
-        estimated_minutes=45,
-        travel_minutes=18,
-        supported=False,
-        pilot_default_enabled=False,
-        lfg_dungeon_id=10,
-        legal_min_level=19,
-        legal_max_level=80,
-        entrance_zone_ids=(331, 148),  # Ashenvale, Darkshore
-    ),
-    DungeonSpec(
-        dungeon_id="gnomeregan_n",
-        name="Gnomeregan",
-        map_id=90,
-        difficulty=0,
-        areatrigger_id=324,
-        script="instance_gnomeregan",
-        entrance_map=0,
-        entrance_x=-5163.3,
-        entrance_y=927.6,
-        entrance_z=257.2,
-        min_level=24,
-        max_level=38,
-        recommended_min=26,
-        recommended_max=35,
-        raid_stage_min=0,
-        faction="alliance",
-        estimated_minutes=55,
-        travel_minutes=12,
-        supported=False,
-        pilot_default_enabled=False,
-        lfg_dungeon_id=14,
-        legal_min_level=15,
-        legal_max_level=80,
-        entrance_zone_ids=(1, 1537),  # Dun Morogh, Ironforge
+        entrance_zone_ids=(46, 51),
     ),
 )
 
 DUNGEON_BY_ID: dict[str, DungeonSpec] = {d.dungeon_id: d for d in DUNGEON_CATALOG}
-DUNGEON_BY_MAP: dict[int, DungeonSpec] = {d.map_id: d for d in DUNGEON_CATALOG}
+DUNGEONS_BY_MAP: dict[int, tuple[DungeonSpec, ...]] = {}
+for _d in DUNGEON_CATALOG:
+    DUNGEONS_BY_MAP[_d.map_id] = DUNGEONS_BY_MAP.get(_d.map_id, ()) + (_d,)
+# Primary map lookup prefers the first Normal (difficulty=0) entry per map for backward compatibility.
+DUNGEON_BY_MAP: dict[int, DungeonSpec] = {}
+for _d in DUNGEON_CATALOG:
+    if _d.map_id not in DUNGEON_BY_MAP or (DUNGEON_BY_MAP[_d.map_id].difficulty != 0 and _d.difficulty == 0):
+        DUNGEON_BY_MAP[_d.map_id] = _d
 DUNGEON_BY_LFG_ID: dict[int, DungeonSpec] = {
     d.lfg_dungeon_id: d for d in DUNGEON_CATALOG if d.lfg_dungeon_id > 0
 }
 
 
 def enabled_dungeon_ids() -> set[str]:
-    """Return explicitly enabled pilot dungeon IDs from HEARTHCORE_COOP_DUNGEONS (default empty = safe off)."""
+    """Return explicitly enabled 5-player dungeon IDs from HEARTHCORE_COOP_DUNGEONS (default empty = safe off).
+
+    Supports keywords: `all` / `*` (all 92 supported 5-player dungeons), `normal` (60 Normal),
+    `heroic` (32 Heroic), `classic` (28 Classic), `tbc` (32 TBC), `wotlk` (32 WotLK), or explicit IDs.
+    Raids (`supported=False`) are NEVER returned even when `all` is set.
+    """
     raw = (os.getenv("HEARTHCORE_COOP_DUNGEONS") or "").strip()
     if not raw:
         return set()
     wanted = {tok.strip().lower() for tok in raw.split(",") if tok.strip()}
-    return {d.dungeon_id for d in DUNGEON_CATALOG if d.supported and d.dungeon_id in wanted}
+    out: set[str] = set()
+    for d in DUNGEON_CATALOG:
+        if not d.supported:
+            continue
+        if (
+            "all" in wanted
+            or "*" in wanted
+            or d.dungeon_id in wanted
+            or ("normal" in wanted and d.difficulty == 0)
+            or ("heroic" in wanted and d.difficulty == 1)
+            or ("classic" in wanted and d.raid_stage_min == 0)
+            or ("tbc" in wanted and d.raid_stage_min == 1)
+            or ("wotlk" in wanted and d.raid_stage_min == 2)
+        ):
+            out.add(d.dungeon_id)
+    return out
 
 
 def configured_schedule_tz(tz=None):
@@ -1040,8 +1089,8 @@ def check_character_eligibility(
         return False, f"dungeon_unsupported:{dungeon.dungeon_id}"
     if not allow_pilot_shadow and dungeon.dungeon_id not in enabled_dungeon_ids():
         return False, f"dungeon_disabled:{dungeon.dungeon_id}"
-    if dungeon.difficulty != 0:
-        return False, "heroics_and_raids_disabled_in_phase2"
+    if dungeon.difficulty not in (0, 1):
+        return False, "raids_disabled_in_coop_rdf"
     if not enrolled_coop:
         return False, "protected_core_or_not_enrolled"
     if not online:

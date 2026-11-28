@@ -143,6 +143,7 @@ struct AuthorizedRun
     std::uint64_t opportunityId = 0;
     std::uint32_t revision = 0;
     std::uint32_t targetMapId = 0;
+    std::uint32_t lfgDungeonId = 0;         // WotLK LFGDungeons.dbc ID (disambiguates multi-wing & heroic dungeons)
     std::uint32_t expectedInstanceId = 0;   // 0 until bound on verified dungeon entry
     std::uint8_t difficulty = 0;            // 0 = Normal, 1 = Heroic
     std::uint32_t expectedGroupId = 0;      // 0 only during bounded assembly before native group bind

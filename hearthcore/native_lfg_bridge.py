@@ -80,7 +80,7 @@ def build_mysql_publish_statements(
 
     dungeon_id = str(opportunity.get("dungeon_id") or "")
     spec = DUNGEON_BY_ID.get(dungeon_id)
-    if spec is None or not spec.supported or spec.lfg_dungeon_id <= 0 or spec.difficulty != 0:
+    if spec is None or not spec.supported or spec.lfg_dungeon_id <= 0 or spec.difficulty not in (0, 1):
         return False, f"unsupported_dungeon:{dungeon_id}", []
     if dungeon_id not in enabled_dungeon_ids():
         return False, f"dungeon_not_enabled:{dungeon_id}", []
