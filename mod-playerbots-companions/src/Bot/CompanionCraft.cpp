@@ -1700,6 +1700,11 @@ CompanionCraft::Offer CompanionCraft::EvaluateCraft(Player* bot, bool active)
     if (dropped)
         ReleaseAll(low, "run ended");
 
+    // Auto-ensure stock WotLK Milling (51005) on any companion who knows Inscription (773)
+    // (Apprentice Inscription 45357 auto-grants Milling; SQL-seeded companions may lack it).
+    if (bot->HasSkill(SKILL_INSCRIPTION) && !bot->HasSpell(51005))
+        bot->learnSpell(51005, false);
+
     // Forced GM requests: a feeder (mill / prospect) replaces the local recipe, a session replaces the session test.
     bool const forcedSession = force == Force::Session;
     bool const forcedFeeder = force == Force::Mill || force == Force::Prospect;
@@ -2180,7 +2185,7 @@ CompanionCraft::Place CompanionCraft::NextGatherSpot(Player* bot, uint32 gatherI
         for (GoSpawn const& sp : sit->second)
         {
             float const d = bot->GetDistance(sp.x, sp.y, sp.z);
-            if (d > 2600.0f)
+            if (d > 5500.0f)
                 continue;
             if (skipSpawns.count(sp.spawnId))
                 continue;
@@ -2219,7 +2224,7 @@ CompanionCraft::Offer CompanionCraft::EvaluateGatherFarm(Player* bot, bool activ
     Offer offer;
     if (!bot || !sPlayerbotAIConfig.companionGatherFarmEnabled || !AreaEnabled("Gather") || !AreaEnabled("Craft"))
         return offer;
-    if (!bot->HasSkill(SKILL_MINING) && !bot->HasSkill(SKILL_HERBALISM))
+    if (!bot->HasSkill(SKILL_MINING) && !bot->HasSkill(SKILL_HERBALISM) && !bot->HasSkill(SKILL_SKINNING))
         return offer;
 
     uint32 const low = bot->GetGUID().GetCounter();
@@ -2354,6 +2359,91 @@ CompanionCraft::Offer CompanionCraft::EvaluateGatherFarm(Player* bot, bool activ
                             ? ("farm guild-requested item " + std::to_string(need.source))
                             : ("farm item " + std::to_string(need.source) + " for skill " + std::to_string(need.skill));
         return offer;
+    }
+
+    // Skinning catch-up / leather farming: when a Skinner's skill lags behind their level (or Light/Medium Leather is
+    // requested for Leatherworking), hunt level-appropriate Alliance beasts on the current continent instead of fighting
+    // high-level mobs whose hides require Skinning 150+.
+    if (bot->HasSkill(SKILL_SKINNING))
+    {
+        uint32 const curSkin = bot->GetPureSkillValue(SKILL_SKINNING);
+        uint32 const maxSkin = bot->GetPureMaxSkillValue(SKILL_SKINNING);
+        uint32 const targetLeather = curSkin < 75 ? 2318u : (curSkin < 140 ? 2319u : 4234u);
+        bool const laggingSkin = curSkin < maxSkin && (curSkin < std::min<uint32>(225, bot->GetLevel() * 4));
+        bool const wantLeather = laggingSkin || CompanionBrain::IsRequestedMat(targetLeather);
+        if (wantLeather && bot->GetItemCount(targetLeather, false) < targetCount)
+        {
+            std::string const leaseKey = "gather:" + std::to_string(targetLeather);
+            if (CompanionLease::MayTry(low, leaseKey))
+            {
+                struct HuntSpot { uint32 mapId; float x, y, z; };
+                std::vector<HuntSpot> spots;
+                if (bot->GetMapId() == 0)
+                {
+                    if (curSkin < 60)
+                    {
+                        spots.push_back({0, -9460.0f, -670.0f, 56.0f});   // Elwynn Forest (Lv 5-9 wolves/bears/boars)
+                        spots.push_back({0, -5620.0f, -490.0f, 396.0f});  // Dun Morogh (Lv 6-10 wolves/boars/bears)
+                    }
+                    else if (curSkin < 120)
+                    {
+                        spots.push_back({0, -5230.0f, -2950.0f, 323.0f}); // Loch Modan (Lv 12-16 bears/boars/crocs)
+                        spots.push_back({0, -10420.0f, 1080.0f, 35.0f});  // Westfall (Lv 12-17 boars/vultures)
+                    }
+                    else
+                    {
+                        spots.push_back({0, -3540.0f, -2580.0f, 12.0f});  // Wetlands (Lv 21-26 crocs/raptors)
+                    }
+                }
+                else if (bot->GetMapId() == 1)
+                {
+                    if (curSkin < 60)
+                        spots.push_back({1, 9860.0f, 1020.0f, 1308.0f});  // Teldrassil (Lv 5-9 sabers/spiders/owls)
+                    else
+                        spots.push_back({1, 6160.0f, 380.0f, 20.0f});     // Darkshore (Lv 12-18 bears/crawlers/moonstalkers)
+                }
+
+                Place bestSpot;
+                float bestDist = std::numeric_limits<float>::max();
+                for (HuntSpot const& hs : spots)
+                {
+                    float const d = bot->GetDistance(hs.x, hs.y, hs.z);
+                    if (d < bestDist && !sCompanionBotMgr.IsPathTooDangerous(bot, hs.mapId, hs.x, hs.y, hs.z))
+                    {
+                        bestDist = d;
+                        bestSpot.valid = true;
+                        bestSpot.mapId = hs.mapId;
+                        bestSpot.x = hs.x;
+                        bestSpot.y = hs.y;
+                        bestSpot.z = hs.z;
+                    }
+                }
+                if (bestSpot.valid)
+                {
+                    uint32 const gap = std::max<uint32>(25, SkillGap(bot, SKILL_SKINNING));
+                    Run run;
+                    run.valid = true;
+                    run.duty = "gather";
+                    run.step = STEP_STATION;
+                    run.gatherSkill = SKILL_SKINNING;
+                    run.gatherItem = targetLeather;
+                    run.gatherTargetCount = targetCount;
+                    run.gatherStartCount = bot->GetItemCount(targetLeather, false);
+                    run.gatherSpot = bestSpot;
+                    SaveRun(low, run);
+
+                    offer.valid = true;
+                    offer.need = std::min(95.0f, 58.0f + static_cast<float>(gap) * 0.9f);
+                    offer.first = bestSpot;
+                    offer.here = bestDist <= 140.0f;
+                    offer.key = leaseKey;
+                    offer.travelFactor = 0.20f;
+                    offer.summary = "skinning hunt for item " + std::to_string(targetLeather) +
+                                    " (Skinning " + std::to_string(curSkin) + "/" + std::to_string(maxSkin) + ")";
+                    return offer;
+                }
+            }
+        }
     }
     return offer;
 }

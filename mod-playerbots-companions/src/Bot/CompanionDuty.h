@@ -55,6 +55,7 @@ public:
         uint8 slot = 0;
         uint32 entry = 0;
         uint32 count = 0;
+        int32 randomProperty = 0;
     };
 
     struct BankTabUsage

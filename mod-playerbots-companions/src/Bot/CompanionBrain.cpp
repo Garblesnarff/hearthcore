@@ -506,11 +506,40 @@ CompanionBrain::ItemClass CompanionBrain::ClassifyItem(PlayerbotAI* botAI, Item*
         return ItemClass::KEEP;
     if (proto->Class == ITEM_CLASS_QUEST || proto->Bonding == BIND_QUEST_ITEM || proto->StartQuest != 0)
         return ItemClass::KEEP;
-    if (proto->Class == ITEM_CLASS_PROJECTILE || proto->Class == ITEM_CLASS_QUIVER ||
-        proto->Class == ITEM_CLASS_CONTAINER)
+    if (proto->Class == ITEM_CLASS_PROJECTILE || proto->Class == ITEM_CLASS_QUIVER)
         return ItemClass::KEEP;
+    // Protect containers UNLESS the companion already has 4 larger general bags equipped (sell obsolete small bags).
+    if (proto->Class == ITEM_CLASS_CONTAINER)
+    {
+        Player* const b = botAI->GetBot();
+        if (b && proto->SubClass == ITEM_SUBCLASS_CONTAINER && proto->SellPrice > 0)
+        {
+            uint32 smallestEquipped = 999;
+            uint32 equippedCount = 0;
+            for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+            {
+                Bag* eqBag = static_cast<Bag*>(b->GetItemByPos(INVENTORY_SLOT_BAG_0, bagSlot));
+                if (eqBag && eqBag->GetTemplate() && eqBag->GetTemplate()->Class == ITEM_CLASS_CONTAINER &&
+                    eqBag->GetTemplate()->SubClass == ITEM_SUBCLASS_CONTAINER)
+                {
+                    ++equippedCount;
+                    smallestEquipped = std::min<uint32>(smallestEquipped, eqBag->GetBagSize());
+                }
+            }
+            if (equippedCount >= 4 && proto->ContainerSlots < smallestEquipped)
+                return ItemClass::SELL;
+        }
+        return ItemClass::KEEP;
+    }
     if (IsProfessionTool(proto))
         return ItemClass::KEEP;
+    // A recipe this companion can learn now stays until it is used (it is otherwise banked or sold).
+    if (proto->Class == ITEM_CLASS_RECIPE && botAI->IsCompanion() &&
+        botAI->GetBot()->BotCanUseItem(proto) == EQUIP_ERR_OK)
+        for (auto const& spell : proto->Spells)
+            if (spell.SpellTrigger == ITEM_SPELLTRIGGER_LEARN_SPELL_ID && spell.SpellId > 0 &&
+                !botAI->GetBot()->HasSpell(static_cast<uint32>(spell.SpellId)))
+                return ItemClass::KEEP;
     // Verified guild work-order delivery (Issue #27): a transferable item crafted for this companion's active
     // claimed work order must be classified BANK so RunCompanionBankDuty deposits it for verified receipt.
     if (Player* const orderBot = botAI->GetBot();
@@ -560,11 +589,15 @@ CompanionBrain::ItemClass CompanionBrain::ClassifyItem(PlayerbotAI* botAI, Item*
             return ItemClass::KEEP;
     }
     // Phase 2 (Craft.Enabled): food and bandages are kept up to Craft.KeepStacks stacks. With Bank.StrictPolicy=1,
-    // excess ordinary food/bandages are SOLD to vendors rather than clogging the guild bank.
+    // excess or badly outdated low-level food/drinks are SOLD to vendors rather than clogging bags/guild bank.
     if (proto->Class == ITEM_CLASS_CONSUMABLE &&
         (proto->SubClass == ITEM_SUBCLASS_FOOD || proto->SubClass == ITEM_SUBCLASS_BANDAGE) &&
         CompanionCraft::AreaEnabled("Craft"))
     {
+        if (bot && proto->SubClass == ITEM_SUBCLASS_FOOD && !IsRequestedMat(proto->ItemId) &&
+            proto->SellPrice > 0 && bot->GetLevel() >= 18 &&
+            static_cast<uint32>(proto->RequiredLevel) + 12 < bot->GetLevel())
+            return ItemClass::SELL;
         if (!CompanionCraft::OverKeepStacks(bot, proto))
             return ItemClass::KEEP;
         if (sPlayerbotAIConfig.companionBankStrictPolicy && !IsRequestedMat(proto->ItemId))
@@ -605,9 +638,16 @@ CompanionBrain::ItemClass CompanionBrain::ClassifyItem(PlayerbotAI* botAI, Item*
     if (consumable && (proto->SubClass == ITEM_SUBCLASS_FOOD || proto->SubClass == ITEM_SUBCLASS_BANDAGE))
         return ItemClass::KEEP;
 
-    // 10: a soulbound item cannot be deposited, so it stays.
+    // 10: a soulbound item cannot be deposited in the guild bank. Sell non-upgrade soulbound gear
+    // (heuristics above already protected heirlooms, tools, and EQUIP/REPLACE upgrades!) so old
+    // quest rewards & dungeon drops never fill bags to 100/112 and deadlock crafting/milling.
     if (item->IsSoulBound())
+    {
+        if ((proto->Class == ITEM_CLASS_ARMOR || proto->Class == ITEM_CLASS_WEAPON) &&
+            proto->Quality <= ITEM_QUALITY_RARE && proto->SellPrice > 0)
+            return ItemClass::SELL;
         return ItemClass::KEEP;
+    }
 
     // 11-13: BANK, unless strict bank policy rejects non-guide clutter (then SELL) or the guild bank already holds
     // BankMaxStacks stacks (or requested minCount) of the item.
