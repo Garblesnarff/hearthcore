@@ -21,6 +21,7 @@ local TARGET_SCALE = 1.35
 local LEVEL_UP_PRESSES = 20
 local VOICE_GAP = 3                               -- at most one prompt voice line every 3 seconds
 local PRAISE_GAP = 2.5                            -- separate cooldown so fast presses ALWAYS hear praise!
+local MISS_CUE_GAP = 2.5                          -- cooldown between "They dodged!" / "You missed!" vocal cues
 local ATTACKER_TTL = 5                            -- seconds to count recent melee attackers from combat log
 local BOOKTYPE_SPELL = "spell"                    -- same value as SpellBookFrame.lua
 -- binding sets: ACCOUNT_BINDINGS / CHARACTER_BINDINGS live in load-on-demand Blizzard_BindingUI
@@ -164,6 +165,7 @@ local st = {
 	pending = nil,         -- { name = , t0 = } key suggestion waiting for press
 	lastVoiceAt = -100,
 	lastPraiseAt = -100,
+	lastMissCueAt = -100,
 	stars = 0,             -- stars this fight
 	starFlash = 0,
 	summaryLeft = 0,
@@ -195,6 +197,7 @@ local function cfg()
 	if c.scaleFrame == nil then c.scaleFrame = false end -- taint-free red glow ON by default; TargetFrame scaling opt-in
 	if c.arrows == nil then c.arrows = false end
 	if c.marks == nil then c.marks = false end
+	if c.missCues == nil then c.missCues = true end
 	c.stage = c.stage or "A"
 	c.levels = c.levels or {}
 	c.seen = c.seen or {}
@@ -227,6 +230,25 @@ local function say(name, isPraise)
 	else
 		if t - st.lastVoiceAt < VOICE_GAP then return end
 		st.lastVoiceAt = t
+	end
+	pcall(PlaySoundFile, AUDIO_DIR .. name .. ".mp3")
+end
+
+-- Vocal cue when a mob dodges or Logan misses ("They dodged!" / "You missed!").
+-- Nudges the prompt voice cooldown slightly so an instant Overpower prompt doesn't talk over "They dodged!"
+-- (the big Overpower icon & key still light up immediately on the next tick).
+local function sayMissCue(name)
+	if not name or not coachOn() then return end
+	local c = cfg()
+	if not (c and c.missCues) then return end
+	local have = LoganReads_Coach_Audio or {}
+	if not have[name] then return end
+	local t = GetTime()
+	if t - st.lastMissCueAt < MISS_CUE_GAP then return end
+	st.lastMissCueAt = t
+	local minVoiceAt = t - VOICE_GAP + 1.2
+	if st.lastVoiceAt < minVoiceAt then
+		st.lastVoiceAt = minVoiceAt
 	end
 	pcall(PlaySoundFile, AUDIO_DIR .. name .. ".mp3")
 end
@@ -1015,15 +1037,34 @@ local function onCurrentSpellChanged()
 	end
 end
 
--- Track hostile mobs actively swinging at / damaging Logan for AoE Thunder Clap & Bladestorm rules
-local function onCombatLog(timestamp, subEvent, srcGUID, srcName, srcFlags, dstGUID)
+-- Track hostile mobs swinging at Logan (for AoE rules) AND vocal cues when a mob dodges or Logan misses!
+-- WoW 3.3.5a COMBAT_LOG_EVENT_UNFILTERED prefix has 8 args; payload starts at arg9:
+--   SWING_MISSED: arg9 = missType
+--   SPELL_MISSED / RANGE_MISSED: arg9 = spellId, arg10 = spellName, arg11 = spellSchool, arg12 = missType
+local function onCombatLog(timestamp, subEvent, srcGUID, srcName, srcFlags, dstGUID, dstName, dstFlags, arg9, arg10, arg11, arg12)
 	if not subEvent or not srcGUID or not dstGUID then return end
 	local myGuid = UnitGUID("player")
-	if not myGuid or dstGUID ~= myGuid or srcGUID == myGuid then return end
-	if subEvent == "SWING_DAMAGE" or subEvent == "SWING_MISSED"
-		or subEvent == "SPELL_DAMAGE" or subEvent == "SPELL_MISSED"
-		or subEvent == "RANGE_DAMAGE" or subEvent == "RANGE_MISSED" then
-		st.attackers[srcGUID] = GetTime()
+	if not myGuid then return end
+	if dstGUID == myGuid and srcGUID ~= myGuid then
+		if subEvent == "SWING_DAMAGE" or subEvent == "SWING_MISSED"
+			or subEvent == "SPELL_DAMAGE" or subEvent == "SPELL_MISSED"
+			or subEvent == "RANGE_DAMAGE" or subEvent == "RANGE_MISSED" then
+			st.attackers[srcGUID] = GetTime()
+		end
+		return
+	end
+	if srcGUID == myGuid and dstGUID ~= myGuid then
+		local missType = nil
+		if subEvent == "SWING_MISSED" then
+			missType = arg9
+		elseif subEvent == "SPELL_MISSED" or subEvent == "RANGE_MISSED" then
+			missType = arg12
+		end
+		if missType == "DODGE" then
+			sayMissCue("dodged")
+		elseif missType == "MISS" then
+			sayMissCue("missed")
+		end
 	end
 end
 
@@ -1081,7 +1122,7 @@ local EVENTS = {
 	"UNIT_SPELLCAST_SUCCEEDED", "CURRENT_SPELL_CAST_CHANGED", "COMBAT_LOG_EVENT_UNFILTERED",
 }
 
-ev:SetScript("OnEvent", function(self, event, a1, a2, a3, a4, a5, a6)
+ev:SetScript("OnEvent", function(self, event, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12)
 	local ok, err = pcall(function()
 		if event == "ADDON_LOADED" then
 			if a1 ~= "LoganReads" then return end
@@ -1114,7 +1155,7 @@ ev:SetScript("OnEvent", function(self, event, a1, a2, a3, a4, a5, a6)
 		elseif event == "CURRENT_SPELL_CAST_CHANGED" then
 			onCurrentSpellChanged()
 		elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
-			onCombatLog(a1, a2, a3, a4, a5, a6)
+			onCombatLog(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12)
 		end
 	end)
 	if not ok then
@@ -1164,7 +1205,7 @@ local function levelLine()
 	return table.concat(parts, "; ")
 end
 
-local HELP = "/lr coach on|off, keys on|off, bars, move, level <1|2|3|auto>, stage <A|B>, mark test|on|off, arrows on|off, frame on|off, status, reset"
+local HELP = "/lr coach on|off, keys on|off, bars, move, level <1|2|3|auto>, stage <A|B>, misses on|off, mark test|on|off, arrows on|off, frame on|off, status, reset"
 
 function C.command(rest)
 	local c = cfg()
@@ -1262,6 +1303,16 @@ function C.command(rest)
 			return
 		end
 		msg("arrows " .. (c.arrows and "ON" or "OFF") .. " (nameplates are switched on/off with it).")
+	elseif cmd == "misses" then
+		if arg == "on" then
+			c.missCues = true
+		elseif arg == "off" then
+			c.missCues = false
+		else
+			msg("miss/dodge voice cues are " .. (c.missCues and "ON" or "OFF") .. ". Use /lr coach misses on|off.")
+			return
+		end
+		msg("miss/dodge voice cues " .. (c.missCues and "ON" or "OFF") .. ".")
 	elseif cmd == "frame" then
 		if arg == "on" then
 			c.frame = true
@@ -1277,7 +1328,8 @@ function C.command(rest)
 		msg("coach " .. (c.on and "ON" or "OFF") .. ", LoganReads " .. (lrOn() and "ON" or "OFF")
 			.. ", keys " .. (c.keys and "ON" or "OFF") .. ", stage " .. c.stage
 			.. ", frame " .. (c.frame and "ON" or "OFF") .. ", arrows " .. (c.arrows and "ON" or "OFF")
-			.. ", marks " .. (c.marks and "ON" or "OFF") .. ", stars total " .. c.starsTotal)
+			.. ", marks " .. (c.marks and "ON" or "OFF") .. ", misses " .. (c.missCues and "ON" or "OFF")
+			.. ", stars total " .. c.starsTotal)
 		msg("known: " .. levelLine())
 		if cmd == "" then msg(HELP) end
 	elseif cmd == "reset" then
