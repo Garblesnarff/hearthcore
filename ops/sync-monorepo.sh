@@ -87,6 +87,7 @@ if [[ "$MODE" == "mirror-cpp" ]]; then
     "src/Ai/Base/Actions/AcceptInvitationAction.cpp"
     "src/Ai/Base/Actions/ReviveFromCorpseAction.cpp"
     "src/Ai/Base/Actions/GuildBankAction.cpp"
+    "src/Ai/Base/Actions/GuildBankAction.h"
     "src/Ai/Base/Actions/LfgActions.cpp"
     "src/Ai/Base/Strategy/CompanionClassStrategy.cpp"
     "src/Ai/Base/Strategy/CompanionLeadStrategy.h"

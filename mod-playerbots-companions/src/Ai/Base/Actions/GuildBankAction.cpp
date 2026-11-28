@@ -9,10 +9,14 @@
 #include <map>
 #include "AiObjectContext.h"
 #include "Bag.h"
+#include "CompanionBankPickupLogic.h"
+#include "CompanionBotMgr.h"
 #include "CompanionBrain.h"
 #include "CompanionClassStrategy.h"
 #include "CompanionDuty.h"
 #include "CompanionLife.h"
+#include "Config.h"
+#include "EquipAction.h"
 #include "GameObject.h"
 #include "GameTime.h"
 #include "GuildMgr.h"
@@ -37,6 +41,29 @@ std::mutex gOrganizeMutex;
 std::unordered_map<uint32, uint32> gLastOrganizeSec;   // guildId -> last auto-organize unix sec
 constexpr uint32 ORGANIZE_COOLDOWN_SEC = 1800;         // auto-organize at most once per 30 min per guild
 constexpr uint32 MAX_PURGE_PER_VISIT = 8;              // leave daily withdraw slots for crafting withdrawals
+std::mutex gPickupMutex;
+std::unordered_map<uint32, uint32> gLastPickupSec;     // bot low guid -> last pickup attempt, game seconds
+
+uint32 LearnSpellOf(ItemTemplate const* proto)
+{
+    for (auto const& spell : proto->Spells)
+        if (spell.SpellTrigger == ITEM_SPELLTRIGGER_LEARN_SPELL_ID && spell.SpellId > 0)
+            return static_cast<uint32>(spell.SpellId);
+    return 0;
+}
+
+bool HasEmptyBagSlot(Player* bot)
+{
+    for (uint8 slot = INVENTORY_SLOT_BAG_START; slot < INVENTORY_SLOT_BAG_END; ++slot)
+        if (!bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            return true;
+    return false;
+}
+
+bool PickupEnabled()
+{
+    return sConfigMgr->GetOption<bool>("AiPlayerbot.Companion.Bank.Pickup", true, false);
+}
 }  // namespace
 
 bool GuildBankAction::Execute(Event event)
@@ -325,6 +352,9 @@ bool GuildBankAction::RunCompanionBankDuty(GameObject* bank)
                      static_cast<uint32>(bankSlot.slot));
     }
 
+    // Recipes it can learn, bags for empty bag slots, and gear upgrades.
+    RunPickup(slots, viewTabs, deposited);
+
     // Class play consumables (CompanionClass::WantedConsumables, e.g. Minor Mana Oil, Smoked Sagefish): topped up to
     // the listed count when the bank has them.
     for (auto const& [entry, wanted] : CompanionClass::WantedConsumables(bot))
@@ -442,6 +472,9 @@ bool GuildBankAction::OrganizeCompanionBank(bool force, uint32* outPurged, uint3
                 continue;
 
             uint32 const reservedQty = CompanionLife::ReservedBankQty(cell.entry, 0);
+            if (CompanionBankPickup::NeverPurge(proto->Class, proto->Quality))
+                continue;
+
             bool unwanted = !CompanionBrain::IsBankWantedItem(proto);
             if (reservedQty > 0 && keptStock[cell.entry] < reservedQty)
             {
@@ -652,4 +685,137 @@ uint32 GuildBankAction::WithdrawForCompanion(uint32 entry, uint32 count, char co
         CompanionDuty::RecordLedger(bot->GetGUID().GetCounter(), "withdraw", entry, got, bankSlot.tab, note);
     }
     return moved;   // the caller invalidates the bank snapshot after its last move
+}
+
+uint8 GuildBankAction::PickupKind(CompanionDuty::BankSlot const& bankSlot)
+{
+    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(bankSlot.entry);
+    if (!proto)
+        return static_cast<uint8>(CompanionBankPickup::Kind::None);
+
+    CompanionBankPickup::Candidate c;
+    c.itemClass = proto->Class;
+    c.subClass = proto->SubClass;
+    // Cheap class filter first: most bank slots are materials.
+    bool const gear = proto->Class == ITEM_CLASS_WEAPON || proto->Class == ITEM_CLASS_ARMOR;
+    if (!gear && proto->Class != ITEM_CLASS_RECIPE && proto->Class != ITEM_CLASS_CONTAINER)
+        return static_cast<uint8>(CompanionBankPickup::Kind::None);
+    c.canUse = bot->BotCanUseItem(proto) == EQUIP_ERR_OK;
+    // Several bags of one entry are normal; one recipe or one piece of gear is enough.
+    c.alreadyHolds = proto->Class != ITEM_CLASS_CONTAINER && bot->HasItemCount(bankSlot.entry, 1);
+    if (!c.canUse || c.alreadyHolds)
+        return static_cast<uint8>(CompanionBankPickup::Kind::None);
+
+    if (proto->Class == ITEM_CLASS_RECIPE)
+    {
+        uint32 const taught = LearnSpellOf(proto);
+        c.teachesSpell = taught != 0;
+        c.knowsSpell = taught && bot->HasSpell(taught);
+    }
+    else if (proto->Class == ITEM_CLASS_CONTAINER)
+        c.emptyBagSlot = HasEmptyBagSlot(bot);
+    else
+    {
+        std::string const qualifier =
+            std::to_string(proto->ItemId) + "," + std::to_string(bankSlot.randomProperty);
+        ItemUsage const usage = botAI->GetAiObjectContext()->GetValue<ItemUsage>("item usage", qualifier)->Get();
+        c.isUpgrade = usage == ITEM_USAGE_EQUIP || usage == ITEM_USAGE_REPLACE;
+        c.equipAllowed = sCompanionBotMgr.CanEquip(bot, proto);
+    }
+    return static_cast<uint8>(CompanionBankPickup::Decide(c));
+}
+
+bool GuildBankAction::HasPickup()
+{
+    uint32 const guildId = bot->GetGuildId();
+    Guild* guild = guildId ? sGuildMgr->GetGuildById(guildId) : nullptr;
+    if (!guild || !PickupEnabled() || !bot->GetFreeInventorySpace())
+        return false;
+
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    {
+        std::lock_guard<std::mutex> lock(gPickupMutex);
+        auto it = gLastPickupSec.find(bot->GetGUID().GetCounter());
+        if (it != gLastPickupSec.end() && now - it->second < CompanionBankPickup::RETRY_SECONDS)
+            return false;
+    }
+
+    std::vector<CompanionDuty::BankTabUsage> tabs;
+    std::vector<CompanionDuty::BankSlot> slots;
+    if (!CompanionDuty::BankSnapshot(guildId, tabs, slots))
+        return false;
+    for (CompanionDuty::BankSlot const& bankSlot : slots)
+        if (guild->MemberHasTabRights(bot->GetGUID(), bankSlot.tab, GUILD_BANK_RIGHT_VIEW_TAB) &&
+            PickupKind(bankSlot) != static_cast<uint8>(CompanionBankPickup::Kind::None))
+            return true;
+    return false;
+}
+
+void GuildBankAction::RunPickup(std::vector<CompanionDuty::BankSlot> const& slots, std::set<uint8> const& viewTabs,
+                                std::set<uint32> const& deposited)
+{
+    uint32 const guildId = bot->GetGuildId();
+    Guild* guild = guildId ? sGuildMgr->GetGuildById(guildId) : nullptr;
+    if (!guild || !PickupEnabled())
+        return;
+
+    uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+    {
+        std::lock_guard<std::mutex> lock(gPickupMutex);
+        gLastPickupSec[bot->GetGUID().GetCounter()] = now;
+    }
+
+    uint32 recipes = 0;
+    uint32 bags = 0;
+    uint32 gear = 0;
+    for (CompanionDuty::BankSlot const& bankSlot : slots)
+    {
+        if (!viewTabs.count(bankSlot.tab) || deposited.count(bankSlot.entry))
+            continue;
+        // Judged against the bot as it is now, so an earlier pickup in this visit counts.
+        auto const kind = static_cast<CompanionBankPickup::Kind>(PickupKind(bankSlot));
+        if (kind == CompanionBankPickup::Kind::None ||
+            (kind == CompanionBankPickup::Kind::Recipe && recipes >= CompanionBankPickup::MAX_RECIPES_PER_VISIT) ||
+            (kind == CompanionBankPickup::Kind::Bag && bags >= CompanionBankPickup::MAX_BAGS_PER_VISIT) ||
+            (kind == CompanionBankPickup::Kind::Gear && gear >= CompanionBankPickup::MAX_GEAR_PER_VISIT))
+            continue;
+
+        uint8 freeSlot = NULL_SLOT;
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            if (!bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            {
+                freeSlot = slot;
+                break;
+            }
+        if (freeSlot == NULL_SLOT)
+            return;   // backpack full
+
+        // This exact bank slot, one item. A refused move (rank daily limit) leaves the backpack slot empty.
+        guild->SwapItemsWithInventory(bot, true, bankSlot.tab, bankSlot.slot, INVENTORY_SLOT_BAG_0, freeSlot,
+                                      bankSlot.count > 1 ? 1 : 0);
+        Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, freeSlot);
+        if (!item || item->GetEntry() != bankSlot.entry)
+            continue;
+        CompanionDuty::RecordLedger(bot->GetGUID().GetCounter(), "withdraw", bankSlot.entry, 1, bankSlot.tab,
+                                    "bank pickup");
+
+        if (kind == CompanionBankPickup::Kind::Recipe)
+        {
+            ++recipes;
+            uint32 const taught = LearnSpellOf(item->GetTemplate());
+            bot->learnSpell(taught, false);
+            // Same result as using the recipe: the spell is learned and the item is consumed.
+            if (bot->HasSpell(taught))
+                bot->DestroyItem(INVENTORY_SLOT_BAG_0, freeSlot, true);
+            LOG_INFO("playerbots", "[Companion] {} bank pickup: recipe {} learned={}", bot->GetName(),
+                     bankSlot.entry, bot->HasSpell(taught) ? 1 : 0);
+        }
+        else
+        {
+            kind == CompanionBankPickup::Kind::Bag ? ++bags : ++gear;
+            EquipAction(botAI).EquipItems({bankSlot.entry});
+            LOG_INFO("playerbots", "[Companion] {} bank pickup: {} {}", bot->GetName(),
+                     kind == CompanionBankPickup::Kind::Bag ? "bag" : "gear", bankSlot.entry);
+        }
+    }
 }

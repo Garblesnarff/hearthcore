@@ -22,6 +22,7 @@
 #include "CellImpl.h"
 #include "Chat.h"
 #include "CompanionBotMgr.h"
+#include "CompanionBankPickupLogic.h"
 #include "CompanionBrain.h"
 #include "CompanionCraft.h"
 #include "CompanionLease.h"
@@ -55,6 +56,7 @@
 
 namespace
 {
+constexpr float PICKUP_BANK_NEED = 60.0f;
 using DutyKind = CompanionBotMgr::DutySpotKind;
 
 // Trainers checked, nearest first, for a far TRAIN candidate and in range. Profession trainers (Cooking, Fishing, First
@@ -409,7 +411,8 @@ bool BankReady(Player* bot, uint32 low)
             if (!guild->MemberHasTabRights(bot->GetGUID(), s.tab, GUILD_BANK_RIGHT_VIEW_TAB))
                 continue;
             ItemTemplate const* proto = sObjectMgr->GetItemTemplate(s.entry);
-            if (proto && proto->SellPrice > 0 && !CompanionBrain::IsBankWantedItem(proto))
+            if (proto && proto->SellPrice > 0 && !CompanionBrain::IsBankWantedItem(proto) &&
+                !CompanionBankPickup::NeverPurge(proto->Class, proto->Quality))
                 return true;
         }
     }
@@ -957,7 +960,8 @@ void CompanionDuty::Evaluate(PlayerbotAI* botAI)
                     if (!g || !g->MemberHasTabRights(bot->GetGUID(), s.tab, GUILD_BANK_RIGHT_VIEW_TAB))
                         continue;
                     ItemTemplate const* proto = sObjectMgr->GetItemTemplate(s.entry);
-                    if (proto && proto->SellPrice > 0 && !CompanionBrain::IsBankWantedItem(proto))
+                    if (proto && proto->SellPrice > 0 && !CompanionBrain::IsBankWantedItem(proto) &&
+                !CompanionBankPickup::NeverPurge(proto->Class, proto->Quality))
                     {
                         bankNeed = 75.0f;
                         break;
@@ -966,6 +970,10 @@ void CompanionDuty::Evaluate(PlayerbotAI* botAI)
             }
         }
     }
+
+    // Something in the bank this companion would use (recipe, bag, gear upgrade) is a reason to visit on its own.
+    if (bankOk && bankNeed < PICKUP_BANK_NEED && GuildBankAction(botAI).HasPickup())
+        bankNeed = PICKUP_BANK_NEED;
 
     // Repair need: 0 above 60% durability, 100 at 0%. Durability is the LOWEST equipped item (not the average): under
     // URGENT_REPAIR_PCT the repair ignores the travel cost and wins over every other duty and the activity.
@@ -1545,7 +1553,7 @@ void CompanionDuty::UpdateWorld(uint32 elapsed)
         }
 
         QueryResult items = CharacterDatabase.Query(
-            "SELECT gbi.TabId, gbi.SlotId, ii.itemEntry, ii.count FROM guild_bank_item gbi "
+            "SELECT gbi.TabId, gbi.SlotId, ii.itemEntry, ii.count, ii.randomPropertyId FROM guild_bank_item gbi "
             "JOIN item_instance ii ON ii.guid = gbi.item_guid "
             "WHERE gbi.guildid = {}",
             guildId);
@@ -1559,6 +1567,7 @@ void CompanionDuty::UpdateWorld(uint32 elapsed)
                 slot.slot = static_cast<uint8>(fields[1].Get<uint32>());
                 slot.entry = fields[2].Get<uint32>();
                 slot.count = fields[3].Get<uint32>();
+                slot.randomProperty = fields[4].Get<int32>();
                 for (CompanionDuty::BankTabUsage& tab : snapshot.tabs)
                 {
                     if (tab.tab == slot.tab)
