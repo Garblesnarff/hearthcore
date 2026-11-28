@@ -84,9 +84,11 @@ trap 'rm -rf "$STAGE"' EXIT
 if [[ "$MODE" == "mirror-cpp" ]]; then
   CPP_FILES=(
     "src/Bot/PlayerbotAI.h"
+    "src/Ai/Base/Actions/AcceptInvitationAction.cpp"
     "src/Ai/Base/Actions/ReviveFromCorpseAction.cpp"
     "src/Ai/Base/Actions/GuildBankAction.cpp"
     "src/Ai/Base/Actions/LfgActions.cpp"
+    "src/Ai/Base/Strategy/CompanionClassStrategy.cpp"
     "src/Ai/Base/Strategy/CompanionLeadStrategy.h"
     "src/Ai/Base/Strategy/CompanionLeadStrategy.cpp"
     "src/Ai/Base/Strategy/CompanionCraftStrategy.cpp"

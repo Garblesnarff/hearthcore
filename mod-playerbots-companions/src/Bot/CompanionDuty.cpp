@@ -1498,7 +1498,7 @@ void CompanionDuty::ReplyToOwner(PlayerbotAI* botAI, std::vector<std::string> co
             botAI->SayToParty(line);
         return;
     }
-    Player* owner = sCompanionBotMgr.FindOwnerOnline();
+    Player* owner = sCompanionBotMgr.FindOwnerOnlineFor(bot);
     if (!owner)
         return;
     for (std::string const& line : lines)

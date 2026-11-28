@@ -1674,7 +1674,7 @@ bool CompanionQuest::OwnerHasQuest(Player* bot, uint32 questId)
             return true;
     }
     // On the bot's map the live log is read directly (same map thread); a quest taken in the last seconds counts.
-    Player* owner = bot ? sCompanionBotMgr.FindOwnerOnline() : nullptr;
+    Player* owner = bot ? sCompanionBotMgr.FindOwnerOnlineFor(bot) : nullptr;
     return owner && owner->IsInWorld() && owner->FindMap() == bot->GetMap() &&
            owner->FindQuestSlot(questId) < MAX_QUEST_LOG_SIZE;   // in his log (not merely rewarded long ago)
 }
