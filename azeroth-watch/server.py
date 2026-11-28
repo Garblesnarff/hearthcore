@@ -406,6 +406,7 @@ def make_handler(
     require_auth_for_reads: bool | None = None,
     trust_loopback_reads: bool | None = None,
     trust_loopback_writes: bool | None = None,
+    open_reads: bool | None = None,
 ):
     # Separate mutable settings file so dashboard NEVER rewrites .env holding ANTHROPIC_API_KEY (Issue #72).
     settings_path = overrides_path if overrides_path is not None else (
@@ -427,6 +428,14 @@ def make_handler(
         bool(trust_loopback_writes)
         if trust_loopback_writes is not None
         else (os.getenv("AZEROTH_WATCH_TRUST_LOOPBACK_WRITES") or "0").strip().lower() in ("1", "true", "yes", "on")
+    )
+
+    # Owner opt-in: every viewer gets the full read-only dashboard with no token. Writes stay gated.
+    # Strict read auth wins if both are set.
+    reads_open = not auth_reads and (
+        bool(open_reads)
+        if open_reads is not None
+        else (os.getenv("AZEROTH_WATCH_OPEN_READS") or "0").strip().lower() in ("1", "true", "yes", "on")
     )
 
     # Per-server-instance server-side session store (revocable!), SSE counter, sheet cache & concurrency cap
@@ -587,11 +596,9 @@ def make_handler(
                 return False, False
             sid = self._extract_session_cookie()
             if sid:
-                if _validate_session(sid):
-                    return True, False
-                if count_failure:
-                    _record_auth_fail(ip)
-                return False, False
+                # Session ids are 256-bit and expire/reset on restart: a stale one is not a guessing
+                # attempt, and counting it locked dashboards out after 5 polls.
+                return (True, False) if _validate_session(sid) else (False, False)
             return False, False
 
         def _is_loopback(self) -> bool:
@@ -637,13 +644,13 @@ def make_handler(
 
             if path == "/api/state":
                 is_auth, rate_lim = self._is_authenticated(count_failure=True)
-                if rate_lim:
+                if rate_lim and not reads_open:
                     self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Too many failed attempts; wait 60s"}', close_conn=True)
                     return
                 if auth_reads and not is_auth:
                     self._send_bytes(401, "application/json; charset=utf-8", b'{"ok":false,"error":"Authentication required for /api/state (use /api/kiosk for minimal view)"}', close_conn=True)
                     return
-                is_local_ro = bool(local_reads_ok and not auth_reads and self._is_loopback())
+                is_local_ro = reads_open or bool(local_reads_ok and not auth_reads and self._is_loopback())
                 ver, snap = collector.get_snapshot()
                 body = _cached_serialized_state(ver, snap, is_auth, local_readonly=is_local_ro)
                 self._send_bytes(200, "application/json; charset=utf-8", body)
@@ -651,13 +658,13 @@ def make_handler(
 
             if path == "/api/stream":
                 is_auth, rate_lim = self._is_authenticated(count_failure=True)
-                if rate_lim:
+                if rate_lim and not reads_open:
                     self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Too many failed attempts; wait 60s"}', close_conn=True)
                     return
                 if auth_reads and not is_auth:
                     self._send_bytes(401, "application/json; charset=utf-8", b'{"ok":false,"error":"Authentication required for /api/stream"}', close_conn=True)
                     return
-                is_local_ro = bool(local_reads_ok and not auth_reads and self._is_loopback())
+                is_local_ro = reads_open or bool(local_reads_ok and not auth_reads and self._is_loopback())
                 with state_lock:
                     if sse_active["count"] >= max(1, int(max_sse_clients)):
                         self._send_bytes(
@@ -709,7 +716,7 @@ def make_handler(
                     self._send_bytes(400, "application/json; charset=utf-8", b'{"ok":false,"error":"Invalid character name"}')
                     return
                 is_auth, rate_lim = self._is_authenticated(count_failure=True)
-                if rate_lim:
+                if rate_lim and not reads_open:
                     self._send_bytes(429, "application/json; charset=utf-8", b'{"ok":false,"error":"Too many failed attempts; wait 60s"}', close_conn=True)
                     return
                 local_char_open = bool(local_writes_ok and self._is_loopback())
@@ -717,7 +724,7 @@ def make_handler(
                 if auth_reads and not can_ctl:
                     self._send_bytes(401, "application/json; charset=utf-8", b'{"ok":false,"error":"Authentication required"}', close_conn=True)
                     return
-                is_local_ro = bool(local_reads_ok and not auth_reads and self._is_loopback())
+                is_local_ro = reads_open or bool(local_reads_ok and not auth_reads and self._is_loopback())
                 redact_flag = not (can_ctl or is_local_ro)
                 cache_key = (slug.lower(), redact_flag, can_ctl)
                 now_m = time.monotonic()

@@ -1058,7 +1058,7 @@
   function updateAdminBtn() {
     const b = $("btn-admin-auth");
     if (!b) return;
-    b.textContent = adminUnlocked ? "🔓 Admin Unlocked" : "🔒 Unlock Admin";
+    b.textContent = adminUnlocked ? "🔓 Controls Unlocked" : "🔒 Unlock Controls";
     b.classList.toggle("unlocked", adminUnlocked);
   }
   async function checkAdminAuth() {
