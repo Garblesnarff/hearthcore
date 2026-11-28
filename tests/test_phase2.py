@@ -133,7 +133,7 @@ class Phase2Tests(unittest.TestCase):
     # ------------------------------------------------------------------
     def test_dungeon_catalog_eligibility_and_unsupported_rejection(self):
         stockade = DUNGEON_BY_ID["stockade_n"]
-        sfk = DUNGEON_BY_ID["sfk_n"]
+        raid = DUNGEON_BY_ID["molten_core_r"]
 
         # Live pilot defaults OFF!
         ok_live, reason_live = check_character_eligibility(
@@ -145,7 +145,7 @@ class Phase2Tests(unittest.TestCase):
 
         # Unsupported dungeon rejected even in shadow
         ok_unsup, reason_unsup = check_character_eligibility(
-            level=24, faction="alliance", viable_roles=["tank"], dungeon=sfk,
+            level=24, faction="alliance", viable_roles=["tank"], dungeon=raid,
             available_minutes=90, locked_maps=set(), allow_pilot_shadow=True,
         )
         self.assertFalse(ok_unsup)

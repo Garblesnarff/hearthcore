@@ -1,6 +1,7 @@
 """Comprehensive tests for Issue #25: persistent opaque persona identity & multi-character mapping."""
 from __future__ import annotations
 
+import gc
 import hashlib
 import sqlite3
 import tempfile
@@ -301,6 +302,10 @@ class Issue25PersonaIdentityTests(unittest.TestCase):
             self.assertEqual(r_unres["reason"], "unresolved_persona_mapping")
 
             # P2-10: WAL-aware read-only shadow pass leaves brain.db + -wal + -shm + iterdump 100% unchanged!
+            # Settle sidecars first: a GC'd setup handle checkpoints and removes -wal, and the digest's own
+            # mode=ro reader then recreates it. Neither is a write by the pass under test.
+            gc.collect()
+            _wal_aware_db_digest(db_p)
             dig_before = _wal_aware_db_digest(db_p)
             sh = run_shadow_match_snapshot(
                 {

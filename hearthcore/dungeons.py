@@ -5,7 +5,8 @@ are verified directly against the installed acore_world database / WotLK 3.3.5a 
 (docs/PHASE_II_AUDIT_II00.md, data/sql/base/db_world/dungeon_access_template.sql).
 
 Safety invariants:
-- Unsupported dungeons & all raids/heroics remain disabled (`supported=False`).
+- All raids remain unsupported (`supported=False`). 5-player Normal and Heroic dungeons are supported but
+  stay off until named in `HEARTHCORE_COOP_DUNGEONS`.
 - Even supported pilot dungeons default OFF unless explicitly opted in via feature flag.
 - Role viability requires verified live telemetry (class, live spec/talents, spells, equipment,
   native LFG role mask) — NEVER inferred from static profiles when live telemetry is unknown.
@@ -179,7 +180,7 @@ class DungeonSpec:
     dungeon_id: str
     name: str
     map_id: int
-    difficulty: int               # 0 = normal 5-player
+    difficulty: int               # 0 = normal 5-player, 1 = heroic 5-player
     areatrigger_id: int
     script: str
     entrance_map: int
@@ -684,10 +685,18 @@ def estimate_travel_and_prep_minutes(
         prep_needs.append("dead_needs_resurrection")
         prep_min += 5
 
+    # Most rows have no audited entrance (all zeros). Never compare against that placeholder map.
+    entrance_known = bool(dungeon.entrance_x or dungeon.entrance_y)
+
     if current_map_id is not None:
         cm = int(current_map_id)
         if cm == dungeon.map_id:
             travel_min = 0
+        elif not entrance_known:
+            travel_min = max(travel_min + 15, 25)  # conservative: assume the long trip
+            prep_needs.append("entrance_unknown")
+            if cm not in OVERLAND_MAPS:
+                prep_needs.append("leave_current_instance")
         elif cm not in OVERLAND_MAPS:
             # Currently inside another instance / BG -> must exit/hearth first
             travel_min = max(travel_min + 10, 20)

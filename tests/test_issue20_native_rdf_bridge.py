@@ -88,12 +88,12 @@ int main()
     // 1. Supported dungeon catalog & fail-closed rejection of unsupported/heroic/random dungeons.
     {
         auto const* stk = ResolveSupportedLfgDungeon(34, 0);
-        CHECK(stk != nullptr && stk->lfgDungeonId == 12 && stk->allianceOnly);
+        CHECK(stk != nullptr && stk->lfgDungeonId == 12 && stk->faction == 1);
         auto const* dm = ResolveSupportedLfgDungeon(36, 0);
-        CHECK(dm != nullptr && dm->lfgDungeonId == 6 && !dm->allianceOnly);
+        CHECK(dm != nullptr && dm->lfgDungeonId == 6 && dm->faction == 0);
         CHECK(ResolveSupportedLfgDungeon(34, 1) == nullptr);   // Heroic rejected
-        CHECK(ResolveSupportedLfgDungeon(33, 0) == nullptr);   // SFK unsupported
-        CHECK(ResolveSupportedLfgDungeon(48, 0) == nullptr);   // BFD unsupported
+        CHECK(ResolveSupportedLfgDungeon(409, 2) == nullptr);  // Raid rejected
+        CHECK(ResolveSupportedLfgDungeon(1, 0) == nullptr);    // Not a dungeon map
         CHECK(LookupSupportedLfgDungeonById(12u | (1u << 24)) != nullptr);
         CHECK(LookupSupportedLfgDungeonById(258u | (6u << 24)) == nullptr);  // Random dungeon rejected
     }
