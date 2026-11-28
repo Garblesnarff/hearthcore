@@ -502,7 +502,7 @@ class MySQLIntegrationTests(unittest.TestCase):
         INSERT IGNORE INTO acore_world.quest_template (ID, QuestLevel, LogTitle) VALUES (501, 30, 'Steel of Ironforge');
         INSERT IGNORE INTO acore_world.player_xp_for_level (level, Experience) VALUES (33, 48600);
 
-        INSERT INTO `{db_name}`.characters VALUES
+        INSERT INTO `{db_name}`.characters (guid, account, name, race, class, gender, level, xp, money, zone, map, online, totaltime, health, power1) VALUES
             (101, 2, 'Brannoc', 4, 1, 1, 33, 3397, 761128, 1519, 0, 1, 72000, 1588, 0);
         INSERT INTO `{db_name}`.companion_schedule (name, shift_group, start_hour, end_hour, days_mask, always_online, note)
             VALUES ('Brannoc', 'core-wonky', 0, 24, 127, 1, 'Core tank');
