@@ -139,7 +139,10 @@ bool ReviveFromCorpseAction::Execute(Event event)
 
     bool const autonomousCompanion =
         botAI->IsCompanion() && botAI->GetCompanionMode() == PlayerbotAI::COMPANION_AUTONOMY;
-    if (!botAI->HasGameClientMaster() || autonomousCompanion)
+    bool const cooperativeCompanion =
+        botAI->IsCompanion() && bot->GetGroup() != nullptr &&
+        botAI->GetCompanionMode() == PlayerbotAI::COMPANION_COOPERATIVE;
+    if (!cooperativeCompanion && (!botAI->HasGameClientMaster() || autonomousCompanion))
     {
         uint32 dCount = AI_VALUE(uint32, "death count");
 
