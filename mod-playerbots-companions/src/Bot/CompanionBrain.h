@@ -30,6 +30,11 @@ enum class CoopMode : uint8;
 enum class DrainReason : uint8;
 struct DrainDecision;
 }
+namespace CompanionLfgBridge
+{
+struct JoinDecision;
+struct ProposalDecision;
+}
 
 // Companion brain: bag item classes and per-companion weights (acore_characters.companion_weights).
 //
@@ -138,7 +143,27 @@ public:
                                              std::string* outReason = nullptr);
     static void ReleaseCoopAdmissionToken(uint64 opportunityId);
     static bool CoopHeadroomPaused();
-    // World thread only: flushes queued binds/disbands atomically to MySQL and reloads memberships.
+    // Issue #20: Native WotLK RDF/LFG voluntary queue bridge (MySQL + LFGMgr authoritative, world-thread driven).
+    static bool IsCoopLfgTrackedBot(uint32 botGuid);
+    static bool AllowBotOnlyLfgProposal(std::vector<uint32> const& candidateGuids);
+    static bool TryBuildCompanionLfgJoin(Player const* bot, bool shiftEnded,
+                                         CompanionLfgBridge::JoinDecision& outDecision);
+    static bool SendCompanionLfgJoin(Player* bot, PlayerbotAI* botAI, bool shiftEnded);
+    static void MarkCompanionLfgJoinSent(uint32 botGuid, uint64 opportunityId, uint32 lfgDungeonId);
+    static bool ShouldCompanionLeaveLfgQueue(Player const* bot, bool shiftEnded, std::string* outReason = nullptr);
+    static void OnCompanionLfgQueueLeft(uint32 botGuid, std::string const& reason, bool isStaleRequeue = false);
+    static void OnCompanionJoinedOwnerGroup(uint32 botGuid);
+    static void OnCompanionLogout(uint32 botGuid);
+    static CompanionLfgBridge::ProposalDecision EvaluateCompanionLfgProposal(Player const* bot, uint32 proposalId,
+                                                                             uint32 rawDungeonEntry, uint8 proposalState,
+                                                                             bool shiftEnded);
+    static void OnCompanionLfgProposalAccepted(uint32 botGuid, uint64 opportunityId, uint32 proposalId,
+                                               uint32 lfgDungeonId);
+    static void OnCompanionLfgProposalDeclined(uint32 botGuid, uint32 proposalId, std::string const& reason);
+    static void OnCompanionLfgProposalFinished(uint32 botGuid, uint32 proposalId, uint8 proposalState);
+    // World thread only: drives cooperative LFG queue/leave/deferred-proposal lifecycle safely with LFGMgr,
+    // flushes queued binds/disbands/outcomes atomically to MySQL, and reloads memberships.
+    static void TickCoopLfgOnWorldThread();
     static void FlushCoopGroupMutations();
     static void ReloadCoopMemberships();
 

@@ -9,6 +9,7 @@
 #include "CompanionBrain.h"
 #include "CompanionCoopAuthLogic.h"
 #include "CompanionCoopDrainLogic.h"
+#include "CompanionLfgBridgeLogic.h"
 #include "CompanionCraft.h"
 #include "CompanionClassStrategy.h"
 #include "CompanionGatherStrategy.h"
@@ -50,7 +51,9 @@
 #include "WorldPacket.h"
 #include "ItemTemplate.h"
 #include "GameTime.h"
+#include "LFGMgr.h"
 #include "Log.h"
+#include "Opcodes.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "PlayerbotAI.h"
@@ -1672,8 +1675,11 @@ void CompanionBotMgr::TickBot(PlayerbotAI* botAI)
 
     if (groupedWithOwner)
     {
-        // The owner's group always wins: it ends any lease (no failure, no cooldown) and clears pending coop recalls.
+        // The owner's group always wins: it ends any lease (no failure, no cooldown), clears pending coop recalls,
+        // and clears any solo coop LFG bridge tracking cleanly (NEVER touches owner's own group LFG queue; core
+        // LFGGroupScript::OnAddMember already removes any prior solo queue on group join!).
         CompanionBrain::ClearCoopOwnerRecall(bot->GetGUID().GetCounter());
+        CompanionBrain::OnCompanionJoinedOwnerGroup(bot->GetGUID().GetCounter());
         CompanionLease::RequestInterrupt(bot, CompanionLease::Interrupt::Group);
         if (botAI->GetCompanionMode() != PlayerbotAI::COMPANION_FOLLOW)
         {

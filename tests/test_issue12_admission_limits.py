@@ -524,7 +524,9 @@ class Issue12AdmissionLimitsTests(unittest.TestCase):
 
         # Native LFG queue join & proposal accept are gated for non-owner-grouped companions!
         self.assertIn("CompanionBrain::TryAdmitCompanionLfgJoin(", lfg)
-        self.assertIn("CompanionBrain::TryAdmitCompanionLfgProposal(", lfg)
+        # LfgActions routes proposals through EvaluateCompanionLfgProposal (which calls TryAdmitCompanionLfgProposal!)
+        self.assertIn("CompanionBrain::EvaluateCompanionLfgProposal(", lfg)
+        self.assertIn("TryAdmitCompanionLfgProposal(", brain)
 
         # No emergency combat/coop logout; non-coop startup unaffected (0 = unlimited when coop OFF)
         self.assertIn("!IsInAuthorizedCoopGroup(connected)", mgr)

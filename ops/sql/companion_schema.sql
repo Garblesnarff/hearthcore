@@ -57,6 +57,11 @@ CREATE TABLE IF NOT EXISTS `companion_opportunities` (
   `group_guid` int unsigned NOT NULL DEFAULT '0',
   `outcome_reason` varchar(120) NOT NULL DEFAULT '',
   `is_shadow` tinyint unsigned NOT NULL DEFAULT '1',
+  `lfg_dungeon_id` int unsigned NOT NULL DEFAULT '0',
+  `native_queue_id` varchar(64) NOT NULL DEFAULT '',
+  `native_proposal_id` int unsigned NOT NULL DEFAULT '0',
+  `native_run_id` varchar(64) NOT NULL DEFAULT '',
+  `correlation_key` varchar(96) NOT NULL DEFAULT '',
   PRIMARY KEY (`id`),
   KEY `idx_co_state` (`state`,`is_shadow`,`recruit_until`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
