@@ -231,6 +231,12 @@ public:
     uint32 OwnerLowFor(Player const* bot) const;
     uint32 OwnerLevelFor(Player const* bot) const;
     Player* FindOwnerOnlineFor(Player const* bot) const;
+    // Any thread. Single-lock identity-only lookup for Issue #30 shared-quest isolation (decoupled from XP-cap
+    // level staleness; returns hasAssignedOwner=false for non-companions; never substitutes primary owner).
+    void ResolveOwnerIdentityFor(Player const* bot, bool& hasAssignedOwner, uint32& resolvedOwnerLow) const;
+    CompanionOwnerXpCap::BotOwnerIdentity ResolveOwnerIdentityByName(std::string const& botName) const;
+    // Any thread. Every currently resolved configured owner low GUID (primary + all per-bot overrides).
+    std::set<uint32> AllResolvedOwnerLows() const;
     // Companion play schedules (acore_characters.companion_schedule).
     struct ScheduleEntry
     {

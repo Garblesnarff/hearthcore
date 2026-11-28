@@ -26,7 +26,9 @@ class PerCompanionOwnerTests(unittest.TestCase):
 
         quest_src = (COMP_SRC / "Bot" / "CompanionQuest.cpp").read_text(encoding="utf-8")
         owner_has_quest = quest_src.split("bool CompanionQuest::OwnerHasQuest(", 1)[1].split("\n}\n", 1)[0]
-        self.assertIn("FindOwnerOnlineFor(bot)", owner_has_quest)
+        self.assertIn("ResolveOwnerQuestContext(bot)", owner_has_quest)
+        self.assertIn("ResolveOwnerIdentityFor(bot", quest_src)
+        self.assertIn("ObjectAccessor::GetPlayer(map,", quest_src)
         self.assertNotIn("FindOwnerOnline()", owner_has_quest)
 
 

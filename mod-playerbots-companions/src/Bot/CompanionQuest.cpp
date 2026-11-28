@@ -22,11 +22,13 @@
 #include <variant>
 
 #include "CellImpl.h"
+#include "CharacterCache.h"
 #include "CompanionBotMgr.h"
 #include "CompanionBrain.h"
 #include "CompanionDuty.h"
 #include "CompanionLease.h"
 #include "CompanionLife.h"
+#include "CompanionOwnerQuestLogic.h"
 #include "CompanionTransport.h"
 #include "CompanionTrip.h"
 #include "Config.h"
@@ -43,6 +45,7 @@
 #include "Map.h"
 #include "MapMgr.h"
 #include "NewRpgInfo.h"
+#include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "PlayerbotAI.h"
@@ -115,10 +118,11 @@ std::atomic<uint32> gCrossMinGoals{3};
 std::atomic<float> gCrossPenalty{10.0f};
 std::atomic<uint32> gCrossStayMaxMinutes{90};
 
-// ---- owner quest log copy (world thread writes, map threads read under gOwnerMutex) ----
+// ---- owner-keyed quest log snapshots (world thread writes, map threads read under gOwnerMutex; Issue #30) ----
 std::mutex gOwnerMutex;
-std::unordered_set<uint32> gOwnerQuests;
-std::atomic<bool> gOwnerQuestsKnown{false};
+CompanionOwnerQuest::OwnerQuestRegistry gOwnerQuestRegistry;
+std::atomic<uint32> gOwnerQuestStaleSec{300};
+std::atomic<uint32> gOwnerQuestMaxDbFailures{2};
 std::unordered_map<uint32, uint32> gRaceVendors;   // race id -> mount vendor creature entry (written before publish)
 
 // ---- shared tables (world thread builds once, then publishes gTablesReady; read-only afterwards) ----
@@ -288,6 +292,11 @@ void LoadSwitches()
     gWMount.store(readFloat("AiPlayerbot.Companion.Weight.Mount", 1.0f));
     gCompletionist.store(std::min(1.0f, readFloat("AiPlayerbot.Companion.Weight.Completionist", 0.5f)));
     gKeepOwnerQuests.store(sConfigMgr->GetOption<bool>("AiPlayerbot.Companion.Quest.KeepOwnerQuests", true));
+    uint32 const rawOwnerQuestStale =
+        sConfigMgr->GetOption<uint32>("AiPlayerbot.Companion.Quest.OwnerSnapshotStaleSeconds", 300, false);
+    gOwnerQuestStaleSec.store(CompanionOwnerQuest::ClampStaleSeconds(rawOwnerQuestStale, OWNER_DB_MS));
+    gOwnerQuestMaxDbFailures.store(
+        std::max<uint32>(1u, sConfigMgr->GetOption<uint32>("AiPlayerbot.Companion.Quest.OwnerSnapshotMaxFailures", 2, false)));
     gFreeSlots.store(std::min(20u, sConfigMgr->GetOption<uint32>("AiPlayerbot.Companion.Quest.FreeSlots", 3)));
     gMountGoldReserve.store(sConfigMgr->GetOption<uint32>("AiPlayerbot.Companion.Quest.MountGoldReserve", 1));
     gGreyMinValue.store(readFloat("AiPlayerbot.Companion.Quest.GreyMinValue", 25.0f));
@@ -576,70 +585,113 @@ std::vector<std::pair<uint32, uint32>> RepGoals(uint32 low)
 // ---------------------------------------------------------------------------------------------------------------
 // Owner quest log copy (world thread)
 // ---------------------------------------------------------------------------------------------------------------
-void PublishOwnerQuests(std::unordered_set<uint32>&& quests, char const* source)
+CompanionOwnerQuest::OwnerQuestConfig CurrentOwnerQuestConfig()
 {
-    size_t count = quests.size();
-    bool changed = false;
-    {
-        std::lock_guard<std::mutex> lock(gOwnerMutex);
-        changed = !gOwnerQuestsKnown.load() || quests != gOwnerQuests;
-        gOwnerQuests = std::move(quests);
-    }
-    gOwnerQuestsKnown.store(true);
-    if (changed)
-        LOG_INFO("playerbots", "Companion owner quests: source={} count={}", source, count);
+    CompanionOwnerQuest::OwnerQuestConfig cfg;
+    cfg.liveRefreshMs = OWNER_LIVE_MS;
+    cfg.dbRefreshMs = OWNER_DB_MS;
+    cfg.logoutDbDelayMs = OWNER_LOGOUT_DB_DELAY_MS;
+    cfg.staleAfterSec = gOwnerQuestStaleSec.load();
+    cfg.maxConsecutiveDbFailures = gOwnerQuestMaxDbFailures.load();
+    return cfg;
 }
 
-// Online: the live log every OWNER_LIVE_MS (world thread: the map threads are not running then). Logout: the last
-// live copy is kept and character_queststatus is read OWNER_LOGOUT_DB_DELAY_MS later (the save is asynchronous).
-// Offline: character_queststatus every OWNER_DB_MS. Status 0 rows are not in the log (Player::_LoadQuestStatus).
+// Per-owner quest snapshot maintenance on the world thread (Issue #30).
+// Online: live log every OWNER_LIVE_MS (world thread: map threads are paused). Logout: keeps last live copy
+// while async save completes, then queries character_queststatus after OWNER_LOGOUT_DB_DELAY_MS.
+// Offline: queries character_queststatus every OWNER_DB_MS, verifying DB health on empty result so a DB outage
+// NEVER publishes an empty quest set as fresh.
 void UpdateOwnerQuests(uint32 elapsed)
 {
-    static uint32 timer = 0;
-    static bool first = true;
-    static bool wasOnline = false;
-    uint32 const ownerLow = sCompanionBotMgr.OwnerLow();
-    if (!ownerLow)
-        return;
-    timer += elapsed;
-    Player* owner = sCompanionBotMgr.FindOwnerOnline();
-    if (owner)
+    std::set<uint32> const activeOwners = sCompanionBotMgr.AllResolvedOwnerLows();
+    uint32 const nowSec = NowSec();
+    CompanionOwnerQuest::OwnerQuestConfig const cfg = CurrentOwnerQuestConfig();
+
     {
-        if (first || !wasOnline || timer >= OWNER_LIVE_MS)
+        std::lock_guard<std::mutex> lock(gOwnerMutex);
+        gOwnerQuestRegistry.SyncActiveOwners(activeOwners);
+    }
+
+    for (uint32 ownerLow : activeOwners)
+    {
+        if (!ownerLow)
+            continue;
+        Player* owner = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(ownerLow));
+        CompanionOwnerQuest::ProbeAction action = CompanionOwnerQuest::ProbeAction::None;
         {
+            std::lock_guard<std::mutex> lock(gOwnerMutex);
+            action = gOwnerQuestRegistry.PlanProbe(ownerLow, owner != nullptr, elapsed, nowSec, cfg);
+        }
+
+        if (action == CompanionOwnerQuest::ProbeAction::None)
+            continue;
+
+        if (action == CompanionOwnerQuest::ProbeAction::LogoutKeepLive)
+        {
+            LOG_INFO("playerbots",
+                     "Companion owner quests: owner={} source=logout keep live copy, db read in {}s",
+                     ownerLow, OWNER_LOGOUT_DB_DELAY_MS / 1000);
+            continue;
+        }
+
+        if (action == CompanionOwnerQuest::ProbeAction::ReadOnlineLog)
+        {
+            if (!owner)
+                continue;
             std::unordered_set<uint32> quests;
             for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
                 if (uint32 questId = owner->GetQuestSlotQuestId(slot))
                     quests.insert(questId);
-            PublishOwnerQuests(std::move(quests), "online");
-            timer = 0;
-            first = false;
+            size_t const count = quests.size();
+            bool changed = false;
+            {
+                std::lock_guard<std::mutex> lock(gOwnerMutex);
+                changed = gOwnerQuestRegistry.RecordOnlineSnapshot(ownerLow, std::move(quests), nowSec);
+            }
+            if (changed)
+                LOG_INFO("playerbots", "Companion owner quests: owner={} source=online count={}", ownerLow, count);
+            continue;
         }
-        wasOnline = true;
-        return;
+
+        if (action == CompanionOwnerQuest::ProbeAction::QueryDb)
+        {
+            // Sentinel row (SELECT 0 UNION ALL ...) makes empty-log vs DB-error 100% atomic in a single query:
+            // - nullptr result ALWAYS means a query/DB error -> RecordDbSnapshotFailure (never clears known quests!)
+            // - non-null result with only row 0 means DB succeeded and owner genuinely has 0 active quests!
+            QueryResult result = CharacterDatabase.Query(
+                "SELECT 0 UNION ALL SELECT quest FROM character_queststatus WHERE guid = {} AND status <> 0",
+                ownerLow);
+            if (result)
+            {
+                std::unordered_set<uint32> quests;
+                do
+                {
+                    if (uint32 const q = result->Fetch()[0].Get<uint32>())
+                        quests.insert(q);
+                } while (result->NextRow());
+                size_t const count = quests.size();
+                bool changed = false;
+                {
+                    std::lock_guard<std::mutex> lock(gOwnerMutex);
+                    changed = gOwnerQuestRegistry.RecordDbSnapshotSuccess(ownerLow, std::move(quests), nowSec);
+                }
+                if (changed)
+                    LOG_INFO("playerbots", "Companion owner quests: owner={} source=db count={}", ownerLow, count);
+            }
+            else
+            {
+                CompanionOwnerQuest::SnapshotState nextState = CompanionOwnerQuest::SnapshotState::Unknown;
+                {
+                    std::lock_guard<std::mutex> lock(gOwnerMutex);
+                    gOwnerQuestRegistry.RecordDbSnapshotFailure(ownerLow, nowSec, cfg);
+                    nextState = gOwnerQuestRegistry.StateForOwner(ownerLow, nowSec, cfg);
+                }
+                LOG_WARN("playerbots",
+                         "Companion owner quests: owner={} source=db_error state={} (protecting shared quests fail-closed)",
+                         ownerLow, CompanionOwnerQuest::SnapshotStateName(nextState));
+            }
+        }
     }
-    if (wasOnline)
-    {
-        wasOnline = false;
-        LOG_INFO("playerbots", "Companion owner quests: source=logout keep live copy, db read in {}s",
-                 OWNER_LOGOUT_DB_DELAY_MS / 1000);
-        timer = OWNER_DB_MS - OWNER_LOGOUT_DB_DELAY_MS;
-        return;
-    }
-    if (!first && timer < OWNER_DB_MS)
-        return;
-    timer = 0;
-    first = false;
-    std::unordered_set<uint32> quests;
-    QueryResult result =
-        CharacterDatabase.Query("SELECT quest FROM character_queststatus WHERE guid = {} AND status <> 0", ownerLow);
-    if (result)
-    {
-        do
-            quests.insert(result->Fetch()[0].Get<uint32>());
-        while (result->NextRow());
-    }
-    PublishOwnerQuests(std::move(quests), "db");
 }
 
 uint32 FreeLogSlots(Player* bot)
@@ -1617,6 +1669,36 @@ void CompanionQuest::EndTrip(PlayerbotAI* botAI, char const* result, bool succes
                         success ? CompanionLease::Outcome::Success : CompanionLease::Outcome::Failure);
 }
 
+namespace
+{
+struct OwnerQuestContext
+{
+    bool hasAssignedOwner = false;
+    uint32 ownerLow = 0;
+    Player* sameMapOwner = nullptr;
+    bool ownerLiveOnSameMap = false;
+};
+
+// Shared identity + safe same-map owner lookup (guards bot->FindMap() so callers during teleport/logout
+// never trigger Map::GetMap() assert).
+OwnerQuestContext ResolveOwnerQuestContext(Player* bot)
+{
+    OwnerQuestContext ctx;
+    if (!bot)
+        return ctx;
+    sCompanionBotMgr.ResolveOwnerIdentityFor(bot, ctx.hasAssignedOwner, ctx.ownerLow);
+    if (ctx.ownerLow)
+    {
+        if (Map* map = bot->FindMap())
+        {
+            ctx.sameMapOwner = ObjectAccessor::GetPlayer(map, ObjectGuid::Create<HighGuid::Player>(ctx.ownerLow));
+            ctx.ownerLiveOnSameMap = (ctx.sameMapOwner != nullptr && ctx.sameMapOwner->IsInWorld());
+        }
+    }
+    return ctx;
+}
+}  // namespace
+
 bool CompanionQuest::FreeLogSlot(Player* bot)
 {
     if (!bot || sCompanionBotMgr.IsGroupedWithOwner(bot))
@@ -1628,12 +1710,33 @@ bool CompanionQuest::FreeLogSlot(Player* bot)
     {
         // At most one log-full drop per 10 minutes, so a full log does not churn through quests.
         std::lock_guard<std::mutex> lock(gStateMutex);
-        QuestBotState& st = gStates[bot->GetGUID().GetCounter()];
+        QuestBotState const& st = gStates[bot->GetGUID().GetCounter()];
         if (st.lastLogFullDropSec && now - st.lastLogFullDropSec < 600)
             return false;
-        st.lastLogFullDropSec = now;
     }
-    // Lowest value first; a quest the owner has too is skipped (B2) and the next one is dropped instead.
+
+    // Resolve owner quest context ONCE before scanning candidates (avoids 25x lock churn when fail-closed).
+    if (gKeepOwnerQuests.load())
+    {
+        OwnerQuestContext const ctx = ResolveOwnerQuestContext(bot);
+        if (ctx.hasAssignedOwner && !ctx.ownerLiveOnSameMap)
+        {
+            CompanionOwnerQuest::OwnerQuestConfig const cfg = CurrentOwnerQuestConfig();
+            CompanionOwnerQuest::SnapshotState snapState = CompanionOwnerQuest::SnapshotState::Unknown;
+            if (ctx.ownerLow)
+            {
+                std::lock_guard<std::mutex> lock(gOwnerMutex);
+                snapState = gOwnerQuestRegistry.StateForOwner(ctx.ownerLow, now, cfg);
+            }
+            if (!ctx.ownerLow || snapState != CompanionOwnerQuest::SnapshotState::Fresh)
+            {
+                // Fail closed immediately without burning lastLogFullDropSec cooldown.
+                return false;
+            }
+        }
+    }
+
+    // Lowest value first; a quest the assigned owner has is skipped (B2 / Issue #30) and the next safe quest is dropped.
     struct Candidate
     {
         float value;
@@ -1658,6 +1761,10 @@ bool CompanionQuest::FreeLogSlot(Player* bot)
     {
         if (KeepForOwner(bot, candidate.questId, "log-full"))
             continue;
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gStates[bot->GetGUID().GetCounter()].lastLogFullDropSec = now;
+        }
         AbandonQuest(bot, candidate.slot, candidate.questId, "log-full", candidate.value);
         return true;
     }
@@ -1666,29 +1773,38 @@ bool CompanionQuest::FreeLogSlot(Player* bot)
 
 bool CompanionQuest::OwnerHasQuest(Player* bot, uint32 questId)
 {
-    if (!questId)
+    if (!bot || !questId)
         return false;
-    {
-        std::lock_guard<std::mutex> lock(gOwnerMutex);
-        if (gOwnerQuests.count(questId))
-            return true;
-    }
-    // On the bot's map the live log is read directly (same map thread); a quest taken in the last seconds counts.
-    Player* owner = bot ? sCompanionBotMgr.FindOwnerOnlineFor(bot) : nullptr;
-    return owner && owner->IsInWorld() && owner->FindMap() == bot->GetMap() &&
-           owner->FindQuestSlot(questId) < MAX_QUEST_LOG_SIZE;   // in his log (not merely rewarded long ago)
+    OwnerQuestContext const ctx = ResolveOwnerQuestContext(bot);
+    bool const liveHasQuest =
+        ctx.ownerLiveOnSameMap && (ctx.sameMapOwner->FindQuestSlot(questId) < MAX_QUEST_LOG_SIZE);
+
+    uint32 const nowSec = NowSec();
+    CompanionOwnerQuest::OwnerQuestConfig const cfg = CurrentOwnerQuestConfig();
+    std::lock_guard<std::mutex> lock(gOwnerMutex);
+    return gOwnerQuestRegistry.EvaluateOwnerHasQuest(
+        ctx.hasAssignedOwner, ctx.ownerLow, ctx.ownerLiveOnSameMap, liveHasQuest, questId, nowSec, cfg);
 }
 
-// B2 guard: the reason a quest must be kept for the owner (owner-unknown, owner-shared), or nullptr.
+// B2 / Issue #30 guard: the reason a quest must be kept for THIS bot's assigned owner (owner-unknown, owner-shared),
+// or nullptr. Uses strictly the bot's resolved assigned owner (never primary-owner fallback).
 static char const* OwnerGuardReason(Player* bot, uint32 questId)
 {
     if (!bot || !gKeepOwnerQuests.load())
         return nullptr;
-    if (!gOwnerQuestsKnown.load() && sCompanionBotMgr.OwnerConfigured())
-        return "owner-unknown";   // fail closed until the owner's log has loaded once
-    if (CompanionQuest::OwnerHasQuest(bot, questId))
-        return "owner-shared";
-    return nullptr;
+    OwnerQuestContext const ctx = ResolveOwnerQuestContext(bot);
+    bool const liveHasQuest =
+        ctx.ownerLiveOnSameMap && (ctx.sameMapOwner->FindQuestSlot(questId) < MAX_QUEST_LOG_SIZE);
+
+    uint32 const nowSec = NowSec();
+    CompanionOwnerQuest::OwnerQuestConfig const cfg = CurrentOwnerQuestConfig();
+    CompanionOwnerQuest::GuardDecision decision = CompanionOwnerQuest::GuardDecision::AllowAbandon;
+    {
+        std::lock_guard<std::mutex> lock(gOwnerMutex);
+        decision = gOwnerQuestRegistry.EvaluateGuard(
+            true, ctx.hasAssignedOwner, ctx.ownerLow, ctx.ownerLiveOnSameMap, liveHasQuest, questId, nowSec, cfg);
+    }
+    return CompanionOwnerQuest::GuardReasonText(decision);
 }
 
 // GM test hook: the companion's abandon path for one quest (AbandonQuest, behind the same B2 guard as the stock
@@ -1747,33 +1863,34 @@ bool CompanionQuest::MayAccept(Player* bot, Quest const* quest)
     uint32 const questId = quest->GetQuestId();
     uint32 const free = FreeLogSlots(bot);
     uint32 const keep = gFreeSlots.load();
-    char const* reason = nullptr;
+    bool const ownerHas = OwnerHasQuest(bot, questId);
     float value = -1.0f;
-    if (OwnerHasQuest(bot, questId))
+    bool isGreyLow = false;
+    bool outsideHub = false;
+    if (!ownerHas && free > keep)
     {
-        if (!free)
-            reason = "free-slots";   // a quest the owner has needs only one free slot
-    }
-    else if (free <= keep)
-        reason = "free-slots";
-    else if (IsGreyFor(bot, quest) && (value = QuestValue(bot, quest)) < gGreyMinValue.load())
-        reason = "grey-low-value";
-    else
-    {
-        std::lock_guard<std::mutex> lock(gStateMutex);
-        auto it = gStates.find(low);
-        if (it != gStates.end() && it->second.trip.active && it->second.trip.kind == TripKind::Hub)
+        if (IsGreyFor(bot, quest) && (value = QuestValue(bot, quest)) < gGreyMinValue.load())
+            isGreyLow = true;
+        else
         {
-            std::vector<uint32> const& plan = it->second.trip.hubPlan;
-            if (std::find(plan.begin(), plan.end(), questId) == plan.end())
-                reason = "not-in-hub-plan";
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            auto it = gStates.find(low);
+            if (it != gStates.end() && it->second.trip.active && it->second.trip.kind == TripKind::Hub)
+            {
+                std::vector<uint32> const& plan = it->second.trip.hubPlan;
+                if (std::find(plan.begin(), plan.end(), questId) == plan.end())
+                    outsideHub = true;
+            }
         }
     }
-    if (!reason)
+    CompanionOwnerQuest::AcceptDecision const dec =
+        CompanionOwnerQuest::EvaluateMayAccept(ownerHas, free, keep, isGreyLow, outsideHub);
+    if (dec.allowed)
         return true;
     if (ShouldLogSkip(low, (uint64(2) << 32) | questId, NowSec()))
         LOG_INFO("playerbots", "Companion {}: accept skip quest={} reason={} free={} keep={} value={}", bot->GetName(),
-                 questId, reason, free, keep, value < 0.0f ? std::string("-") : Num(value));
+                 questId, dec.rejectReason ? dec.rejectReason : "blocked", free, keep,
+                 value < 0.0f ? std::string("-") : Num(value));
     return false;
 }
 
@@ -2804,6 +2921,39 @@ void CompanionQuest::Evaluate(PlayerbotAI* botAI)
 std::vector<std::string> CompanionQuest::WhyLines(uint32 lowGuid)
 {
     std::vector<std::string> lines;
+    uint32 const now = NowSec();
+
+    // Resolve this specific companion's assigned owner & quest snapshot outside gStateMutex (no nested locks!).
+    std::string ownerSummary = "none";
+    std::string botName;
+    if (sCharacterCache->GetCharacterNameByGuid(ObjectGuid::Create<HighGuid::Player>(lowGuid), botName) && !botName.empty())
+    {
+        CompanionOwnerXpCap::BotOwnerIdentity const id = sCompanionBotMgr.ResolveOwnerIdentityByName(botName);
+        if (id.assignment != CompanionOwnerXpCap::OwnerAssignmentKind::None)
+        {
+            if (id.ownerLowGuid == 0)
+            {
+                ownerSummary = id.ownerName + " (unresolved)";
+            }
+            else
+            {
+                CompanionOwnerQuest::OwnerQuestConfig const cfg = CurrentOwnerQuestConfig();
+                CompanionOwnerQuest::SnapshotState snapState = CompanionOwnerQuest::SnapshotState::Unknown;
+                size_t ownerCount = 0;
+                {
+                    std::lock_guard<std::mutex> ownerLock(gOwnerMutex);
+                    snapState = gOwnerQuestRegistry.StateForOwner(id.ownerLowGuid, now, cfg);
+                    ownerCount = gOwnerQuestRegistry.QuestCountForOwner(id.ownerLowGuid);
+                }
+                ownerSummary = id.ownerName + " (" +
+                               (snapState == CompanionOwnerQuest::SnapshotState::Fresh
+                                    ? std::to_string(ownerCount)
+                                    : std::string(CompanionOwnerQuest::SnapshotStateName(snapState))) +
+                               ")";
+            }
+        }
+    }
+
     std::lock_guard<std::mutex> lock(gStateMutex);
     auto it = gStates.find(lowGuid);
     if (it == gStates.end())
@@ -2812,18 +2962,11 @@ std::vector<std::string> CompanionQuest::WhyLines(uint32 lowGuid)
         return lines;
     }
     QuestBotState const& st = it->second;
-    uint32 const now = NowSec();
     auto ago = [now](uint32 sec)
     { return sec && now >= sec ? std::to_string(now - sec) + "s ago" : std::string("never"); };
-    size_t ownerCount = 0;
-    {
-        std::lock_guard<std::mutex> ownerLock(gOwnerMutex);
-        ownerCount = gOwnerQuests.size();
-    }
     lines.push_back(std::string("Quest project: ") + (Enabled() ? "on" : "off") + ", log " +
                     std::to_string(st.logUsed) + "/" + std::to_string(MAX_QUEST_LOG_SIZE) + ", keeps " +
-                    std::to_string(gFreeSlots.load()) + " free, owner quests " +
-                    (gOwnerQuestsKnown.load() ? std::to_string(ownerCount) : std::string("unknown")) +
+                    std::to_string(gFreeSlots.load()) + " free, owner quests " + ownerSummary +
                     ", last full evaluation " + ago(st.lastFullEvalSec));
     if (st.trip.active)
     {

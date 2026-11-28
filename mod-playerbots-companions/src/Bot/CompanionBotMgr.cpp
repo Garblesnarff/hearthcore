@@ -1486,6 +1486,32 @@ Player* CompanionBotMgr::FindOwnerOnlineFor(Player const* bot) const
     return ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(ol));
 }
 
+void CompanionBotMgr::ResolveOwnerIdentityFor(Player const* bot, bool& hasAssignedOwner, uint32& resolvedOwnerLow) const
+{
+    hasAssignedOwner = false;
+    resolvedOwnerLow = 0;
+    if (!bot || !IsCompanion(bot))
+        return;
+    std::lock_guard<std::mutex> lock(_stateMutex);
+    CompanionOwnerXpCap::BotOwnerIdentity const id = _ownerRegistry.ResolveOwnerIdentity(bot->GetName(), /*includeName=*/false);
+    hasAssignedOwner = (id.assignment != CompanionOwnerXpCap::OwnerAssignmentKind::None);
+    resolvedOwnerLow = id.ownerLowGuid;
+}
+
+CompanionOwnerXpCap::BotOwnerIdentity CompanionBotMgr::ResolveOwnerIdentityByName(std::string const& botName) const
+{
+    if (!IsCompanionName(botName))
+        return {};
+    std::lock_guard<std::mutex> lock(_stateMutex);
+    return _ownerRegistry.ResolveOwnerIdentity(botName, /*includeName=*/true);
+}
+
+std::set<uint32> CompanionBotMgr::AllResolvedOwnerLows() const
+{
+    std::lock_guard<std::mutex> lock(_stateMutex);
+    return _ownerRegistry.AllResolvedOwnerLows();
+}
+
 bool CompanionBotMgr::IsOwner(Player const* player) const
 {
     if (!player)

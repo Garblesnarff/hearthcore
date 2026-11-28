@@ -181,6 +181,14 @@ struct BotXpCapFastResult
     bool expansionCapped = false;
 };
 
+// Identity-only projection decoupled from XP-cap level/staleness (used by shared-quest protection #30).
+struct BotOwnerIdentity
+{
+    OwnerAssignmentKind assignment = OwnerAssignmentKind::None;
+    std::string ownerName;
+    std::uint32_t ownerLowGuid = 0;
+};
+
 inline bool IsRecordStale(OwnerRecord const& rec, std::uint32_t nowSec, OwnerXpCapConfig const& cfg)
 {
     if (rec.level == 0)
@@ -477,6 +485,39 @@ public:
         if (IsRecordStale(rec, nowSec, cfg))
             return OwnerResolutionState::StaleLevel;
         return OwnerResolutionState::ResolvedFresh;
+    }
+
+    // Identity-only lookup decoupled from level freshness or XP-cap configuration (Issue #30).
+    // Never falls back to primary owner when an explicit AssignedOverride is unresolved.
+    BotOwnerIdentity ResolveOwnerIdentity(std::string const& botName, bool includeName = false) const
+    {
+        BotOwnerIdentity id;
+        std::string const botKey = LowerAscii(TrimAscii(botName));
+        std::string const* ownerKeyPtr = nullptr;
+        auto ovIt = _botOverrides.find(botKey);
+        if (ovIt != _botOverrides.end())
+        {
+            id.assignment = OwnerAssignmentKind::AssignedOverride;
+            ownerKeyPtr = &ovIt->second;
+        }
+        else if (!_primaryOwnerKey.empty())
+        {
+            id.assignment = OwnerAssignmentKind::PrimaryDefault;
+            ownerKeyPtr = &_primaryOwnerKey;
+        }
+        else
+        {
+            return id;
+        }
+
+        auto recIt = _owners.find(*ownerKeyPtr);
+        if (recIt == _owners.end())
+            return id;
+        if (includeName)
+            id.ownerName = recIt->second.displayName;
+        if (recIt->second.guidResolved && recIt->second.resolvedLowGuid != 0)
+            id.ownerLowGuid = recIt->second.resolvedLowGuid;
+        return id;
     }
 
     // Fast-path projection avoiding return-value owner-name copying on hot map-thread calls
